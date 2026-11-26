@@ -32,7 +32,7 @@ pub mod linux {
 #[cfg(unix)]
 pub use fs_unix::{
     Swap, clone_at, exchange_checked, fdatasync, fsync, full_fsync, open_beneath_mode, peer_uid,
-    probe_fold, rename_noreplace, same_version, stat_key_at,
+    probe_fold, rename_noreplace, same_bytes, same_version, stat_key_at,
 };
 
 #[derive(Clone, Debug)]

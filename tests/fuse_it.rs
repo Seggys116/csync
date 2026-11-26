@@ -470,6 +470,51 @@ mod linux {
         assert_no_strays(&proj);
         assert_no_strays(&mnt);
 
+        // a refused edit that grew the file past the host copy must not leave the guest's length behind
+        fs::write(proj.join("grow.txt"), "one\n").unwrap();
+        eventually("grow.txt on the guest", SYNC, || {
+            read(&mnt.join("grow.txt")).as_deref() == Some("one\n")
+        });
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(mnt.join("grow.txt"))
+            .unwrap();
+        fs::write(proj.join("grow.txt"), "host\n").unwrap();
+        fs::write(proj.join("sync3.txt"), "3\n").unwrap();
+        eventually(
+            "host change pushed before the growing refusal",
+            SYNC,
+            || mnt.join("sync3.txt").exists(),
+        );
+        f.write_at(b"a much longer guest line\n", 0).unwrap();
+        assert_eq!(errno(f.sync_all()), Some(libc::ECANCELED));
+        drop(f);
+        eventually(
+            "guest shows the host copy after a growing refusal",
+            SYNC,
+            || read(&mnt.join("grow.txt")).as_deref() == Some("host\n"),
+        );
+        assert_eq!(read(&proj.join("grow.txt")).as_deref(), Some("host\n"));
+        assert_no_strays(&proj);
+        assert_no_strays(&mnt);
+
+        // an atomic save of a streamed body queued behind another upload: requests overtake bulk
+        // chunks on the link, yet the host must still see the temp before the rename that names it
+        for i in 0..4u8 {
+            fs::write(mnt.join(format!("bulk{i}.bin")), vec![b'0' + i; 8 << 20]).unwrap();
+            let body = vec![b'a' + i; 256 << 10];
+            fs::write(mnt.join(".saved.bin.tmp"), &body).unwrap();
+            fs::rename(mnt.join(".saved.bin.tmp"), mnt.join("saved.bin"))
+                .expect("rename of a just-written temp");
+            eventually("saved.bin on the host", SYNC, || {
+                fs::read(proj.join("saved.bin")).is_ok_and(|b| b == body)
+            });
+            assert!(!proj.join(".saved.bin.tmp").exists());
+            fs::remove_file(mnt.join(format!("bulk{i}.bin"))).unwrap();
+        }
+        assert_no_strays(&proj);
+        assert_no_strays(&mnt);
+
         // ignored paths stay on the guest
         fs::create_dir(mnt.join("target")).unwrap();
         fs::write(mnt.join("target/out.o"), "obj").unwrap();
@@ -480,23 +525,26 @@ mod linux {
             "an ignored directory reached the host"
         );
 
-        // .git is readable and read-only
+        // .git is readable and read-only; its modes lack write bits, so default_permissions
+        // refuses a non-root writer with EACCES before csync's own EROFS check is reached
         assert_eq!(
             read(&mnt.join(".git/HEAD")).as_deref(),
             Some("ref: refs/heads/main\n")
         );
+        let ro = if std::os::unix::fs::MetadataExt::uid(&fs::metadata(&proj).unwrap()) == 0 {
+            libc::EROFS
+        } else {
+            libc::EACCES
+        };
         assert_eq!(
             errno(
                 fs::OpenOptions::new()
                     .write(true)
                     .open(mnt.join(".git/HEAD"))
             ),
-            Some(libc::EROFS)
+            Some(ro)
         );
-        assert_eq!(
-            errno(fs::write(mnt.join(".git/new"), "x")),
-            Some(libc::EROFS)
-        );
+        assert_eq!(errno(fs::write(mnt.join(".git/new"), "x")), Some(ro));
         assert!(!proj.join(".git/new").exists());
 
         // host edits raise inotify events inside the mount
@@ -742,10 +790,7 @@ mod linux {
                     }
                     Err(_) => break,
                 }
-                assert!(
-                    Instant::now() < end,
-                    "host kept a malformed handshake open"
-                );
+                assert!(Instant::now() < end, "host kept a malformed handshake open");
             }
         }
     }
@@ -859,8 +904,14 @@ mod linux {
             l == "pairing state=closed"
         });
         let g2f = fingerprint(&bin, g2);
-        assert!(!trusts(&bin, &host_home, &g2f), "host trusts a rejected guest");
-        assert!(trusted(&bin, g2).is_empty(), "a rejected guest stored trust");
+        assert!(
+            !trusts(&bin, &host_home, &g2f),
+            "host trusts a rejected guest"
+        );
+        assert!(
+            trusted(&bin, g2).is_empty(),
+            "a rejected guest stored trust"
+        );
 
         // a guest that declines the code, even after the host accepted, leaves no trust either side
         let (g3, m3) = (&homes[2], &mnts[2]);
@@ -877,8 +928,14 @@ mod linux {
             l == "pairing state=closed"
         });
         let g3f = fingerprint(&bin, g3);
-        assert!(!trusts(&bin, &host_home, &g3f), "host trusts a declined guest");
-        assert!(trusted(&bin, g3).is_empty(), "a declined guest stored trust");
+        assert!(
+            !trusts(&bin, &host_home, &g3f),
+            "host trusts a declined guest"
+        );
+        assert!(
+            trusted(&bin, g3).is_empty(),
+            "a declined guest stored trust"
+        );
         assert!(host.alive());
 
         // revoke from the host session drops the live guest and refuses its reconnect
@@ -889,7 +946,10 @@ mod linux {
             "a revoked guest must exit with the auth code"
         );
         eventually("unmounted after revoke", SYNC, || !is_mounted(m1));
-        assert!(!trusts(&bin, &host_home, &g1f), "revoke left the guest trusted");
+        assert!(
+            !trusts(&bin, &host_home, &g1f),
+            "revoke left the guest trusted"
+        );
         let mut again = join(&bin, g1, m1, &addr, "it-guest1");
         assert_eq!(
             again.exit_code_unmounted(m1, RECONNECT),
@@ -913,13 +973,33 @@ mod linux {
             "a forgotten guest must exit with the auth code"
         );
         eventually("unmounted after forget", SYNC, || !is_mounted(m4));
-        assert!(!trusts(&bin, &host_home, &g4f), "forget left the guest trusted");
+        assert!(
+            !trusts(&bin, &host_home, &g4f),
+            "forget left the guest trusted"
+        );
         let mut again = join(&bin, g4, m4, &addr, "it-guest4");
         assert_eq!(
             again.exit_code_unmounted(m4, RECONNECT),
             Some(EXIT_AUTH),
             "a forgotten guest must not reconnect"
         );
+
+        // csync forget on the guest ends its live session the same way
+        let (g2, m2) = (&homes[1], &mnts[1]);
+        let mut second = join(&bin, g2, m2, &addr, "it-guest2");
+        pairing_codes(&mut host, &mut second);
+        host.say("accept");
+        second.say("confirm yes");
+        wait_mount(&mut second, m2);
+        assert!(trusts(&bin, g2, &hf));
+        csync(&bin, g2, &["forget", &hf]);
+        assert_eq!(
+            second.exit_code(SYNC),
+            Some(EXIT_AUTH),
+            "a guest that forgot its host must exit with the auth code"
+        );
+        eventually("unmounted after the guest forgot", SYNC, || !is_mounted(m2));
+        assert!(!trusts(&bin, g2, &hf), "forget left the host trusted");
 
         assert!(host.alive(), "host stopped during the pairing scenarios");
         host.quit(SYNC);

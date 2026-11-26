@@ -65,7 +65,9 @@ fn folded_match(name: &str, want: &str, prefix: bool) -> bool {
 
 // every fixed name starts with '.', so any other ascii first byte cannot fold to one
 fn may_fold_to_fixed(c: &str) -> bool {
-    c.as_bytes().first().is_some_and(|&b| b == b'.' || !b.is_ascii())
+    c.as_bytes()
+        .first()
+        .is_some_and(|&b| b == b'.' || !b.is_ascii())
 }
 
 struct Matcher {
@@ -358,9 +360,7 @@ impl Rules {
                 return None;
             }
             let from_guest = cur.is_some_and(|d| {
-                !d.guest.is_empty()
-                    && d.guest
-                        .contains(&text.map(|t| *blake3::hash(t).as_bytes()))
+                !d.guest.is_empty() && d.guest.contains(&text.map(|t| *blake3::hash(t).as_bytes()))
             });
             let d = match self.dirs.get_mut(dir) {
                 Some(d) => d,
@@ -503,6 +503,17 @@ impl Rules {
             let repo = self.repo_of(p.as_str());
             self.exc_insert(p.as_str(), repo);
         }
+    }
+
+    pub fn repo_exceptions(&self, worktree: &RelPath) -> Vec<RelPath> {
+        let Some(&idx) = self.repo_by_root.get(worktree.as_str()) else {
+            return Vec::new();
+        };
+        self.exc_files
+            .iter()
+            .filter(|(_, r)| **r == idx)
+            .filter_map(|(k, _)| RelPath::new(k).ok())
+            .collect()
     }
 
     pub fn set_repo_exceptions(&mut self, worktree: &RelPath, tracked_ignored: Vec<RelPath>) {
@@ -1059,7 +1070,10 @@ mod tests {
         assert!(!r.is_rule_file(&rp("a/.gitignores")));
 
         r.set_fs_fold(false, true);
-        check(&r, &[(".GIT/config", false, GitRo), (".ENV", false, Synced)]);
+        check(
+            &r,
+            &[(".GIT/config", false, GitRo), (".ENV", false, Synced)],
+        );
     }
 
     fn key(t: &[u8]) -> Option<Hash32> {

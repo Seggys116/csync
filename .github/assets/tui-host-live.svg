@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 924 556" width="924" height="556" role="img" aria-label="host-live">
+<rect width="924" height="556" rx="12" fill="#0d1117"/>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" xml:space="preserve">
+<text x="12.0" y="26.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="26.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">c</text>
+<text x="39.0" y="26.0" fill="#4cc2ce" font-weight="700" textLength="9.0" lengthAdjust="spacing">s</text>
+<text x="48.0" y="26.0" fill="#6ab0dd" font-weight="700" textLength="9.0" lengthAdjust="spacing">y</text>
+<text x="57.0" y="26.0" fill="#899deb" font-weight="700" textLength="9.0" lengthAdjust="spacing">n</text>
+<text x="66.0" y="26.0" fill="#a78bfa" font-weight="700" textLength="9.0" lengthAdjust="spacing">c</text>
+<text x="75.0" y="26.0" fill="#808899" textLength="45.0" lengthAdjust="spacing"> host</text>
+<text x="120.0" y="26.0" fill="#3e4454" textLength="639.0" lengthAdjust="spacing"> ───────────────────────────────────────────────────────────────────── </text>
+<text x="759.0" y="26.0" fill="#4ade80" textLength="9.0" lengthAdjust="spacing">●</text>
+<text x="777.0" y="26.0" fill="#4ade80" textLength="108.0" lengthAdjust="spacing">1 guest live</text>
+<text x="885.0" y="26.0" fill="#3e4454" textLength="27.0" lengthAdjust="spacing"> ─╮</text>
+<text x="12.0" y="45.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="45.0" fill="#808899" textLength="81.0" lengthAdjust="spacing">project  </text>
+<text x="111.0" y="45.0" fill="#c9d1d9" font-weight="700" textLength="45.0" lengthAdjust="spacing">proj2</text>
+<text x="705.0" y="45.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">listen</text>
+<text x="759.0" y="45.0" fill="#c9d1d9" textLength="144.0" lengthAdjust="spacing">  0.0.0.0:47474 </text>
+<text x="903.0" y="45.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="64.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="64.0" fill="#808899" textLength="81.0" lengthAdjust="spacing">root     </text>
+<text x="111.0" y="64.0" fill="#c9d1d9" textLength="792.0" lengthAdjust="spacing">/private/tmp/claude-501/-Users-zaknoble-cla…a02-4d08-913d-4f088ffe589c/scratchpad/proj2 </text>
+<text x="903.0" y="64.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="83.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="12.0" y="102.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="102.0" fill="#3e4454" font-weight="700" textLength="54.0" lengthAdjust="spacing">Guests</text>
+<text x="84.0" y="102.0" fill="#3e4454" textLength="792.0" lengthAdjust="spacing"> ───────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="876.0" y="102.0" fill="#808899" textLength="27.0" lengthAdjust="spacing"> 1 </text>
+<text x="903.0" y="102.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">╮</text>
+<text x="12.0" y="121.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="48.0" y="121.0" fill="#3e4454" textLength="45.0" lengthAdjust="spacing">guest</text>
+<text x="192.0" y="121.0" fill="#3e4454" textLength="45.0" lengthAdjust="spacing">state</text>
+<text x="318.0" y="121.0" fill="#3e4454" textLength="27.0" lengthAdjust="spacing">rtt</text>
+<text x="399.0" y="121.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">in</text>
+<text x="498.0" y="121.0" fill="#3e4454" textLength="27.0" lengthAdjust="spacing">out</text>
+<text x="597.0" y="121.0" fill="#3e4454" textLength="63.0" lengthAdjust="spacing">traffic</text>
+<text x="822.0" y="121.0" fill="#3e4454" textLength="45.0" lengthAdjust="spacing">queue</text>
+<text x="903.0" y="121.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<rect x="30.0" y="126.0" width="864.0" height="19.0" fill="#2a2e3a"/>
+<text x="12.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="140.0" fill="#2dd4bf" textLength="18.0" lengthAdjust="spacing">› </text>
+<text x="48.0" y="140.0" fill="#c9d1d9" font-weight="700" textLength="108.0" lengthAdjust="spacing">65ac89c0ef42</text>
+<text x="192.0" y="140.0" fill="#4ade80" textLength="9.0" lengthAdjust="spacing">●</text>
+<text x="210.0" y="140.0" fill="#4ade80" textLength="36.0" lengthAdjust="spacing">live</text>
+<text x="246.0" y="140.0" fill="#c9d1d9" textLength="153.0" lengthAdjust="spacing">        0.3 ms   </text>
+<text x="399.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">-</text>
+<text x="498.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">-</text>
+<text x="597.0" y="140.0" fill="#3e4454" textLength="216.0" lengthAdjust="spacing">▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁</text>
+<text x="822.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">0</text>
+<text x="903.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="159.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="12.0" y="178.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="178.0" fill="#3e4454" font-weight="700" textLength="72.0" lengthAdjust="spacing">Activity</text>
+<text x="102.0" y="178.0" fill="#3e4454" textLength="810.0" lengthAdjust="spacing"> ─────────────────────────────────────────────────────────────────────────────────── utc ╮</text>
+<text x="12.0" y="197.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="197.0" fill="#3e4454" textLength="135.0" lengthAdjust="spacing">no activity yet</text>
+<text x="903.0" y="197.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="216.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="216.0" fill="#2dd4bf" textLength="18.0" lengthAdjust="spacing">› </text>
+<text x="48.0" y="216.0" fill="#808899" textLength="792.0" lengthAdjust="spacing">guest git: GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.checkStat GIT_CONFIG_VALUE_0=minimal</text>
+<text x="903.0" y="216.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="235.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="48.0" y="235.0" fill="#808899" textLength="513.0" lengthAdjust="spacing">GIT_CONFIG_KEY_1=core.trustCtime GIT_CONFIG_VALUE_1=false</text>
+<text x="903.0" y="235.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="254.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="254.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="273.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="273.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="292.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="292.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="311.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="311.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="330.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="330.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="349.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="349.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="368.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="368.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="387.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="387.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="406.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="406.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="425.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="425.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="444.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="444.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="463.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="463.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="482.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="482.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="501.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="21.0" y="520.0" fill="#808899" textLength="45.0" lengthAdjust="spacing">files</text>
+<text x="66.0" y="520.0" fill="#c9d1d9" textLength="54.0" lengthAdjust="spacing"> 76   </text>
+<text x="120.0" y="520.0" fill="#808899" textLength="63.0" lengthAdjust="spacing">commits</text>
+<text x="183.0" y="520.0" fill="#c9d1d9" textLength="45.0" lengthAdjust="spacing"> 0   </text>
+<text x="228.0" y="520.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">merged</text>
+<text x="282.0" y="520.0" fill="#c9d1d9" textLength="45.0" lengthAdjust="spacing"> 0   </text>
+<text x="327.0" y="520.0" fill="#808899" textLength="63.0" lengthAdjust="spacing">refused</text>
+<text x="390.0" y="520.0" fill="#c9d1d9" textLength="288.0" lengthAdjust="spacing"> 0                              </text>
+<text x="678.0" y="520.0" fill="#3e4454" textLength="72.0" lengthAdjust="spacing">↓ -  ↑ -</text>
+<text x="759.0" y="520.0" fill="#3e4454" textLength="126.0" lengthAdjust="spacing">▁▁▁▁▁▁▁▁▁▁▁▁▁▁</text>
+<text x="885.0" y="520.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="894.0" y="520.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">▁</text>
+<text x="21.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">q</text>
+<text x="39.0" y="539.0" fill="#808899" textLength="36.0" lengthAdjust="spacing">quit</text>
+<text x="102.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="18.0" lengthAdjust="spacing">↑↓</text>
+<text x="129.0" y="539.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">select</text>
+<text x="210.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">x</text>
+<text x="228.0" y="539.0" fill="#808899" textLength="108.0" lengthAdjust="spacing">revoke guest</text>
+</g></svg>

@@ -1450,10 +1450,8 @@ pub(crate) mod tests {
     fn test_listener(pairing: bool, timing: HsTiming) -> (Listener, std::path::PathBuf) {
         let mut r = [0u8; 8];
         getrandom::fill(&mut r).unwrap();
-        let d = std::env::temp_dir().join(format!(
-            "csync-test-conn-{}",
-            crate::crypto::trust::hex(&r)
-        ));
+        let d =
+            std::env::temp_dir().join(format!("csync-test-conn-{}", crate::crypto::trust::hex(&r)));
         let trust = Arc::new(Trust::load(&d).unwrap());
         let id = Arc::new(Identity::generate().unwrap());
         let addr = "127.0.0.1:0".parse().unwrap();
@@ -1604,6 +1602,9 @@ pub(crate) mod tests {
         let r = dial(addr, &guest, Dial::Resume(pin), &hello(Role::Guest));
         host.join().unwrap();
         assert!(matches!(r, Err(NetError::Rejected(Reject::KeyMismatch))));
-        assert!(matches!(hs_err(HsError::PinMismatch), NetError::KeyMismatch));
+        assert!(matches!(
+            hs_err(HsError::PinMismatch),
+            NetError::KeyMismatch
+        ));
     }
 }

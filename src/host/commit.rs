@@ -893,6 +893,8 @@ fn set_attr(
     if let Some(p) = perm {
         chmod(fd, u32::from(p))?;
     }
+    // sampled before set_times overwrites the mtime that reveals a host write racing this call
+    let mid = sys::stat_key(fd).map_err(|e| wire(&e))?;
     if let Some(t) = mtime_ns {
         let f = std::fs::File::from(rustix::io::dup(fd).map_err(wire_errno)?);
         f.set_times(std::fs::FileTimes::new().set_modified(systime(t)))
@@ -901,8 +903,11 @@ fn set_attr(
     let post = sys::stat_key(fd).map_err(|e| wire(&e))?;
     let meta = match c.kind {
         Kind::File => {
-            let unchanged =
-                post.dev == c.stat.dev && post.ino == c.stat.ino && post.size == c.stat.size;
+            let unchanged = mid.dev == c.stat.dev
+                && mid.ino == c.stat.ino
+                && mid.size == c.stat.size
+                && mid.mtime_ns == c.stat.mtime_ns
+                && post.size == c.stat.size;
             let hash = match c.hash.filter(|_| unchanged) {
                 Some(h) => h,
                 None => hash_fd(fd, post.size).map_err(|e| wire(&e))?,
@@ -911,6 +916,9 @@ fn set_attr(
         }
         _ => dir_meta(&post, false),
     };
+    // the origin only applies attributes from the reply, so content a host write slipped in must reach it as a change
+    let foreign = c.kind == Kind::File && (meta.hash != c.hash || meta.size != c.stat.size);
+    let origin = origin.filter(|_| !foreign);
     record(
         core,
         path,
@@ -1072,15 +1080,19 @@ fn rename(
         changes.extend(tree.observe(to, present));
         copy_subtree(&mut tree, &rules, from, to, &mut changes);
         changes.extend(tree.observe(from, Observed::Absent));
-        // rule files and repos moved with the directory, so the new location is reconciled against disk
-        let _ = scan::scan_subtree(&core.root_path, to, &mut rules, &mut tree, &mut changes);
-        drop(rules);
         core.publish_locked(&tree, changes, origin);
+        // rule files and repos moved with the directory, so the new location is reconciled against disk;
+        // whatever that finds came from host writes the origin never saw, so it is told too
+        let mut found = Vec::new();
+        let _ = scan::scan_subtree(&core.root_path, to, &mut rules, &mut tree, &mut found);
+        drop(rules);
+        core.publish_locked(&tree, found, None);
     } else {
         let mut tree = core.tree();
         changes.extend(tree.observe(to, present));
         changes.extend(tree.observe(from, Observed::Absent));
-        core.publish_locked(&tree, changes, origin);
+        let foreign = fc.kind == Kind::File && meta.hash != fc.hash;
+        core.publish_locked(&tree, changes, origin.filter(|_| !foreign));
     }
     Ok(Reply::Done { meta })
 }
@@ -1378,7 +1390,12 @@ mod tests {
             Err(WireErr::Ignored)
         );
         assert_eq!(
-            exec(&core, op_mv("SECRETS/key.pem", "stolen.pem"), Payload::None, None),
+            exec(
+                &core,
+                op_mv("SECRETS/key.pem", "stolen.pem"),
+                Payload::None,
+                None
+            ),
             Err(WireErr::Ignored)
         );
         assert_eq!(fs::read(t.0.join(".env")).unwrap(), b"TOKEN=1\n");
@@ -1468,7 +1485,12 @@ mod tests {
         assert_eq!(class(".env"), Class::Ignored);
 
         assert!(matches!(
-            exec(&core, op_mv("sub/.gitignore", ".gitignore"), Payload::None, None),
+            exec(
+                &core,
+                op_mv("sub/.gitignore", ".gitignore"),
+                Payload::None,
+                None
+            ),
             Ok(Reply::Done { .. })
         ));
         reread(&core, ".gitignore");

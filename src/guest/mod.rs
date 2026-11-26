@@ -434,6 +434,7 @@ mod live {
             work: VecDeque::new(),
             seen: FxHashSet::default(),
             rule_paths: Vec::new(),
+            bye: CloseReason::Local,
             cfg,
         };
         let res = match hello(&sess, &g.core.tree) {
@@ -489,6 +490,8 @@ mod live {
         work: VecDeque<Effect>,
         seen: FxHashSet<NodeId>,
         rule_paths: Vec<RelPath>,
+        // what the host is told when the link closes at shutdown
+        bye: CloseReason,
     }
 
     fn earliest(a: Option<Instant>, b: Instant) -> Option<Instant> {
@@ -537,6 +540,7 @@ mod live {
                     },
                     recv(cmds) -> c => match c {
                         Ok(UiCmd::Quit) | Err(_) => return Ok(()),
+                        Ok(UiCmd::Revoke(HOST_PEER)) => return Err(self.forget_host()),
                         Ok(_) => {}
                     },
                     recv(timer) -> _ => self.tick(),
@@ -585,6 +589,7 @@ mod live {
             } = sess;
             self.host_name = hello.name;
             let rpc = Rpc::new(link.clone());
+            self.core.tw().clear_acked();
             self.remote.set(Some(rpc.clone() as Arc<dyn Remote>));
             *lock(&self.link_slot) = Some(link.clone());
             self.link = Some(link);
@@ -599,6 +604,13 @@ mod live {
             rules_reset(&self.core, &self.rules, &w.excludes, &w.repos);
             self.set_peer(ConnState::Syncing { done: 0, total: 0 });
             self.ping();
+        }
+
+        // the user withdrew trust in this host: drop its entry, then end like a revoked session
+        fn forget_host(&mut self) -> io::Error {
+            let _ = self.cfg.trust.forget(&self.key.to_b64());
+            self.bye = CloseReason::Revoked;
+            denied("this guest forgot the host")
         }
 
         fn lost(&mut self, why: CloseReason) -> io::Result<()> {
@@ -987,7 +999,7 @@ mod live {
             }
             self.bus.update(|s| s.mounted = false);
             if let Some(l) = self.link.take() {
-                l.close(CloseReason::Local);
+                l.close(self.bye.clone());
             }
             *lock(&self.link_slot) = None;
             self.remote.set(None);
@@ -1233,7 +1245,10 @@ mod live {
                 ));
             }
             assert!(matches!(
-                classify(NetError::Handshake("handshake authentication failed"), false),
+                classify(
+                    NetError::Handshake("handshake authentication failed"),
+                    false
+                ),
                 Fail::Unverified
             ));
             assert!(matches!(

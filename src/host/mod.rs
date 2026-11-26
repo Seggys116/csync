@@ -30,6 +30,7 @@ use rustc_hash::FxHashMap;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use std::{
     cell::Cell,
+    collections::VecDeque,
     fs::File,
     io::{self, Read},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
@@ -1276,6 +1277,8 @@ impl Host {
             jobs: self.jobs.clone(),
             fetch: self.fetch.clone(),
             uploads: FxHashMap::default(),
+            order: VecDeque::new(),
+            held: FxHashMap::default(),
             live: false,
             last_ping: Instant::now(),
         };
@@ -1339,6 +1342,9 @@ struct SessionCtx {
     jobs: Sender<commit::Job>,
     fetch: Sender<serve::FetchJob>,
     uploads: FxHashMap<ReqId, Upload>,
+    // mutations not yet handed to the committer, in the order the guest sent them
+    order: VecDeque<ReqId>,
+    held: FxHashMap<ReqId, (Op, commit::Payload)>,
     live: bool,
     last_ping: Instant,
 }
@@ -1443,7 +1449,7 @@ impl SessionCtx {
             .collect();
         for id in stale {
             self.uploads.remove(&id);
-            self.g.reply(id, Err(WireErr::Io));
+            self.fail(id, WireErr::Io);
         }
     }
 
@@ -1455,7 +1461,7 @@ impl SessionCtx {
             }
             Msg::Cancel { id } => {
                 if self.uploads.remove(&id).is_some() {
-                    self.g.reply(id, Err(WireErr::Gone));
+                    self.fail(id, WireErr::Gone);
                 } else {
                     self.g.cancel_fetch(id);
                 }
@@ -1517,23 +1523,23 @@ impl SessionCtx {
             Op::Mk { .. } | Op::Remove { .. } | Op::SetAttr { .. } => None,
         };
         let Some((target, ver, body)) = plan else {
-            return self.submit(id, op, commit::Payload::None);
+            return self.ready(id, op, commit::Payload::None);
         };
         match body {
-            Body::Empty => self.submit(id, op, commit::Payload::Bytes(Vec::new())),
+            Body::Empty => self.ready(id, op, commit::Payload::Bytes(Vec::new())),
             Body::Inline(b) => {
                 self.core
                     .stats
                     .rx
                     .fetch_add(b.0.len() as u64, Ordering::Relaxed);
-                self.submit(id, op, commit::Payload::Bytes(b.0));
+                self.ready(id, op, commit::Payload::Bytes(b.0));
             }
             Body::Stream { len } if len != ver.size => self.g.reply(id, Err(WireErr::Invalid)),
-            Body::Stream { len: 0 } => self.submit(id, op, commit::Payload::Bytes(Vec::new())),
+            Body::Stream { len: 0 } => self.ready(id, op, commit::Payload::Bytes(Vec::new())),
             Body::Stream { len } => {
                 self.begin_upload(id, op, &target, len, UpKind::Stream { hash: ver.hash })
             }
-            Body::Delta { ops, data_len: 0 } => self.submit(
+            Body::Delta { ops, data_len: 0 } => self.ready(
                 id,
                 op,
                 commit::Payload::Delta {
@@ -1581,6 +1587,38 @@ impl SessionCtx {
         }
     }
 
+    // mutations run in the order the guest sent them, so one still uploading holds back the rest
+    fn ready(&mut self, id: ReqId, op: Op, payload: commit::Payload) {
+        if self.order.is_empty() {
+            return self.submit(id, op, payload);
+        }
+        self.order.push_back(id);
+        self.held.insert(id, (op, payload));
+    }
+
+    fn uploaded(&mut self, id: ReqId, op: Op, payload: commit::Payload) {
+        self.held.insert(id, (op, payload));
+        self.release_held();
+    }
+
+    fn fail(&mut self, id: ReqId, e: WireErr) {
+        self.g.reply(id, Err(e));
+        if let Some(i) = self.order.iter().position(|&x| x == id) {
+            self.order.remove(i);
+        }
+        self.release_held();
+    }
+
+    fn release_held(&mut self) {
+        while let Some(&id) = self.order.front() {
+            let Some((op, payload)) = self.held.remove(&id) else {
+                return;
+            };
+            self.order.pop_front();
+            self.submit(id, op, payload);
+        }
+    }
+
     fn begin_upload(&mut self, id: ReqId, op: Op, target: &RelPath, len: u64, kind: UpKind) {
         if self.uploads.contains_key(&id) {
             return self.g.reply(id, Err(WireErr::Invalid));
@@ -1604,6 +1642,7 @@ impl SessionCtx {
                     hasher: blake3::Hasher::new(),
                     at: Instant::now(),
                 };
+                self.order.push_back(id);
                 self.uploads.insert(id, up);
             }
             Err(e) => self.g.reply(id, Err(e)),
@@ -1624,12 +1663,12 @@ impl SessionCtx {
             }
             Err(e) => {
                 self.uploads.remove(&id);
-                self.g.reply(id, Err(e));
+                self.fail(id, e);
             }
         }
     }
 
-    fn finish_upload(&self, id: ReqId, u: Upload) {
+    fn finish_upload(&mut self, id: ReqId, u: Upload) {
         let Upload {
             op,
             kind,
@@ -1641,11 +1680,11 @@ impl SessionCtx {
         match kind {
             UpKind::Stream { hash } => {
                 if *hasher.finalize().as_bytes() != hash {
-                    return self.g.reply(id, Err(WireErr::Invalid));
+                    return self.fail(id, WireErr::Invalid);
                 }
-                self.submit(id, op, commit::Payload::File(staged));
+                self.uploaded(id, op, commit::Payload::File(staged));
             }
-            UpKind::Delta { ops } => self.submit(
+            UpKind::Delta { ops } => self.uploaded(
                 id,
                 op,
                 commit::Payload::Delta {
@@ -1655,5 +1694,191 @@ impl SessionCtx {
                 },
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::{Expect, Version};
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn session() -> (Tmp, SessionCtx, Receiver<commit::Job>, Session) {
+        session_with(|_| {})
+    }
+
+    fn session_with(prep: impl FnOnce(&Path)) -> (Tmp, SessionCtx, Receiver<commit::Job>, Session) {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let p = std::env::temp_dir().join(format!(
+            "csync-order-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        let root = std::fs::canonicalize(&p).unwrap();
+        prep(&root);
+        let mut rules = Rules::new(&[]);
+        let tree = scan::scan(&root, &mut rules).unwrap();
+        let (ev, _) = bounded(64);
+        let core = Core::new(
+            root.clone(),
+            Name::new("t").unwrap(),
+            tree,
+            Arc::new(RwLock::new(rules)),
+            ev,
+        )
+        .unwrap();
+        let (guest_end, host_end) = crate::net::conn::tests::test_pair();
+        let g = Arc::new(Guest::new(
+            1,
+            host_end.link.clone(),
+            Name::new("g").unwrap(),
+        ));
+        let (jobs, jrx) = crossbeam_channel::unbounded();
+        let (fetch, _) = bounded(4);
+        let ctx = SessionCtx {
+            core: Arc::new(core),
+            g,
+            inbox: host_end.inbox,
+            jobs,
+            fetch,
+            uploads: FxHashMap::default(),
+            order: VecDeque::new(),
+            held: FxHashMap::default(),
+            live: true,
+            last_ping: Instant::now(),
+        };
+        (Tmp(root), ctx, jrx, guest_end)
+    }
+
+    fn streamed(path: &str, body: &[u8]) -> Op {
+        Op::Commit {
+            path: RelPath::new(path).unwrap(),
+            base: Expect::Absent,
+            new: Version {
+                hash: *blake3::hash(body).as_bytes(),
+                size: body.len() as u64,
+            },
+            perm: Some(0o644),
+            body: Body::Stream {
+                len: body.len() as u64,
+            },
+            sync: false,
+        }
+    }
+
+    fn ids(rx: &Receiver<commit::Job>) -> Vec<ReqId> {
+        rx.try_iter().map(|j| j.id).collect()
+    }
+
+    #[test]
+    fn a_rename_waits_for_the_upload_it_follows() {
+        let (_t, mut s, jobs, _peer) = session();
+        let body = vec![7u8; 100_000];
+        s.on_msg(Msg::Req {
+            id: 1,
+            op: streamed(".a.tmp", &body),
+        });
+        s.on_msg(Msg::Req {
+            id: 2,
+            op: Op::Rename {
+                from: RelPath::new(".a.tmp").unwrap(),
+                to: RelPath::new("a").unwrap(),
+                from_expect: Expect::Any,
+                to_expect: Expect::Absent,
+                body: None,
+            },
+        });
+        assert!(
+            ids(&jobs).is_empty(),
+            "nothing may run before the upload lands"
+        );
+        s.on_chunk(1, 0, true, &body);
+        assert_eq!(ids(&jobs), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_failed_upload_releases_what_waited_behind_it() {
+        let (_t, mut s, jobs, _peer) = session();
+        let body = vec![1u8; 100_000];
+        s.on_msg(Msg::Req {
+            id: 3,
+            op: streamed(".b.tmp", &body),
+        });
+        s.on_msg(Msg::Req {
+            id: 4,
+            op: Op::Remove {
+                path: RelPath::new("x").unwrap(),
+                expect: Expect::Any,
+            },
+        });
+        s.on_msg(Msg::Cancel { id: 3 });
+        assert_eq!(ids(&jobs), vec![4]);
+        s.on_msg(Msg::Req {
+            id: 5,
+            op: Op::Remove {
+                path: RelPath::new("y").unwrap(),
+                expect: Expect::Any,
+            },
+        });
+        assert_eq!(ids(&jobs), vec![5]);
+    }
+
+    #[test]
+    fn a_guest_dir_move_tells_that_guest_what_the_host_changed_inside() {
+        let (t, s, _jobs, peer) = session_with(|root| {
+            std::fs::create_dir_all(root.join("d1")).unwrap();
+            std::fs::write(root.join("d1/a.txt"), "a\n").unwrap();
+            std::fs::write(root.join("d1/b.txt"), "b\n").unwrap();
+        });
+        {
+            let mut f = lock(&s.g.feed);
+            f.live = true;
+            f.sent = s.core.tree().seq();
+        }
+        lock(&s.core.hub.guests).push(s.g.clone());
+        // a host write the watcher has not reported yet
+        std::fs::remove_file(t.0.join("d1/b.txt")).unwrap();
+        std::fs::write(t.0.join("d1/c.txt"), "c\n").unwrap();
+        let op = Op::Rename {
+            from: RelPath::new("d1").unwrap(),
+            to: RelPath::new("m2").unwrap(),
+            from_expect: Expect::Dir,
+            to_expect: Expect::Absent,
+            body: None,
+        };
+        assert!(commit::exec(&s.core, op, commit::Payload::None, Some(s.g.id)).is_ok());
+        let mut seen = Vec::new();
+        while let Ok(i) = peer.inbox.recv_timeout(Duration::from_secs(2)) {
+            if let In::Msg(Msg::Push(Push::Changes { changes, .. })) = i {
+                seen.extend(changes);
+            }
+            if seen.len() >= 2 {
+                break;
+            }
+        }
+        let b = RelPath::new("m2/b.txt").unwrap();
+        let c = RelPath::new("m2/c.txt").unwrap();
+        assert!(
+            seen.iter()
+                .any(|x| matches!(x, Change::Remove { path } if *path == b)),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .any(|x| matches!(x, Change::Upsert { path, .. } if *path == c)),
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|x| matches!(x, Change::Rename { .. })),
+            "the origin already made the move itself: {seen:?}"
+        );
     }
 }

@@ -807,7 +807,17 @@ impl Applier {
             let list = repo::tracked_ignored(&abs, &wt);
             let mut sorted = list.clone();
             sorted.sort_unstable();
-            if self.exc.get(&wt) == Some(&sorted) {
+            // the first refresh compares against what registration already applied, not an empty cache
+            let same = match self.exc.get(&wt) {
+                Some(v) => *v == sorted,
+                None => {
+                    let mut cur = self.core.rules_r().repo_exceptions(&wt);
+                    cur.sort_unstable();
+                    cur == sorted
+                }
+            };
+            if same {
+                self.exc.insert(wt, sorted);
                 continue;
             }
             self.exc.insert(wt.clone(), sorted);
@@ -1059,6 +1069,81 @@ mod tests {
         assert_eq!(top_missing(&t, &rp("a/b/c")), Some(rp("a/b")));
         assert_eq!(top_missing(&t, &rp("a")), None);
         assert_eq!(top_missing(&t, &rp("z")), Some(rp("z")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_writes_inside_a_dir_the_committer_moved_are_indexed() {
+        use crate::host::commit::{Payload, exec};
+        use crate::proto::{Expect, Op};
+        use std::fs;
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-moved-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("a/sub")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/x.txt"), "x0\n").unwrap();
+        fs::write(root.join("a/sub/f.txt"), "f\n").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let _clean = Clean(root.clone());
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(1024);
+        let watcher = sys::start_watcher_filtered(&root, None, tx.clone(), None).unwrap();
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core =
+            Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let idx = root.with_extension("index");
+        let _clean_idx = Clean(idx.clone());
+        let app = Applier::new(core.clone(), watcher, rx, stop_rx, idx);
+        let h = std::thread::spawn(move || app.run());
+        let wait = |what: &str, f: &dyn Fn(&Tree) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !f(&core.tree()) {
+                assert!(Instant::now() < deadline, "index never showed {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (mut from, mut to) = ("a", "b/m2");
+        for i in 0..20u32 {
+            let op = Op::Rename {
+                from: rp(from),
+                to: rp(to),
+                from_expect: Expect::Dir,
+                to_expect: Expect::Absent,
+                body: None,
+            };
+            assert!(exec(&core, op, Payload::None, Some(7)).is_ok());
+            if i % 2 == 1 {
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            let leaf = format!("{to}/sub/t{i}/leaf");
+            fs::create_dir(root.join(format!("{to}/sub/t{i}"))).unwrap();
+            fs::write(root.join(&leaf), "g\n").unwrap();
+            let body = format!("x{i} changed\n");
+            fs::write(root.join(format!("{to}/x.txt")), &body).unwrap();
+            let want = *blake3::hash(body.as_bytes()).as_bytes();
+            let xp = rp(&format!("{to}/x.txt"));
+            wait(&leaf, &|t| t.get(&rp(&leaf)).is_some());
+            wait(&format!("{to}/x.txt"), &|t| {
+                t.get(&xp).and_then(|e| e.meta.hash) == Some(want)
+            });
+            assert!(core.tree().get(&rp(from)).is_none());
+            std::mem::swap(&mut from, &mut to);
+        }
+        let _ = stop_tx.send(());
+        h.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 24" width="960" height="24" role="presentation" aria-hidden="true">
+<defs>
+<linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#2dd4bf" stop-opacity="0"/>
+<stop offset="0.2" stop-color="#2dd4bf" stop-opacity="0.7"/>
+<stop offset="0.8" stop-color="#a78bfa" stop-opacity="0.7"/>
+<stop offset="1" stop-color="#a78bfa" stop-opacity="0"/>
+</linearGradient>
+<linearGradient id="h" x1="0" y1="0" x2="1" y2="0">
+<stop offset="0" stop-color="#c9d1d9" stop-opacity="0"/>
+<stop offset="0.5" stop-color="#c9d1d9" stop-opacity="0.6"/>
+<stop offset="1" stop-color="#c9d1d9" stop-opacity="0"/>
+</linearGradient>
+</defs>
+<style>@media (prefers-reduced-motion: reduce){.m{display:none}}</style>
+<g shape-rendering="crispEdges">
+<rect x="24" y="11" width="912" height="2" fill="url(#g)"/>
+<rect x="468" y="8" width="8" height="8" fill="#2dd4bf"/>
+<rect x="484" y="8" width="8" height="8" fill="#a78bfa"/>
+</g>
+<rect class="m" x="24" y="11" width="120" height="2" fill="url(#h)"><animate attributeName="x" values="24;816;816" keyTimes="0;0.6;1" dur="7s" repeatCount="indefinite"/></rect>
+</svg>

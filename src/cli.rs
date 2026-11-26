@@ -74,7 +74,7 @@ pub enum Cmd {
         #[arg(
             long,
             value_name = "ADDR",
-            help = "Address to listen on [default: 0.0.0.0:47480]"
+            help = format!("Address to listen on [default: 0.0.0.0:{DEFAULT_PORT}]")
         )]
         listen: Option<SocketAddr>,
         #[arg(long, help = "Do not advertise over mDNS; guests must use --connect")]
@@ -1124,6 +1124,22 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn listen_help_names_the_real_default_port() {
+        let mut c = Cli::command();
+        let host = c.find_subcommand_mut("host").expect("host subcommand");
+        let listen = host
+            .get_arguments()
+            .find(|a| a.get_id() == "listen")
+            .and_then(|a| a.get_help())
+            .map(ToString::to_string)
+            .expect("listen help");
+        assert!(
+            listen.contains(&format!("0.0.0.0:{DEFAULT_PORT}]")),
+            "{listen}"
+        );
     }
 
     #[test]

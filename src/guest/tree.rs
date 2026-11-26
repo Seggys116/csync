@@ -157,6 +157,8 @@ pub struct GTree {
     ghosts: FxHashMap<(NodeId, Name), NodeId>,
     moving: FxHashMap<NodeId, (NodeId, Name)>,
     snap: Option<Vec<NodeId>>,
+    // commits the host acknowledged on the current link; a snapshot taken before them must not revert them
+    acked: rustc_hash::FxHashSet<NodeId>,
     epoch: u32,
     deferred: Vec<Effect>,
     stack: Vec<NodeId>,
@@ -199,6 +201,7 @@ impl GTree {
             ghosts: FxHashMap::default(),
             moving: FxHashMap::default(),
             snap: None,
+            acked: rustc_hash::FxHashSet::default(),
             epoch: 0,
             deferred: Vec::new(),
             stack: Vec::new(),
@@ -461,6 +464,27 @@ impl GTree {
         }
         self.attached += 1;
         id
+    }
+
+    // a guest mkdir the host answered after its own copy of the directory arrived keeps that node and its contents
+    pub fn insert_dir(
+        &mut self,
+        parent: NodeId,
+        name: Name,
+        meta: Meta,
+        domain: GDomain,
+    ) -> NodeId {
+        if let Some(id) = self.child(parent, name.as_str())
+            && !self.moving.contains_key(&id)
+            && let Some(n) = self.get_mut(id)
+            && n.is_dir()
+            && n.domain == domain
+        {
+            n.meta = meta;
+            n.vis = Vis::Live;
+            return id;
+        }
+        self.insert(parent, name, meta, domain, Vis::Live)
     }
 
     // unlinks id and its subtree; slots the kernel still references stay until forget
@@ -920,6 +944,19 @@ impl GTree {
         true
     }
 
+    pub fn was_acked(&self, id: NodeId) -> bool {
+        self.acked.contains(&id)
+    }
+
+    pub fn note_acked(&mut self, id: NodeId) {
+        self.acked.insert(id);
+    }
+
+    // a new link: its snapshot is taken before any request on it is served
+    pub fn clear_acked(&mut self) {
+        self.acked.clear();
+    }
+
     pub fn snapshot_reset(&mut self) {
         self.snap = None;
     }
@@ -952,9 +989,12 @@ impl GTree {
             if !self.get(parent).is_some_and(|p| p.children.is_some()) {
                 return Err("snapshot parent is not a directory");
             }
-            let id = self
-                .upsert_at(parent, e.name.as_str(), e.meta.clone(), fx)
-                .unwrap_or(DETACHED);
+            let id = match self.child(parent, e.name.as_str()) {
+                Some(id) if self.acked.contains(&id) => id,
+                _ => self
+                    .upsert_at(parent, e.name.as_str(), e.meta.clone(), fx)
+                    .unwrap_or(DETACHED),
+            };
             if let Some(s) = idx(id).and_then(|i| self.slots.get_mut(i)) {
                 s.mark = self.epoch;
             }
@@ -962,6 +1002,7 @@ impl GTree {
         }
         if last {
             self.sweep(fx);
+            self.acked.clear();
         } else {
             self.snap = Some(ids);
         }
@@ -973,7 +1014,11 @@ impl GTree {
         // a file with a write in flight may not be on the host yet; it and its directories stay until the commit settles
         let mut keep = rustc_hash::FxHashSet::default();
         for (i, s) in self.slots.iter().enumerate() {
-            if s.node.as_ref().is_some_and(|n| n.staging.is_some() && n.attached()) {
+            let id = i as NodeId + 1;
+            if s.node
+                .as_ref()
+                .is_some_and(|n| n.attached() && (n.staging.is_some() || self.acked.contains(&id)))
+            {
                 let mut cur = i as NodeId + 1;
                 while cur != ROOT && keep.insert(cur) {
                     match self.get(cur) {
@@ -1071,6 +1116,21 @@ mod tests {
         up(&mut t, "src/a.rs", file(1));
         t.set_mounted(true);
         t
+    }
+
+    #[test]
+    fn guest_mkdir_keeps_the_host_copy_that_raced_it() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        up(&mut t, "src/b", dir());
+        up(&mut t, "src/b/c.rs", file(3));
+        let host_b = t.resolve(&rp("src/b")).unwrap();
+        let id = t.insert_dir(src, nm("b"), dir(), GDomain::Synced);
+        assert_eq!(id, host_b);
+        assert_eq!(t.lookup(src, "b").map(|(i, _)| i), Some(id));
+        assert!(t.resolve(&rp("src/b/c.rs")).is_some());
+        let fresh = t.insert_dir(src, nm("d"), dir(), GDomain::Synced);
+        assert_eq!(t.lookup(src, "d").map(|(i, _)| i), Some(fresh));
     }
 
     #[test]
@@ -1336,6 +1396,33 @@ mod tests {
             out.iter()
                 .all(|e| e.name.as_str() != "target" && e.name.as_str() != "gone")
         );
+    }
+
+    #[test]
+    fn snapshot_never_reverts_a_commit_acked_on_the_same_link() {
+        let mut t = GTree::new();
+        let mut fx = Vec::new();
+        t.apply_snapshot_part(&[entry(0, "a", file(1))], true, &mut fx)
+            .unwrap();
+        t.clear_acked();
+        // guest commits: a new version of a, and a new file b the snapshot below predates
+        let a = t.resolve(&rp("a")).unwrap();
+        up(&mut t, "a", file(2));
+        up(&mut t, "b", file(3));
+        let b = t.resolve(&rp("b")).unwrap();
+        t.note_acked(a);
+        t.note_acked(b);
+        t.snapshot_reset();
+        t.apply_snapshot_part(&[entry(0, "a", file(1))], true, &mut fx)
+            .unwrap();
+        assert_eq!(t.get(a).map(|n| n.meta.hash), Some(file(2).hash));
+        assert_eq!(t.resolve(&rp("b")), Some(b));
+        // once that snapshot is in, later ones apply in full again
+        t.snapshot_reset();
+        t.apply_snapshot_part(&[entry(0, "a", file(1))], true, &mut fx)
+            .unwrap();
+        assert_eq!(t.get(a).map(|n| n.meta.hash), Some(file(1).hash));
+        assert!(t.resolve(&rp("b")).is_none());
     }
 
     #[test]

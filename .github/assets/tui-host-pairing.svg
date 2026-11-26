@@ -1,0 +1,347 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 924 556" width="924" height="556" role="img" aria-label="host-pairing">
+<rect width="924" height="556" rx="12" fill="#0d1117"/>
+<g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="15" xml:space="preserve">
+<text x="12.0" y="26.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="26.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">c</text>
+<text x="39.0" y="26.0" fill="#4cc2ce" font-weight="700" textLength="9.0" lengthAdjust="spacing">s</text>
+<text x="48.0" y="26.0" fill="#6ab0dd" font-weight="700" textLength="9.0" lengthAdjust="spacing">y</text>
+<text x="57.0" y="26.0" fill="#899deb" font-weight="700" textLength="9.0" lengthAdjust="spacing">n</text>
+<text x="66.0" y="26.0" fill="#a78bfa" font-weight="700" textLength="9.0" lengthAdjust="spacing">c</text>
+<text x="75.0" y="26.0" fill="#808899" textLength="45.0" lengthAdjust="spacing"> host</text>
+<text x="120.0" y="26.0" fill="#3e4454" textLength="612.0" lengthAdjust="spacing"> ────────────────────────────────────────────────────────────────── </text>
+<text x="732.0" y="26.0" fill="#daaa2c" textLength="9.0" lengthAdjust="spacing">●</text>
+<text x="750.0" y="26.0" fill="#daaa2c" textLength="135.0" lengthAdjust="spacing">pairing request</text>
+<text x="885.0" y="26.0" fill="#3e4454" textLength="27.0" lengthAdjust="spacing"> ─╮</text>
+<text x="12.0" y="45.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="45.0" fill="#808899" textLength="81.0" lengthAdjust="spacing">project  </text>
+<text x="111.0" y="45.0" fill="#c9d1d9" font-weight="700" textLength="45.0" lengthAdjust="spacing">proj2</text>
+<text x="705.0" y="45.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">listen</text>
+<text x="759.0" y="45.0" fill="#c9d1d9" textLength="144.0" lengthAdjust="spacing">  0.0.0.0:47474 </text>
+<text x="903.0" y="45.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="64.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="64.0" fill="#808899" textLength="81.0" lengthAdjust="spacing">root     </text>
+<text x="111.0" y="64.0" fill="#c9d1d9" textLength="792.0" lengthAdjust="spacing">/private/tmp/claude-501/-Users-zaknoble-cla…a02-4d08-913d-4f088ffe589c/scratchpad/proj2 </text>
+<text x="903.0" y="64.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="83.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="12.0" y="102.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="102.0" fill="#3e4454" font-weight="700" textLength="54.0" lengthAdjust="spacing">Guests</text>
+<text x="84.0" y="102.0" fill="#3e4454" textLength="792.0" lengthAdjust="spacing"> ───────────────────────────────────────────────────────────────────────────────────────</text>
+<text x="876.0" y="102.0" fill="#808899" textLength="27.0" lengthAdjust="spacing"> 0 </text>
+<text x="903.0" y="102.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">╮</text>
+<text x="12.0" y="121.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="121.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">⠏</text>
+<text x="39.0" y="121.0" fill="#c9d1d9" textLength="864.0" lengthAdjust="spacing"> waiting for a guest to connect                                                                 </text>
+<text x="903.0" y="121.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="48.0" y="140.0" fill="#808899" textLength="153.0" lengthAdjust="spacing">on the guest run </text>
+<text x="201.0" y="140.0" fill="#2dd4bf" textLength="90.0" lengthAdjust="spacing">csync join</text>
+<text x="903.0" y="140.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="159.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="12.0" y="178.0" fill="#3e4454" textLength="18.0" lengthAdjust="spacing">╭ </text>
+<text x="30.0" y="178.0" fill="#3e4454" font-weight="700" textLength="72.0" lengthAdjust="spacing">Activity</text>
+<text x="102.0" y="178.0" fill="#3e4454" textLength="99.0" lengthAdjust="spacing"> ──────────</text>
+<text x="201.0" y="178.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">╭</text>
+<text x="210.0" y="178.0" fill="#2fd3c0" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="219.0" y="178.0" fill="#31d1c1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="228.0" y="178.0" fill="#34d0c2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="237.0" y="178.0" fill="#36cfc3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="246.0" y="178.0" fill="#38cdc4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="255.0" y="178.0" fill="#3accc5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="264.0" y="178.0" fill="#3ccbc6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="273.0" y="178.0" fill="#3ecac7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="282.0" y="178.0" fill="#41c8c8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="291.0" y="178.0" fill="#43c7ca" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="300.0" y="178.0" fill="#45c6cb" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="309.0" y="178.0" fill="#47c4cc" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="318.0" y="178.0" fill="#49c3cd" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="327.0" y="178.0" fill="#4cc2ce" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="336.0" y="178.0" fill="#4ec0cf" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="345.0" y="178.0" fill="#50bfd0" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="354.0" y="178.0" fill="#52bed1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="363.0" y="178.0" fill="#54bdd2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="372.0" y="178.0" fill="#56bbd3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="390.0" y="178.0" fill="#2dd4bf" font-weight="700" textLength="135.0" lengthAdjust="spacing">Pairing request</text>
+<text x="534.0" y="178.0" fill="#7ea4e6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="543.0" y="178.0" fill="#80a2e7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="552.0" y="178.0" fill="#82a1e8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="561.0" y="178.0" fill="#84a0e9" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="570.0" y="178.0" fill="#869fea" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="579.0" y="178.0" fill="#899deb" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="588.0" y="178.0" fill="#8b9cec" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="597.0" y="178.0" fill="#8d9bed" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="606.0" y="178.0" fill="#8f99ee" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="615.0" y="178.0" fill="#9198ef" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="624.0" y="178.0" fill="#9397f1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="633.0" y="178.0" fill="#9695f2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="642.0" y="178.0" fill="#9894f3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="651.0" y="178.0" fill="#9a93f4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="660.0" y="178.0" fill="#9c92f5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="669.0" y="178.0" fill="#9e90f6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="678.0" y="178.0" fill="#a08ff7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="687.0" y="178.0" fill="#a38ef8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="696.0" y="178.0" fill="#a58cf9" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="705.0" y="178.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">╮</text>
+<text x="714.0" y="178.0" fill="#3e4454" textLength="198.0" lengthAdjust="spacing">──────────────── utc ╮</text>
+<text x="12.0" y="197.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="197.0" fill="#3e4454" textLength="135.0" lengthAdjust="spacing">no activity yet</text>
+<text x="201.0" y="197.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="228.0" y="197.0" fill="#808899" textLength="45.0" lengthAdjust="spacing">guest</text>
+<text x="291.0" y="197.0" fill="#c9d1d9" font-weight="700" textLength="108.0" lengthAdjust="spacing">65ac89c0ef42</text>
+<text x="705.0" y="197.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="197.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="216.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="30.0" y="216.0" fill="#2dd4bf" textLength="18.0" lengthAdjust="spacing">› </text>
+<text x="48.0" y="216.0" fill="#808899" textLength="153.0" lengthAdjust="spacing">guest git: GIT_CO</text>
+<text x="201.0" y="216.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="705.0" y="216.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="714.0" y="216.0" fill="#808899" textLength="126.0" lengthAdjust="spacing">ALUE_0=minimal</text>
+<text x="903.0" y="216.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="235.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="48.0" y="235.0" fill="#808899" textLength="153.0" lengthAdjust="spacing">GIT_CONFIG_KEY_1=</text>
+<text x="201.0" y="235.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="228.0" y="235.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="237.0" y="235.0" fill="#2fd3c0" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="246.0" y="235.0" fill="#32d1c1" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="255.0" y="235.0" fill="#34d0c3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="282.0" y="235.0" fill="#3ccbc6" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="318.0" y="235.0" fill="#45c5cb" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="336.0" y="235.0" fill="#4ac2cd" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="345.0" y="235.0" fill="#4dc1ce" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="354.0" y="235.0" fill="#55c2d2" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="363.0" y="235.0" fill="#63c4d6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="372.0" y="235.0" fill="#70c7d9" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="390.0" y="235.0" fill="#89cde1" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="399.0" y="235.0" fill="#95d0e4" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="408.0" y="235.0" fill="#a1d4e8" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="417.0" y="235.0" fill="#acd7eb" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="426.0" y="235.0" fill="#b4daed" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="480.0" y="235.0" fill="#84b6e4" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="489.0" y="235.0" fill="#7eb0e3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="498.0" y="235.0" fill="#77a9e2" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="507.0" y="235.0" fill="#79a7e4" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="516.0" y="235.0" fill="#7ba5e5" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="534.0" y="235.0" fill="#80a2e7" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="561.0" y="235.0" fill="#879eeb" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="588.0" y="235.0" fill="#8f9aee" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="624.0" y="235.0" fill="#9894f3" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="642.0" y="235.0" fill="#9d91f5" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="651.0" y="235.0" fill="#a08ff6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="660.0" y="235.0" fill="#a28ef8" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="669.0" y="235.0" fill="#a58cf9" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="678.0" y="235.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="705.0" y="235.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="235.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="254.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="254.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="228.0" y="254.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="237.0" y="254.0" fill="#2fd3c0" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="246.0" y="254.0" fill="#32d1c1" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="255.0" y="254.0" fill="#34d0c3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="264.0" y="254.0" fill="#37cec4" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="282.0" y="254.0" fill="#3ccbc6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="291.0" y="254.0" fill="#3ecac7" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="309.0" y="254.0" fill="#43c7ca" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="318.0" y="254.0" fill="#45c5cb" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="345.0" y="254.0" fill="#4dc1ce" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="354.0" y="254.0" fill="#55c2d2" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="363.0" y="254.0" fill="#63c4d6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="372.0" y="254.0" fill="#70c7d9" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="408.0" y="254.0" fill="#a1d4e8" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="444.0" y="254.0" fill="#a3cfea" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="453.0" y="254.0" fill="#9bc9e9" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="462.0" y="254.0" fill="#93c3e7" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="480.0" y="254.0" fill="#84b6e4" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="507.0" y="254.0" fill="#79a7e4" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="516.0" y="254.0" fill="#7ba5e5" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="534.0" y="254.0" fill="#80a2e7" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="543.0" y="254.0" fill="#82a1e8" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="552.0" y="254.0" fill="#859fe9" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="561.0" y="254.0" fill="#879eeb" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="570.0" y="254.0" fill="#8a9dec" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="588.0" y="254.0" fill="#8f9aee" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="597.0" y="254.0" fill="#9198ef" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="615.0" y="254.0" fill="#9695f2" textLength="9.0" lengthAdjust="spacing">▄</text>
+<text x="624.0" y="254.0" fill="#9894f3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="642.0" y="254.0" fill="#9d91f5" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="705.0" y="254.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="254.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="273.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="273.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="237.0" y="273.0" fill="#2fd3c0" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="246.0" y="273.0" fill="#32d1c1" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="255.0" y="273.0" fill="#34d0c3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="300.0" y="273.0" fill="#41c8c8" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="336.0" y="273.0" fill="#4ac2cd" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="345.0" y="273.0" fill="#4dc1ce" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="354.0" y="273.0" fill="#55c2d2" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="363.0" y="273.0" fill="#63c4d6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="408.0" y="273.0" fill="#a1d4e8" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="489.0" y="273.0" fill="#7eb0e3" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="498.0" y="273.0" fill="#77a9e2" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="507.0" y="273.0" fill="#79a7e4" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="561.0" y="273.0" fill="#879eeb" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="606.0" y="273.0" fill="#9397f1" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="651.0" y="273.0" fill="#a08ff6" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="660.0" y="273.0" fill="#a28ef8" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="669.0" y="273.0" fill="#a58cf9" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="678.0" y="273.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">▀</text>
+<text x="705.0" y="273.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="273.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="292.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="292.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="705.0" y="292.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="292.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="311.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="311.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="255.0" y="311.0" fill="#808899" textLength="396.0" lengthAdjust="spacing">accept only if the guest shows the same code</text>
+<text x="705.0" y="311.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="311.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<rect x="228.0" y="316.0" width="405.0" height="19.0" fill="#2a2e3a"/>
+<text x="12.0" y="330.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="330.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="228.0" y="330.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="237.0" y="330.0" fill="#30d2c0" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="246.0" y="330.0" fill="#33d1c2" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="255.0" y="330.0" fill="#35cfc3" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="264.0" y="330.0" fill="#38cdc4" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="273.0" y="330.0" fill="#3bccc6" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="282.0" y="330.0" fill="#3ecac7" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="291.0" y="330.0" fill="#40c8c8" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="300.0" y="330.0" fill="#43c7ca" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="309.0" y="330.0" fill="#46c5cb" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="318.0" y="330.0" fill="#49c3cc" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="327.0" y="330.0" fill="#4cc2ce" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="336.0" y="330.0" fill="#4ec0cf" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="345.0" y="330.0" fill="#51bed0" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="354.0" y="330.0" fill="#54bdd2" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="363.0" y="330.0" fill="#57bbd3" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="372.0" y="330.0" fill="#59b9d4" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="381.0" y="330.0" fill="#5cb8d6" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="390.0" y="330.0" fill="#5fb6d7" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="399.0" y="330.0" fill="#62b4d8" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="408.0" y="330.0" fill="#64b3da" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="417.0" y="330.0" fill="#67b1db" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="426.0" y="330.0" fill="#6ab0dd" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="435.0" y="330.0" fill="#6daede" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="444.0" y="330.0" fill="#70acdf" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="453.0" y="330.0" fill="#72abe1" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="462.0" y="330.0" fill="#75a9e2" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="471.0" y="330.0" fill="#78a7e3" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="480.0" y="330.0" fill="#7ba6e5" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="489.0" y="330.0" fill="#7da4e6" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="498.0" y="330.0" fill="#80a2e7" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="507.0" y="330.0" fill="#83a1e9" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="516.0" y="330.0" fill="#869fea" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="525.0" y="330.0" fill="#899deb" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="534.0" y="330.0" fill="#8b9ced" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="543.0" y="330.0" fill="#8e9aee" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="552.0" y="330.0" fill="#9198ef" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="561.0" y="330.0" fill="#9497f1" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="570.0" y="330.0" fill="#9695f2" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="579.0" y="330.0" fill="#9993f3" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="588.0" y="330.0" fill="#9c92f5" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="597.0" y="330.0" fill="#9f90f6" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="606.0" y="330.0" fill="#a18ef7" textLength="9.0" lengthAdjust="spacing">█</text>
+<text x="615.0" y="330.0" fill="#a48df9" textLength="9.0" lengthAdjust="spacing">▋</text>
+<text x="633.0" y="330.0" fill="#808899" textLength="54.0" lengthAdjust="spacing"> 1m57s</text>
+<text x="705.0" y="330.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="330.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="349.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="349.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="705.0" y="349.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="349.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="368.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="368.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="363.0" y="368.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">a</text>
+<text x="381.0" y="368.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">accept</text>
+<text x="462.0" y="368.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">r</text>
+<text x="480.0" y="368.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">reject</text>
+<text x="705.0" y="368.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="368.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="387.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="201.0" y="387.0" fill="#2dd4bf" textLength="9.0" lengthAdjust="spacing">╰</text>
+<text x="210.0" y="387.0" fill="#2fd3c0" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="219.0" y="387.0" fill="#31d1c1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="228.0" y="387.0" fill="#34d0c2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="237.0" y="387.0" fill="#36cfc3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="246.0" y="387.0" fill="#38cdc4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="255.0" y="387.0" fill="#3accc5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="264.0" y="387.0" fill="#3ccbc6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="273.0" y="387.0" fill="#3ecac7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="282.0" y="387.0" fill="#41c8c8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="291.0" y="387.0" fill="#43c7ca" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="300.0" y="387.0" fill="#45c6cb" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="309.0" y="387.0" fill="#47c4cc" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="318.0" y="387.0" fill="#49c3cd" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="327.0" y="387.0" fill="#4cc2ce" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="336.0" y="387.0" fill="#4ec0cf" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="345.0" y="387.0" fill="#50bfd0" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="354.0" y="387.0" fill="#52bed1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="363.0" y="387.0" fill="#54bdd2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="372.0" y="387.0" fill="#56bbd3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="381.0" y="387.0" fill="#59bad4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="390.0" y="387.0" fill="#5bb9d5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="399.0" y="387.0" fill="#5db7d6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="408.0" y="387.0" fill="#5fb6d7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="417.0" y="387.0" fill="#61b5d8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="426.0" y="387.0" fill="#63b3d9" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="435.0" y="387.0" fill="#66b2da" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="444.0" y="387.0" fill="#68b1db" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="453.0" y="387.0" fill="#6ab0dd" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="462.0" y="387.0" fill="#6caede" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="471.0" y="387.0" fill="#6eaddf" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="480.0" y="387.0" fill="#71ace0" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="489.0" y="387.0" fill="#73aae1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="498.0" y="387.0" fill="#75a9e2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="507.0" y="387.0" fill="#77a8e3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="516.0" y="387.0" fill="#79a6e4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="525.0" y="387.0" fill="#7ba5e5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="534.0" y="387.0" fill="#7ea4e6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="543.0" y="387.0" fill="#80a2e7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="552.0" y="387.0" fill="#82a1e8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="561.0" y="387.0" fill="#84a0e9" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="570.0" y="387.0" fill="#869fea" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="579.0" y="387.0" fill="#899deb" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="588.0" y="387.0" fill="#8b9cec" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="597.0" y="387.0" fill="#8d9bed" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="606.0" y="387.0" fill="#8f99ee" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="615.0" y="387.0" fill="#9198ef" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="624.0" y="387.0" fill="#9397f1" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="633.0" y="387.0" fill="#9695f2" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="642.0" y="387.0" fill="#9894f3" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="651.0" y="387.0" fill="#9a93f4" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="660.0" y="387.0" fill="#9c92f5" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="669.0" y="387.0" fill="#9e90f6" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="678.0" y="387.0" fill="#a08ff7" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="687.0" y="387.0" fill="#a38ef8" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="696.0" y="387.0" fill="#a58cf9" textLength="9.0" lengthAdjust="spacing">─</text>
+<text x="705.0" y="387.0" fill="#a78bfa" textLength="9.0" lengthAdjust="spacing">╯</text>
+<text x="903.0" y="387.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="406.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="406.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="425.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="425.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="444.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="444.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="463.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="463.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="482.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="903.0" y="482.0" fill="#3e4454" textLength="9.0" lengthAdjust="spacing">│</text>
+<text x="12.0" y="501.0" fill="#3e4454" textLength="900.0" lengthAdjust="spacing">╰──────────────────────────────────────────────────────────────────────────────────────────────────╯</text>
+<text x="21.0" y="520.0" fill="#808899" textLength="45.0" lengthAdjust="spacing">files</text>
+<text x="66.0" y="520.0" fill="#c9d1d9" textLength="54.0" lengthAdjust="spacing"> 76   </text>
+<text x="120.0" y="520.0" fill="#808899" textLength="63.0" lengthAdjust="spacing">commits</text>
+<text x="183.0" y="520.0" fill="#c9d1d9" textLength="45.0" lengthAdjust="spacing"> 0   </text>
+<text x="228.0" y="520.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">merged</text>
+<text x="282.0" y="520.0" fill="#c9d1d9" textLength="45.0" lengthAdjust="spacing"> 0   </text>
+<text x="327.0" y="520.0" fill="#808899" textLength="63.0" lengthAdjust="spacing">refused</text>
+<text x="390.0" y="520.0" fill="#c9d1d9" textLength="288.0" lengthAdjust="spacing"> 0                              </text>
+<text x="678.0" y="520.0" fill="#3e4454" textLength="72.0" lengthAdjust="spacing">↓ -  ↑ -</text>
+<text x="759.0" y="520.0" fill="#3e4454" textLength="144.0" lengthAdjust="spacing">▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁</text>
+<text x="21.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">a</text>
+<text x="39.0" y="539.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">accept</text>
+<text x="120.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">r</text>
+<text x="138.0" y="539.0" fill="#808899" textLength="54.0" lengthAdjust="spacing">reject</text>
+<text x="219.0" y="539.0" fill="#2dd4bf" font-weight="700" textLength="9.0" lengthAdjust="spacing">q</text>
+<text x="237.0" y="539.0" fill="#808899" textLength="36.0" lengthAdjust="spacing">quit</text>
+</g></svg>

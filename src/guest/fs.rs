@@ -2,7 +2,7 @@ use super::cache::{BlobCache, BlobRef, WAIT, lock, pread_full, pwrite_all};
 use super::inject::Injector;
 use super::prefetch::{Hint, Prefetch};
 use super::tree::{
-    DETACHED, Effect, GDomain, GNode, GTree, NodeId, ROOT, Refuse, Vis, domain_for_new,
+    DETACHED, Effect, GDomain, GNode, GTree, NodeId, ROOT, Refuse, Synth, Vis, domain_for_new,
 };
 use super::write::{Flushed, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect};
 use crate::ignore::rules::{Class, Rules};
@@ -82,8 +82,21 @@ pub enum Op {
 
 pub const OPS: usize = Op::Other as usize + 1;
 pub const OP_NAMES: [&str; OPS] = [
-    "lookup", "forget", "getattr", "setattr", "open", "read", "write", "flush", "release",
-    "opendir", "readdir", "releasedir", "create", "mutate", "other",
+    "lookup",
+    "forget",
+    "getattr",
+    "setattr",
+    "open",
+    "read",
+    "write",
+    "flush",
+    "release",
+    "opendir",
+    "readdir",
+    "releasedir",
+    "create",
+    "mutate",
+    "other",
 ];
 
 impl Counters {
@@ -155,6 +168,15 @@ fn file_type(k: Kind) -> FileType {
         Kind::Dir => FileType::Directory,
         Kind::Symlink => FileType::Symlink,
     }
+}
+
+// with writeback cache the kernel keeps its own i_size for a written file and ignores the server's,
+// so only the injected truncate (whose setattr reply the kernel always applies) restores the host length
+fn host_content_won(node: NodeId) -> Vec<Effect> {
+    vec![
+        Effect::InvalInode(node),
+        Effect::Synth(Synth::Modify { node }),
+    ]
 }
 
 fn ttl_of(n: &GNode) -> Duration {
@@ -495,6 +517,7 @@ impl Core {
                     to_expect: Expect::Absent,
                     staging: None,
                     local: Some((fd.as_fd(), perm)),
+                    discard: false,
                 });
                 match r {
                     Ok(m) => Some(m),
@@ -838,12 +861,15 @@ impl GuestFs {
             }
             Ok(Flushed::Committed { meta, merged }) => {
                 self.core.ctr.commits.fetch_add(1, Relaxed);
-                if let Some(n) = self.core.tw().get_mut(node) {
+                let mut t = self.core.tw();
+                if let Some(n) = t.get_mut(node) {
                     n.read_ver = meta.version();
                     n.meta = meta;
                 }
+                t.note_acked(node);
+                drop(t);
                 if merged {
-                    self.core.kick(vec![Effect::InvalInode(node)]);
+                    self.core.kick(host_content_won(node));
                 }
                 Ok(())
             }
@@ -856,11 +882,14 @@ impl GuestFs {
                                 n.meta = m;
                             }
                             drop(t);
-                            self.core.kick(vec![Effect::InvalInode(node)]);
+                            self.core.kick(host_content_won(node));
                         }
                         // the host has no such file: the guest copy goes too
                         None => {
-                            let at = t.get(node).filter(|n| n.attached()).map(|n| (n.parent, n.name.clone()));
+                            let at = t
+                                .get(node)
+                                .filter(|n| n.attached())
+                                .map(|n| (n.parent, n.name.clone()));
                             if let Some((parent, name)) = at {
                                 t.remove(node);
                                 drop(t);
@@ -896,17 +925,115 @@ impl GuestFs {
         None
     }
 
-    fn read_newer(&self, id: NodeId, old: Version, offset: u64, want: usize) -> Option<(BlobRef, usize)> {
-        let v = self.newer_meta(id, Some(old))?.version()?;
-        let path = self.core.t().rel_path(id)?;
+    // the host moved on before this version was fetched: serve what replaced it, or the same bytes
+    // from where the file was moved to, as a local file would
+    #[allow(clippy::too_many_arguments)]
+    fn read_newer(
+        &self,
+        id: NodeId,
+        old: Version,
+        at: &RelPath,
+        offset: u64,
+        want: usize,
+        err: i32,
+        reply: ReplyData,
+    ) {
+        let Some((cur, path)) = self.newer_place(id, old, at) else {
+            return reply.error(en(err));
+        };
+        let Some(v) = cur else {
+            return reply.data(&[]);
+        };
         let len = v.size.saturating_sub(offset).min(want as u64) as usize;
+        if len == 0 {
+            return reply.data(&[]);
+        }
         let deadline = Instant::now() + WAIT + Duration::from_millis(v.size >> 12);
-        let b = self
+        match self
             .core
             .cache
             .fetch_at(&v.hash, &path, v.size, offset, len as u32, deadline)
-            .ok()?;
-        Some((b, len))
+        {
+            Ok(b) => read_into(len, |dst| b.read_at(dst, offset).map_err(en), reply),
+            Err(e) => reply.error(en(e)),
+        }
+    }
+
+    // the change that made the host refuse a fetch is on its way: wait for a new version or a new path
+    fn newer_place(
+        &self,
+        id: NodeId,
+        old: Version,
+        at: &RelPath,
+    ) -> Option<(Option<Version>, RelPath)> {
+        for _ in 0..STALE_TRIES {
+            {
+                let t = self.core.t();
+                let n = t.get(id)?;
+                if n.meta.kind != Kind::File {
+                    return None;
+                }
+                let v = n.meta.version();
+                let p = t.rel_path(id);
+                if v != Some(old) || p.as_ref() != Some(at) {
+                    return Some((v, p?));
+                }
+            }
+            std::thread::sleep(STALE_STEP);
+        }
+        None
+    }
+
+    // page cache and i_size belong to the inode, so a cached handle opened on an older version must
+    // serve the current one: a short read at its old eof would shrink i_size until the attrs expire
+    fn moved_on(&self, h: &Handle) -> Option<(Option<Version>, RelPath)> {
+        let opened = match (&h.io, &h.src) {
+            (Io::Cached | Io::Fresh, Src::Blob { ver, .. }) => Some(*ver),
+            (Io::Cached | Io::Fresh, Src::Empty) => None,
+            _ => return None,
+        };
+        let t = self.core.t();
+        let n = t.get(h.node)?;
+        if n.meta.kind != Kind::File || n.meta.version() == opened {
+            return None;
+        }
+        Some((n.meta.version(), t.rel_path(h.node)?))
+    }
+
+    fn read_version(
+        &self,
+        node: NodeId,
+        v: Version,
+        path: &RelPath,
+        offset: u64,
+        want: usize,
+        reply: ReplyData,
+    ) {
+        if offset >= v.size {
+            return reply.data(&[]);
+        }
+        let len = (v.size - offset).min(want as u64) as usize;
+        let res = match self.core.cache.get(&v.hash).filter(|b| b.is_complete()) {
+            Some(b) => Ok(b),
+            None => {
+                let deadline = Instant::now() + WAIT + Duration::from_millis(v.size >> 12);
+                let c = &self.core.ctr.inflight;
+                c.fetch_add(1, Relaxed);
+                let r = self
+                    .core
+                    .cache
+                    .fetch_at(&v.hash, path, v.size, offset, len as u32, deadline);
+                c.fetch_sub(1, Relaxed);
+                r
+            }
+        };
+        match res {
+            Ok(b) => read_into(len, |dst| b.read_at(dst, offset).map_err(en), reply),
+            Err(e @ (libc::ESTALE | libc::EIO)) => {
+                self.read_newer(node, v, path, offset, want, e, reply)
+            }
+            Err(e) => reply.error(en(e)),
+        }
     }
 
     fn open_staged(&self, id: NodeId, o: OpenW<'_>) -> Result<(u32, Arc<OwnedFd>), Errno> {
@@ -990,7 +1117,11 @@ impl GuestFs {
     ) -> Result<NodeId, Errno> {
         let dir = meta.kind == Kind::Dir;
         let mut t = self.core.tw();
-        let id = t.insert(parent, name.clone(), meta, dom, Vis::Live);
+        let id = if dir {
+            t.insert_dir(parent, name.clone(), meta, dom)
+        } else {
+            t.insert(parent, name.clone(), meta, dom, Vis::Live)
+        };
         if id == DETACHED {
             return Err(Errno::ENOENT);
         }
@@ -1258,11 +1389,17 @@ impl GuestFs {
                 None
             }
             (GDomain::Synced, GDomain::Synced) => {
+                if let Some(l) = &p.link
+                    && !l.stays_within(&p.to)
+                {
+                    return Err(Errno::EPERM);
+                }
                 let from_expect = match p.skind {
                     Kind::Dir => Expect::Dir,
                     Kind::File => p.sver.map_or(Expect::Any, Expect::Is),
                     Kind::Symlink => Expect::Any,
                 };
+                let own = p.skind == Kind::File && self.core.t().was_acked(p.sid);
                 let r = self.core.writer.rename(RenameReq {
                     from: &p.from,
                     to: &p.to,
@@ -1270,6 +1407,7 @@ impl GuestFs {
                     to_expect: p.to_expect,
                     staging: p.staging,
                     local: None,
+                    discard: own,
                 });
                 match r {
                     Ok(m) => {
@@ -1284,7 +1422,7 @@ impl GuestFs {
                             if let Some(d) = p.dst {
                                 fx.push(Effect::InvalInode(d));
                             }
-                            if p.staging.is_some() {
+                            if p.staging.is_some() || own {
                                 self.core.tw().remove(p.sid);
                                 if let Ok(n) = Name::new(name) {
                                     fx.push(Effect::InvalEntry(parent, n));
@@ -1319,6 +1457,7 @@ impl GuestFs {
                             to_expect: p.to_expect,
                             staging: None,
                             local: Some((fd.as_fd(), p.sperm)),
+                            discard: false,
                         };
                         self.core.writer.rename(rq).map_err(|e| en(e.errno))?
                     }
@@ -2100,6 +2239,12 @@ impl Filesystem for GuestFs {
             return reply.error(Errno::EBADF);
         };
         let want = size.min(IO_MAX) as usize;
+        if let Some((cur, path)) = self.moved_on(&h) {
+            return match cur {
+                Some(v) => self.read_version(h.node, v, &path, offset, want, reply),
+                None => reply.data(&[]),
+            };
+        }
         match &h.src {
             Src::Blob { path, ver, blob } => {
                 if offset >= ver.size {
@@ -2128,12 +2273,8 @@ impl Filesystem for GuestFs {
                                 fetched = b;
                                 &fetched
                             }
-                            // the host moved on before this version was fetched: serve what replaced it, as a local file would
                             Err(e @ (libc::ESTALE | libc::EIO)) => {
-                                return match self.read_newer(h.node, *ver, offset, want) {
-                                    Some(r) => read_into(r.1, |dst| r.0.read_at(dst, offset).map_err(en), reply),
-                                    None => reply.error(en(e)),
-                                };
+                                return self.read_newer(h.node, *ver, path, offset, want, e, reply);
                             }
                             Err(e) => return reply.error(en(e)),
                         }
@@ -2531,14 +2672,9 @@ impl Filesystem for GuestFs {
         };
         let nf = self.noflush(&h.src);
         match &h.io {
-            Io::Pass(b) => reply.created_passthrough(
-                &ttl,
-                &a,
-                Generation(g),
-                FileHandle(fh),
-                nf,
-                b,
-            ),
+            Io::Pass(b) => {
+                reply.created_passthrough(&ttl, &a, Generation(g), FileHandle(fh), nf, b)
+            }
             io => reply.created(&ttl, &a, Generation(g), FileHandle(fh), fopen(io) | nf),
         }
     }
@@ -2590,10 +2726,15 @@ fn unescape_mountinfo(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        let oct = b.get(i + 1..i + 4).filter(|o| b[i] == b'\\' && o.iter().all(|c| (b'0'..=b'7').contains(c)));
+        let oct = b
+            .get(i + 1..i + 4)
+            .filter(|o| b[i] == b'\\' && o.iter().all(|c| (b'0'..=b'7').contains(c)));
         match oct {
             Some(o) => {
-                out.push(o.iter().fold(0u8, |a, c| a.wrapping_mul(8).wrapping_add(c - b'0')));
+                out.push(
+                    o.iter()
+                        .fold(0u8, |a, c| a.wrapping_mul(8).wrapping_add(c - b'0')),
+                );
                 i += 4;
             }
             None => {
@@ -2616,7 +2757,9 @@ fn csync_mounted_at(at: &Path) -> bool {
         };
         let mut post = post.split(' ');
         let (fstype, source) = (post.next().unwrap_or(""), post.next().unwrap_or(""));
-        pre.split(' ').nth(4).is_some_and(|mp| Path::new(&unescape_mountinfo(mp)) == at)
+        pre.split(' ')
+            .nth(4)
+            .is_some_and(|mp| Path::new(&unescape_mountinfo(mp)) == at)
             && (fstype == "fuse.csync" || (fstype.starts_with("fuse") && source == "csync"))
     })
 }

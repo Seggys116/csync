@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 370" width="960" height="370" role="img" aria-labelledby="t d" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+<title id="t">When both sides edit the same file</title>
+<desc id="d">Three panels. One: the host agent and the guest agent edit the same file at the same time. Two: when their hunks do not overlap, the host makes a clean three-way merge and both edits land. Three: when the hunks overlap, the later edit is refused with ECANCELED and discarded. No .orig, .bak, .A or .B files are ever written.</desc>
+<style>@media (prefers-reduced-motion: reduce){.f{opacity:.45!important}.p{opacity:1!important}}</style>
+<rect width="960" height="370" rx="18" fill="#0d1117"/>
+<rect x="1" y="1" width="958" height="368" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
+<text x="24" y="34" font-size="13" font-weight="700" fill="#c9d1d9">two agents, one file</text>
+<text x="936" y="34" text-anchor="end" font-size="12" fill="#8b949e">merge when it is safe, refuse when it is not</text>
+<rect x="24" y="52" width="290" height="296" fill="#0d1117" stroke="#30363d" stroke-width="4" shape-rendering="crispEdges"/>
+<text x="40" y="80" font-size="13" font-weight="700" fill="#c9d1d9">1  both sides edit</text>
+<text x="40" y="98" font-size="11" fill="#8b949e">host agent and guest agent</text>
+<g shape-rendering="crispEdges">
+<rect x="40" y="112" width="258" height="144" fill="#161b22"/>
+<g><rect x="42" y="134" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="42" y="134" width="3" height="13" fill="#2dd4bf"/></g>
+<g><rect x="42" y="149" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="42" y="149" width="3" height="13" fill="#2dd4bf"/></g>
+<g><rect x="42" y="209" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="42" y="209" width="3" height="13" fill="#a78bfa"/></g>
+<g><rect x="42" y="224" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="42" y="224" width="3" height="13" fill="#a78bfa"/></g>
+<rect x="50" y="122" width="8" height="7" fill="#30363d"/><rect x="66" y="122" width="150" height="7" fill="#3d444d"/>
+<rect x="50" y="137" width="8" height="7" fill="#30363d"/><rect x="66" y="137" width="120" height="7" fill="#3d444d"/>
+<rect x="50" y="152" width="8" height="7" fill="#30363d"/><rect x="66" y="152" width="110" height="7" fill="#3d444d"/>
+<rect x="50" y="167" width="8" height="7" fill="#30363d"/><rect x="66" y="167" width="130" height="7" fill="#3d444d"/>
+<rect x="50" y="182" width="8" height="7" fill="#30363d"/><rect x="66" y="182" width="170" height="7" fill="#3d444d"/>
+<rect x="50" y="197" width="8" height="7" fill="#30363d"/><rect x="66" y="197" width="96" height="7" fill="#3d444d"/>
+<rect x="50" y="212" width="8" height="7" fill="#30363d"/><rect x="66" y="212" width="120" height="7" fill="#3d444d"/>
+<rect x="50" y="227" width="8" height="7" fill="#30363d"/><rect x="66" y="227" width="104" height="7" fill="#3d444d"/>
+<rect x="50" y="242" width="8" height="7" fill="#30363d"/><rect x="66" y="242" width="180" height="7" fill="#3d444d"/>
+</g>
+<text x="290" y="144" text-anchor="end" font-size="10" fill="#2dd4bf">host</text>
+<text x="290" y="219" text-anchor="end" font-size="10" fill="#a78bfa">guest</text>
+<rect x="40" y="268" width="180" height="26" fill="#161b22" stroke="#8b949e" stroke-width="2" shape-rendering="crispEdges"/>
+<text x="52" y="286" font-size="13" font-weight="700" fill="#8b949e">same file, same time</text>
+<text x="40" y="316" font-size="11" fill="#8b949e">the host orders the writes</text>
+<text x="40" y="334" font-size="11" fill="#8b949e">and checks each one</text>
+<rect x="335" y="52" width="290" height="296" fill="#0d1117" stroke="#30363d" stroke-width="4" shape-rendering="crispEdges"/>
+<text x="351" y="80" font-size="13" font-weight="700" fill="#c9d1d9">2  hunks apart</text>
+<text x="351" y="98" font-size="11" fill="#8b949e">no overlap: merged cleanly</text>
+<g shape-rendering="crispEdges">
+<rect x="351" y="112" width="258" height="144" fill="#161b22"/>
+<g><rect x="353" y="134" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="353" y="134" width="3" height="13" fill="#2dd4bf"/></g>
+<g><rect x="353" y="149" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="353" y="149" width="3" height="13" fill="#2dd4bf"/></g>
+<g><rect x="353" y="209" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="353" y="209" width="3" height="13" fill="#a78bfa"/></g>
+<g><rect x="353" y="224" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="353" y="224" width="3" height="13" fill="#a78bfa"/></g>
+<rect x="361" y="122" width="8" height="7" fill="#30363d"/><rect x="377" y="122" width="150" height="7" fill="#3d444d"/>
+<rect x="361" y="137" width="8" height="7" fill="#30363d"/><rect x="377" y="137" width="120" height="7" fill="#3d444d"/>
+<rect x="361" y="152" width="8" height="7" fill="#30363d"/><rect x="377" y="152" width="110" height="7" fill="#3d444d"/>
+<rect x="361" y="167" width="8" height="7" fill="#30363d"/><rect x="377" y="167" width="130" height="7" fill="#3d444d"/>
+<rect x="361" y="182" width="8" height="7" fill="#30363d"/><rect x="377" y="182" width="170" height="7" fill="#3d444d"/>
+<rect x="361" y="197" width="8" height="7" fill="#30363d"/><rect x="377" y="197" width="96" height="7" fill="#3d444d"/>
+<rect x="361" y="212" width="8" height="7" fill="#30363d"/><rect x="377" y="212" width="120" height="7" fill="#3d444d"/>
+<rect x="361" y="227" width="8" height="7" fill="#30363d"/><rect x="377" y="227" width="104" height="7" fill="#3d444d"/>
+<rect x="361" y="242" width="8" height="7" fill="#30363d"/><rect x="377" y="242" width="180" height="7" fill="#3d444d"/>
+</g>
+<text x="601" y="144" text-anchor="end" font-size="10" fill="#2dd4bf">host</text>
+<text x="601" y="219" text-anchor="end" font-size="10" fill="#a78bfa">guest</text>
+<rect x="351" y="268" width="156" height="26" fill="#161b22" stroke="#3fb950" stroke-width="2" shape-rendering="crispEdges"/>
+<text x="363" y="286" font-size="13" font-weight="700" fill="#3fb950">clean 3-way merge</text>
+<text x="351" y="316" font-size="11" fill="#8b949e">both edits land</text>
+<text x="351" y="334" font-size="11" fill="#8b949e">nobody is asked anything</text>
+<rect x="646" y="52" width="290" height="296" fill="#0d1117" stroke="#30363d" stroke-width="4" shape-rendering="crispEdges"/>
+<text x="662" y="80" font-size="13" font-weight="700" fill="#c9d1d9">3  hunks overlap</text>
+<text x="662" y="98" font-size="11" fill="#8b949e">the earlier write wins</text>
+<g shape-rendering="crispEdges">
+<rect x="662" y="112" width="258" height="144" fill="#161b22"/>
+<g><rect x="664" y="149" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="664" y="149" width="3" height="13" fill="#2dd4bf"/></g>
+<g><rect x="664" y="164" width="254" height="13" fill="#2dd4bf" opacity="0.16"/><rect x="664" y="164" width="3" height="13" fill="#2dd4bf"/></g>
+<g class="f"><animate attributeName="opacity" values="1;1;0.15;0.15;1" keyTimes="0;0.35;0.55;0.9;1" dur="5s" repeatCount="indefinite"/><rect x="664" y="164" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="664" y="164" width="3" height="13" fill="#a78bfa"/></g>
+<g class="f"><animate attributeName="opacity" values="1;1;0.15;0.15;1" keyTimes="0;0.35;0.55;0.9;1" dur="5s" repeatCount="indefinite"/><rect x="664" y="179" width="254" height="13" fill="#a78bfa" opacity="0.16"/><rect x="664" y="179" width="3" height="13" fill="#a78bfa"/></g>
+<rect x="664" y="164" width="254" height="13" fill="none" stroke="#ff7b72" stroke-width="2"/>
+<rect x="672" y="122" width="8" height="7" fill="#30363d"/><rect x="688" y="122" width="150" height="7" fill="#3d444d"/>
+<rect x="672" y="137" width="8" height="7" fill="#30363d"/><rect x="688" y="137" width="120" height="7" fill="#3d444d"/>
+<rect x="672" y="152" width="8" height="7" fill="#30363d"/><rect x="688" y="152" width="110" height="7" fill="#3d444d"/>
+<rect x="672" y="167" width="8" height="7" fill="#30363d"/><rect x="688" y="167" width="130" height="7" fill="#3d444d"/>
+<rect x="672" y="182" width="8" height="7" fill="#30363d"/><rect x="688" y="182" width="170" height="7" fill="#3d444d"/>
+<rect x="672" y="197" width="8" height="7" fill="#30363d"/><rect x="688" y="197" width="96" height="7" fill="#3d444d"/>
+<rect x="672" y="212" width="8" height="7" fill="#30363d"/><rect x="688" y="212" width="120" height="7" fill="#3d444d"/>
+<rect x="672" y="227" width="8" height="7" fill="#30363d"/><rect x="688" y="227" width="104" height="7" fill="#3d444d"/>
+<rect x="672" y="242" width="8" height="7" fill="#30363d"/><rect x="688" y="242" width="180" height="7" fill="#3d444d"/>
+</g>
+<text x="912" y="159" text-anchor="end" font-size="10" fill="#2dd4bf">host</text>
+<text x="912" y="174" text-anchor="end" font-size="10" fill="#a78bfa">guest</text>
+<rect x="662" y="268" width="164" height="26" fill="#161b22" stroke="#ff7b72" stroke-width="2" shape-rendering="crispEdges"/>
+<text x="674" y="286" font-size="13" font-weight="700" fill="#ff7b72">refused: ECANCELED</text>
+<text x="662" y="316" font-size="11" fill="#8b949e">later edit refused, discarded</text>
+<text x="662" y="334" font-size="11" fill="#8b949e">no .orig .bak .A .B files</text>
+</svg>

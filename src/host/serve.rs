@@ -90,14 +90,14 @@ fn open_verified(core: &Core, path: &RelPath, stat: &StatKey) -> Result<OwnedFd,
     let fd = sys::open_beneath(core.root.as_fd(), path, OFlags::RDONLY | OFlags::NONBLOCK)
         .map_err(|_| gone(core, path))?;
     let st = sys::stat_key(fd.as_fd()).map_err(|_| gone(core, path))?;
-    if sys::kind_of_mode(st.mode) != Some(Kind::File) || !sys::same_version(&st, stat) {
+    if sys::kind_of_mode(st.mode) != Some(Kind::File) || !sys::same_bytes(&st, stat) {
         return Err(gone(core, path));
     }
     Ok(fd)
 }
 
 fn unchanged(fd: BorrowedFd<'_>, stat: &StatKey) -> bool {
-    sys::stat_key(fd).is_ok_and(|s| sys::same_version(&s, stat))
+    sys::stat_key(fd).is_ok_and(|s| sys::same_bytes(&s, stat))
 }
 
 // Ok(false) when the guest cancelled part way
@@ -296,4 +296,45 @@ fn many(core: &Core, g: &Guest, id: ReqId, items: &[(RelPath, Hash32)]) -> Resul
     core.stats.tx.fetch_add(sent, Ordering::Relaxed);
     reply_bulk(g, id, Ok(Reply::Blobs { items: out }));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ignore::rules::Rules;
+    use crate::index::scan;
+    use crate::proto::Name;
+    use std::{fs, os::unix::fs::PermissionsExt, sync::RwLock};
+
+    #[test]
+    fn a_chmod_does_not_make_unchanged_bytes_gone() {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let p = std::env::temp_dir().join(format!(
+            "csync-serve-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(&p).unwrap();
+        let root = fs::canonicalize(&p).unwrap();
+        fs::write(root.join("a.txt"), "same bytes\n").unwrap();
+        let mut rules = Rules::new(&[]);
+        let tree = scan::scan(&root, &mut rules).unwrap();
+        let (ev, _rx) = crossbeam_channel::bounded(64);
+        let core = Core::new(
+            root.clone(),
+            Name::new("t").unwrap(),
+            tree,
+            Arc::new(RwLock::new(rules)),
+            ev,
+        )
+        .unwrap();
+        let a = RelPath::new("a.txt").unwrap();
+        let stat = core.tree().get(&a).unwrap().stat;
+        fs::set_permissions(root.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(open_verified(&core, &a, &stat).is_ok());
+        fs::write(root.join("a.txt"), "other bytes, longer\n").unwrap();
+        assert_eq!(open_verified(&core, &a, &stat).err(), Some(WireErr::Gone));
+        let _ = fs::remove_dir_all(&root);
+    }
 }

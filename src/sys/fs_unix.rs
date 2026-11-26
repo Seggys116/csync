@@ -199,6 +199,11 @@ pub fn same_version(a: &StatKey, b: &StatKey) -> bool {
         && a.mode == b.mode
 }
 
+// the bytes are those of `b`: a chmod alone changes the version but not the content
+pub fn same_bytes(a: &StatKey, b: &StatKey) -> bool {
+    a.dev == b.dev && a.ino == b.ino && a.size == b.size && a.mtime_ns == b.mtime_ns
+}
+
 pub fn exchange_checked(
     dir: BorrowedFd<'_>,
     tmp: &str,

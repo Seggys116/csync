@@ -249,7 +249,8 @@ impl Walk {
     fn seal(&mut self) {
         if !self.batch.is_empty() {
             let b = std::mem::take(&mut self.batch);
-            self.ready.push_back((b, std::mem::take(&mut self.hot_batch)));
+            self.ready
+                .push_back((b, std::mem::take(&mut self.hot_batch)));
         }
         self.bytes = 0;
     }
@@ -407,7 +408,7 @@ impl Worker {
                 if self.walk.scan_until.is_some_and(|t| Instant::now() < t) {
                     return self.inflight < HOT_DEPTH;
                 }
-                self.inflight == 0 || (self.inflight < DEPTH && self.cache.gate().idle_or_arm())
+                self.inflight < DEPTH && self.cache.gate().idle_or_arm()
             }
         }
     }

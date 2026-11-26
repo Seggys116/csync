@@ -65,6 +65,8 @@ pub struct RenameReq<'a> {
     pub to_expect: Expect,
     pub staging: Option<u32>,
     pub local: Option<(BorrowedFd<'a>, u16)>,
+    // the source is this guest's own save: a refused rename discards it on both sides, as a staged one does
+    pub discard: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,7 +462,7 @@ impl Writer {
             };
             // nobody is left to retry a new file the host never took: the guest copy follows the host
             let r = match r {
-                Err(e) if !e.refused && st.base.is_none() => Err(self.refuse(&mut st, None, None)),
+                Err(e) if !e.refused && st.base.is_none() => self.give_up(&mut st, e),
                 r => r,
             };
             (r != Ok(Flushed::Clean)).then_some(r)
@@ -550,9 +552,34 @@ impl Writer {
             Err(RpcError::Wire(w)) => Err(Refusal::err(wire_errno(w))),
             // the link dropped under the pipelined create: replay it, the host answers Done if it already landed
             Err(_) => match self.commit(st, p.tmp, p.ver, p.stat, false, None) {
-                Err(e) if !e.refused => Err(self.refuse(st, None, None)),
+                Err(e) if !e.refused => self.give_up(st, e),
                 r => r.map(Some),
             },
+        }
+    }
+
+    // the host's current entry at path: Some(None) when it has nothing there, None when it cannot be asked
+    fn host_meta(&self, path: &RelPath) -> Option<Option<Meta>> {
+        let deadline = commit_deadline(0);
+        let (_, remote) = self.remote.get(deadline).ok()?;
+        let op = Op::Fetch {
+            path: path.clone(),
+            want: None,
+            have: None,
+            range: Some((0, 0)),
+        };
+        match remote.call(op, deadline) {
+            Ok(Reply::Blob { meta, .. }) => Some(Some(meta)),
+            Err(RpcError::Wire(WireErr::NotFound | WireErr::Ignored)) => Some(None),
+            _ => None,
+        }
+    }
+
+    // a new file the host never took: the guest copy is set to whatever the host holds, or kept when that is unknown
+    fn give_up<T>(&self, st: &mut Staged, e: Refusal) -> Result<T, Refusal> {
+        match self.host_meta(&st.path) {
+            Some(current) => Err(self.refuse(st, current, None)),
+            None => Err(e),
         }
     }
 
@@ -584,6 +611,8 @@ impl Writer {
             }
             None => (None, Chunks::None),
         };
+        // background warming yields the link while a write waits on the host
+        let _busy = self.cache.gate().enter();
         let (mut gen_seen, mut remote) = self.remote.get(deadline)?;
         let mut retried = false;
         loop {
@@ -960,7 +989,7 @@ impl Writer {
             Expect::Is(v) => Some(v),
             _ => None,
         };
-        self.cas_write(
+        let out = self.cas_write(
             r.to,
             Target::Rename {
                 from: r.from,
@@ -969,8 +998,20 @@ impl Writer {
             ours,
             r.to_expect,
             None,
-        )
-        .map(|w| w.meta)
+        );
+        if let (Err(e), true, Some(v)) = (&out, r.discard, ours)
+            && e.refused
+        {
+            let from = r.from.clone();
+            let rm = move |_: Option<Body>| {
+                Some(Op::Remove {
+                    path: from.clone(),
+                    expect: Expect::Is(v),
+                })
+            };
+            let _ = self.send(&rm, None, commit_deadline(0));
+        }
+        out.map(|w| w.meta)
     }
 
     fn rename_staged(&self, st: &mut Staged, r: &RenameReq<'_>) -> Result<Meta, Refusal> {

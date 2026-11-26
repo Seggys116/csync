@@ -3,8 +3,8 @@ use crate::index::persist;
 use crate::net::conn::Out;
 use crate::net::rpc::{ChunkSink, Rpc, RpcError};
 use crate::proto::{
-    Body, Bytes, ChunkSig, DELTA_MIN, DeltaOp, FILE_MAX, Hash32, Kind, Op, RANGE_FILE_MIN, RANGE_UNIT,
-    RelPath, Reply, ReqId, Version, WireErr,
+    Body, Bytes, ChunkSig, DELTA_MIN, DeltaOp, FILE_MAX, Hash32, Kind, Op, RANGE_FILE_MIN,
+    RANGE_UNIT, RelPath, Reply, ReqId, Version, WireErr,
 };
 use crate::sys;
 use rustc_hash::FxHashMap;
@@ -382,7 +382,7 @@ pub struct Gate {
 pub struct GateGuard<'a>(&'a Gate);
 
 impl Gate {
-    fn enter(&self) -> GateGuard<'_> {
+    pub fn enter(&self) -> GateGuard<'_> {
         lock(&self.st).0 += 1;
         GateGuard(self)
     }
@@ -1425,21 +1425,25 @@ impl Shared {
         let now = Instant::now();
         let mut victims = Vec::new();
         let mut left = g.bytes;
-        for h in g.lru.values().take(EVICT_SCAN) {
-            if left <= target {
-                break;
+        // recently opened blobs go only when nothing else gets the cache under its cap
+        for recent in [false, true] {
+            for h in g.lru.values().take(EVICT_SCAN) {
+                if left <= target {
+                    break;
+                }
+                if g.pins.contains_key(h) {
+                    continue;
+                }
+                let Some(s) = g.slots.get(h) else { continue };
+                let fresh = s
+                    .opened
+                    .is_some_and(|o| now.saturating_duration_since(o) < RECENT_PIN);
+                if fresh != recent {
+                    continue;
+                }
+                left = left.saturating_sub(s.size);
+                victims.push(*h);
             }
-            if g.pins.contains_key(h) {
-                continue;
-            }
-            let Some(s) = g.slots.get(h) else { continue };
-            if s.opened
-                .is_some_and(|o| now.saturating_duration_since(o) < RECENT_PIN)
-            {
-                continue;
-            }
-            left = left.saturating_sub(s.size);
-            victims.push(*h);
         }
         let mut freed = 0;
         for h in &victims {
@@ -1517,7 +1521,9 @@ fn sweep(dir: &OwnedFd) -> io::Result<()> {
 fn auto_cap(root: &OwnedFd, used: u64) -> u64 {
     match rustix::fs::fstatvfs(root) {
         Ok(v) => {
-            (v.f_bavail.saturating_mul(v.f_frsize).saturating_add(used) / 5).clamp(CAP_MIN, CAP_MAX)
+            let room = v.f_bavail.saturating_mul(v.f_frsize).saturating_add(used);
+            // on a filesystem smaller than the usual floor the cap stays well inside it, or fills would hit ENOSPC
+            (room / 5).clamp(CAP_MIN.min(room / 2), CAP_MAX)
         }
         Err(_) => CAP_MIN,
     }
@@ -2119,7 +2125,8 @@ mod tests {
         let (cr, px, hx) = (c.clone(), items[2].0.clone(), items[2].1);
         let deadline = Instant::now() + Duration::from_secs(10);
         let reader = std::thread::spawn(move || {
-            cr.fetch_at(&hx, &px, 5, 0, 5, deadline).map(|r| r.read_all(64).unwrap())
+            cr.fetch_at(&hx, &px, 5, 0, 5, deadline)
+                .map(|r| r.read_all(64).unwrap())
         });
         wait_for(|| c.waiting(&hx) == 1);
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
