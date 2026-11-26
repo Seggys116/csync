@@ -4,7 +4,7 @@ use crate::proto::{
     check_snapshot_part,
 };
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::{borrow::Borrow, collections::HashMap, collections::VecDeque};
 
 pub type NodeId = u64;
@@ -27,6 +27,15 @@ pub enum Vis {
 
 pub type Children = HashMap<Name, NodeId, rustc_hash::FxBuildHasher>;
 
+// a guest-only fifo or socket: the kernel serves it, the tree only names it
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Special {
+    #[default]
+    None,
+    Fifo,
+    Socket,
+}
+
 pub struct GNode {
     pub parent: NodeId,
     pub name: Name,
@@ -36,17 +45,50 @@ pub struct GNode {
     pub r#gen: u64,
     // bumped under the read lock so lookups and readdirplus never take the write lock
     pub nlookup: AtomicU64,
-    pub open: u32,
+    pub open: AtomicU32,
+    // read-only opens served from the page cache; only with none left may it move to another version
+    pub cached: AtomicU32,
+    // the host changed this file while mounted, so a version of it may be replaced before it is fetched
+    pub edited: bool,
     pub read_ver: Option<Version>,
     // the blob the kernel page cache may hold for this inode; another one means the next open drops it
     pub page: Option<Hash32>,
+    // the version that page cache was loaded for; sizes and cached reads come from it until the kernel drops it
+    pub shown: Option<Version>,
+    // writeback cache only: the kernel's size lacks the version just shown until a truncate begun after it returns
+    pub size_gen: u32,
+    pub size_pending: bool,
     pub staging: Option<u32>,
+    pub special: Special,
     pub children: Option<Children>,
 }
 
 impl GNode {
     pub fn is_dir(&self) -> bool {
         self.meta.kind == Kind::Dir
+    }
+
+    // the one version the kernel's i_size and page cache describe
+    pub fn kernel_ver(&self) -> Option<Version> {
+        match (self.page, self.shown) {
+            (Some(_), Some(v)) if self.meta.kind == Kind::File => Some(v),
+            _ => self.meta.version(),
+        }
+    }
+
+    // only just before the kernel drops this inode's attributes and pages
+    pub fn show_current(&mut self) {
+        if self.shown.is_some() {
+            self.shown = self.meta.version();
+            self.page = self.meta.hash;
+        }
+    }
+
+    pub fn kernel_size(&self) -> u64 {
+        match (self.page, self.shown) {
+            (Some(_), Some(v)) if self.meta.kind == Kind::File => v.size,
+            _ => self.meta.size,
+        }
     }
 
     pub fn attached(&self) -> bool {
@@ -83,12 +125,16 @@ pub enum Synth {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     InvalInode(NodeId),
+    // the last reader of an older version's page cache let go: move it to the current one
+    Reshow(NodeId),
     InvalEntry(NodeId, Name),
     Synth(Synth),
     Warm(NodeId, Hash32),
     Unpin(Hash32),
     ConflictPending(NodeId),
     LocalDiscarded(RelPath),
+    // guest-only entries under this directory may now belong on the host
+    Promote(RelPath),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -156,12 +202,18 @@ pub struct GTree {
     // old kernel-visible location of a host rename until the injector replays it
     ghosts: FxHashMap<(NodeId, Name), NodeId>,
     moving: FxHashMap<NodeId, (NodeId, Name)>,
+    // a pending host rename that replaced an entry: readers see the new node under the target name at
+    // once, while the injector finds the kernel-known node it replaces (with its gen), so the replayed
+    // rename unlinks that one (IN_ATTRIB, IN_DELETE_SELF); keyed by the moving node
+    shadows: FxHashMap<NodeId, Option<(NodeId, u64)>>,
     snap: Option<Vec<NodeId>>,
     // commits the host acknowledged on the current link; a snapshot taken before them must not revert them
     acked: rustc_hash::FxHashSet<NodeId>,
     epoch: u32,
     deferred: Vec<Effect>,
     stack: Vec<NodeId>,
+    // overlay hard links: the names of a node beyond its own parent and name
+    links: FxHashMap<NodeId, Vec<(NodeId, Name)>>,
 }
 
 impl Default for GTree {
@@ -180,10 +232,16 @@ impl GTree {
             vis: Vis::Live,
             r#gen: 1,
             nlookup: AtomicU64::new(1),
-            open: 0,
+            open: AtomicU32::new(0),
+            cached: AtomicU32::new(0),
+            edited: false,
             read_ver: None,
             page: None,
+            shown: None,
+            size_gen: 0,
+            size_pending: false,
             staging: None,
+            special: Special::None,
             children: Some(Children::default()),
         };
         Self {
@@ -200,11 +258,13 @@ impl GTree {
             mounted: false,
             ghosts: FxHashMap::default(),
             moving: FxHashMap::default(),
+            shadows: FxHashMap::default(),
             snap: None,
             acked: rustc_hash::FxHashSet::default(),
             epoch: 0,
             deferred: Vec::new(),
             stack: Vec::new(),
+            links: FxHashMap::default(),
         }
     }
 
@@ -262,12 +322,36 @@ impl GTree {
         n.vis == Vis::PendingCreate || self.moving.contains_key(&id)
     }
 
+    // a host-created entry the injector has not announced yet, for a process that asks for it by name
+    pub fn pending_create(&self, parent: NodeId, name: &str) -> Option<NodeId> {
+        let id = self.child(parent, name)?;
+        let n = self.get(id)?;
+        (n.vis == Vis::PendingCreate && !self.moving.contains_key(&id)).then_some(id)
+    }
+
     pub fn lookup(&self, parent: NodeId, name: &str) -> Option<(NodeId, &GNode)> {
+        self.lookup_as(parent, name, false)
+    }
+
+    pub fn lookup_as(&self, parent: NodeId, name: &str, inj: bool) -> Option<(NodeId, &GNode)> {
         if let Some(id) = self.child(parent, name)
             && let Some(n) = self.get(id)
-            && !self.hidden(id, n)
         {
-            return Some((id, n));
+            if !self.hidden(id, n) {
+                return Some((id, n));
+            }
+            match self.shadows.get(&id) {
+                Some(_) if !inj => return Some((id, n)),
+                Some(&Some((r, g))) => {
+                    if let Some(rn) = self.get(r)
+                        && rn.r#gen == g
+                        && !rn.attached()
+                    {
+                        return Some((r, rn));
+                    }
+                }
+                _ => {}
+            }
         }
         if self.ghosts.is_empty() {
             return None;
@@ -283,11 +367,13 @@ impl GTree {
             return false;
         };
         out.reserve(kids.len());
-        for &id in kids.values() {
+        let linked = !self.links.is_empty();
+        for (name, &id) in kids {
             if let Some(n) = self.get(id)
-                && !self.hidden(id, n)
+                && (!self.hidden(id, n) || self.shadows.contains_key(&id))
             {
-                out.push((id, None));
+                let alias = linked && (n.parent != dir || n.name != *name);
+                out.push((id, alias.then(|| name.clone())));
             }
         }
         for ((p, name), &id) in &self.ghosts {
@@ -440,7 +526,7 @@ impl GTree {
         }
         if let Some(old) = self.child(parent, name.as_str()) {
             let mut fx = std::mem::take(&mut self.deferred);
-            self.detach(old, &mut fx);
+            self.detach_at(old, parent, name.as_str(), &mut fx);
             self.deferred = fx;
         }
         let children = (meta.kind == Kind::Dir).then(Children::default);
@@ -452,10 +538,16 @@ impl GTree {
             vis,
             r#gen: 0,
             nlookup: AtomicU64::new(0),
-            open: 0,
+            open: AtomicU32::new(0),
+            cached: AtomicU32::new(0),
+            edited: false,
             read_ver: None,
             page: None,
+            shown: None,
+            size_gen: 0,
+            size_pending: false,
             staging: None,
+            special: Special::None,
             children,
         };
         let id = self.alloc(node);
@@ -507,6 +599,7 @@ impl GTree {
         while let Some(x) = stack.pop() {
             if let Some(old) = self.moving.remove(&x) {
                 self.ghosts.remove(&old);
+                self.shadows.remove(&x);
             }
             let Some(n) = self.get_mut(x) else { continue };
             if !n.attached() {
@@ -515,21 +608,160 @@ impl GTree {
             n.parent = DETACHED;
             n.vis = Vis::Live;
             let kids = n.children.as_mut().map(std::mem::take);
-            if n.open == 0
+            if *n.open.get_mut() == 0
                 && let Some(v) = n.read_ver.take()
             {
                 fx.push(Effect::Unpin(v.hash));
             }
-            let free = *n.nlookup.get_mut() == 0 && n.open == 0;
+            let free = *n.nlookup.get_mut() == 0 && *n.open.get_mut() == 0;
             self.attached = self.attached.saturating_sub(1);
+            self.drop_links(x);
             if let Some(k) = kids {
-                stack.extend(k.into_values());
+                for (name, kid) in k {
+                    if !self.drop_alias(kid, x, name.as_str()) {
+                        stack.push(kid);
+                    }
+                }
             }
             if free {
                 self.release_slot(x);
             }
         }
         self.stack = stack;
+    }
+
+    // removes one name of a node; the node itself goes only with its last name
+    fn detach_at(&mut self, id: NodeId, parent: NodeId, name: &str, fx: &mut Vec<Effect>) {
+        if !self.drop_alias(id, parent, name) {
+            self.detach(id, fx);
+        }
+    }
+
+    pub fn remove_at(&mut self, id: NodeId, parent: NodeId, name: &str) {
+        let mut fx = std::mem::take(&mut self.deferred);
+        self.detach_at(id, parent, name, &mut fx);
+        self.deferred = fx;
+    }
+
+    pub fn has_links(&self, id: NodeId) -> bool {
+        self.links.contains_key(&id)
+    }
+
+    // a hard link in the overlay: one more name for an attached non-directory node
+    pub fn add_link(&mut self, id: NodeId, parent: NodeId, name: Name) -> bool {
+        let ok = self.get(id).is_some_and(|n| n.attached() && !n.is_dir())
+            && self
+                .get(parent)
+                .is_some_and(|p| p.attached() && p.children.is_some())
+            && self.child(parent, name.as_str()).is_none();
+        if !ok {
+            return false;
+        }
+        if let Some(k) = self.get_mut(parent).and_then(|p| p.children.as_mut()) {
+            k.insert(name.clone(), id);
+        }
+        self.links.entry(id).or_default().push((parent, name));
+        true
+    }
+
+    // true when (parent, name) was one of several names of id and only that name went away
+    fn drop_alias(&mut self, id: NodeId, parent: NodeId, name: &str) -> bool {
+        let Some(mut extra) = self.links.remove(&id) else {
+            return false;
+        };
+        let primary = self
+            .get(id)
+            .is_some_and(|n| n.parent == parent && n.name.as_str() == name);
+        let gone = if primary {
+            // the first other name still present in its directory becomes the node's own
+            let mut next = None;
+            while !extra.is_empty() {
+                let (p, nm) = extra.remove(0);
+                if self.child(p, nm.as_str()) == Some(id)
+                    && self.get(p).is_some_and(|d| d.attached())
+                {
+                    next = Some((p, nm));
+                    break;
+                }
+            }
+            match next {
+                Some((p, nm)) => {
+                    if let Some(n) = self.get_mut(id) {
+                        n.parent = p;
+                        n.name = nm;
+                    }
+                    true
+                }
+                None => false,
+            }
+        } else {
+            let at = extra
+                .iter()
+                .position(|(p, nm)| *p == parent && nm.as_str() == name);
+            at.map(|i| extra.remove(i)).is_some()
+        };
+        if gone
+            && let Some(k) = self.get_mut(parent).and_then(|p| p.children.as_mut())
+            && k.get(name) == Some(&id)
+        {
+            k.remove(name);
+        }
+        if !extra.is_empty() {
+            self.links.insert(id, extra);
+        }
+        gone
+    }
+
+    // a node going away takes its other names with it
+    fn drop_links(&mut self, id: NodeId) {
+        let Some(extra) = self.links.remove(&id) else {
+            return;
+        };
+        for (p, nm) in extra {
+            if let Some(k) = self.get_mut(p).and_then(|d| d.children.as_mut())
+                && k.get(nm.as_str()) == Some(&id)
+            {
+                k.remove(nm.as_str());
+            }
+        }
+    }
+
+    // renameat2(RENAME_EXCHANGE) of two overlay names
+    pub fn exchange(&mut self, a: (NodeId, NodeId, &Name), b: (NodeId, NodeId, &Name)) -> bool {
+        let ((ia, pa, na), (ib, pb, nb)) = (a, b);
+        let ok = self.child(pa, na.as_str()) == Some(ia)
+            && self.child(pb, nb.as_str()) == Some(ib)
+            && ia != ib
+            && !self.is_within(pb, ia)
+            && !self.is_within(pa, ib);
+        if !ok {
+            return false;
+        }
+        if let Some(k) = self.get_mut(pa).and_then(|p| p.children.as_mut()) {
+            k.insert(na.clone(), ib);
+        }
+        if let Some(k) = self.get_mut(pb).and_then(|p| p.children.as_mut()) {
+            k.insert(nb.clone(), ia);
+        }
+        self.rename_name(ia, (pa, na), (pb, nb.clone()));
+        self.rename_name(ib, (pb, nb), (pa, na.clone()));
+        true
+    }
+
+    // points whichever name of id was (from) at (to); the children maps are the caller's
+    fn rename_name(&mut self, id: NodeId, from: (NodeId, &Name), to: (NodeId, Name)) {
+        if let Some(extra) = self.links.get_mut(&id)
+            && let Some(e) = extra
+                .iter_mut()
+                .find(|(p, nm)| *p == from.0 && nm == from.1)
+        {
+            *e = to;
+            return;
+        }
+        if let Some(n) = self.get_mut(id) {
+            n.parent = to.0;
+            n.name = to.1;
+        }
     }
 
     pub fn remove(&mut self, id: NodeId) {
@@ -549,7 +781,7 @@ impl GTree {
         let Some(node) = self.get_mut(id) else { return };
         let left = node.nlookup.get_mut();
         *left = left.saturating_sub(n);
-        if *left == 0 && node.open == 0 && !node.attached() {
+        if *left == 0 && *node.open.get_mut() == 0 && !node.attached() {
             self.release_slot(id);
         }
     }
@@ -560,22 +792,41 @@ impl GTree {
         }
     }
 
-    pub fn add_open(&mut self, id: NodeId) {
-        if let Some(n) = self.get_mut(id) {
-            n.open = n.open.saturating_add(1);
+    // counted under the read lock like nlookup, so opens and closes never take the write lock
+    pub fn add_open(&self, id: NodeId) {
+        if let Some(n) = self.get(id) {
+            n.open.fetch_add(1, Relaxed);
         }
     }
 
-    pub fn drop_open(&mut self, id: NodeId) {
+    // true when that was the last open of a node nothing else holds; reap() then frees it under the write lock
+    pub fn drop_open(&self, id: NodeId) -> bool {
+        let Some(n) = self.get(id) else { return false };
+        let mut was = n.open.load(Relaxed);
+        while was > 0 {
+            match n.open.compare_exchange_weak(was, was - 1, Relaxed, Relaxed) {
+                Ok(_) => break,
+                Err(v) => was = v,
+            }
+        }
+        was <= 1 && n.nlookup.load(Relaxed) == 0 && !n.attached()
+    }
+
+    pub fn reap(&mut self, id: NodeId) {
         let Some(n) = self.get_mut(id) else { return };
-        n.open = n.open.saturating_sub(1);
-        if n.open == 0 && *n.nlookup.get_mut() == 0 && !n.attached() {
+        if *n.open.get_mut() == 0 && *n.nlookup.get_mut() == 0 && !n.attached() {
             self.release_slot(id);
         }
     }
 
-    // guest-originated rename after the host (or the overlay) accepted it
-    pub fn relink(&mut self, id: NodeId, to_parent: NodeId, to: Name) -> bool {
+    // guest-originated rename of the name `from` after the host (or the overlay) accepted it
+    pub fn relink(
+        &mut self,
+        id: NodeId,
+        from: (NodeId, &str),
+        to_parent: NodeId,
+        to: Name,
+    ) -> bool {
         if id == ROOT
             || !self
                 .get(to_parent)
@@ -595,9 +846,31 @@ impl GTree {
         if let Some(old) = self.child(to_parent, to.as_str())
             && old != id
         {
-            self.detach(old, &mut fx);
+            self.detach_at(old, to_parent, to.as_str(), &mut fx);
         }
         self.deferred = fx;
+        let alias = (fp, fname.as_str()) != from
+            && self.links.get(&id).is_some_and(|v| {
+                v.iter()
+                    .any(|(p, nm)| *p == from.0 && nm.as_str() == from.1)
+            });
+        if alias {
+            if let Some(k) = self.get_mut(from.0).and_then(|p| p.children.as_mut())
+                && k.get(from.1) == Some(&id)
+            {
+                k.remove(from.1);
+            }
+            if let Some(k) = self.get_mut(to_parent).and_then(|p| p.children.as_mut()) {
+                k.insert(to.clone(), id);
+            }
+            if let Some(e) = self.links.get_mut(&id).and_then(|v| {
+                v.iter_mut()
+                    .find(|(p, nm)| *p == from.0 && nm.as_str() == from.1)
+            }) {
+                *e = (to_parent, to);
+            }
+            return true;
+        }
         if let Some(k) = self.get_mut(fp).and_then(|p| p.children.as_mut()) {
             k.remove(fname.as_str());
         }
@@ -631,6 +904,7 @@ impl GTree {
     fn finish_move(&mut self, id: NodeId, fx: &mut Vec<Effect>) {
         if let Some((p, name)) = self.moving.remove(&id) {
             self.ghosts.remove(&(p, name.clone()));
+            self.shadows.remove(&id);
             fx.push(Effect::InvalEntry(p, name));
             fx.push(Effect::InvalInode(p));
         }
@@ -680,6 +954,9 @@ impl GTree {
                 }
                 if self.mounted {
                     fx.push(Effect::InvalInode(parent));
+                    if let Some(n) = self.get_mut(id) {
+                        n.edited = true;
+                    }
                 }
                 if show {
                     fx.push(Effect::Synth(Synth::Create {
@@ -703,10 +980,26 @@ impl GTree {
     ) -> Option<NodeId> {
         let on = self.mounted;
         let n = self.get(id)?;
+        if n.domain == GDomain::Local && n.is_dir() && meta.kind == Kind::Dir {
+            // the host made the same directory: both sides' entries stay, and the guest's now-synced ones go up
+            let path = self.rel_path(id);
+            let n = self.get_mut(id)?;
+            n.domain = domain_of(&meta);
+            n.meta = meta;
+            if on {
+                fx.push(Effect::InvalInode(id));
+            }
+            if let Some(p) = path {
+                fx.push(Effect::Promote(p));
+            }
+            return Some(id);
+        }
         if n.domain == GDomain::Local {
             // the host now has this path, so the guest-only copy loses
-            let path = self.rel_path(id);
-            self.detach(id, fx);
+            let path = Name::new(name)
+                .ok()
+                .and_then(|nm| self.rel_path(parent)?.join(&nm).ok());
+            self.detach_at(id, parent, name, fx);
             if on {
                 fx.push(Effect::InvalEntry(parent, Name::new(name).ok()?));
             }
@@ -729,10 +1022,13 @@ impl GTree {
         let content =
             n.meta.hash != meta.hash || n.meta.size != meta.size || n.meta.link != meta.link;
         let perm = n.meta.perm != meta.perm;
-        let times = n.meta.mtime_ns != meta.mtime_ns || n.meta.ctime_ns != meta.ctime_ns;
+        let mtime = n.meta.mtime_ns != meta.mtime_ns;
+        let times = mtime || n.meta.ctime_ns != meta.ctime_ns;
         let gitro = n.meta.git_ro != meta.git_ro;
         let was = n.vis;
-        let warm = content && meta.kind == Kind::File && (n.open > 0 || n.read_ver.is_some());
+        let warm = content
+            && meta.kind == Kind::File
+            && (n.open.load(Relaxed) > 0 || n.read_ver.is_some());
         let conflict = content && n.staging.is_some();
         let show = on && was == Vis::Live && self.reachable(id);
         let kind = meta.kind;
@@ -740,6 +1036,7 @@ impl GTree {
         let n = self.get_mut(id)?;
         n.domain = domain_of(&meta);
         n.meta = meta;
+        n.edited |= on && content;
         if was == Vis::PendingDelete {
             n.vis = Vis::Live;
         }
@@ -750,7 +1047,8 @@ impl GTree {
         if show {
             match kind {
                 Kind::File if content => fx.push(Effect::Synth(Synth::Modify { node: id })),
-                Kind::File if perm || times => fx.push(Effect::Synth(Synth::Attrib { node: id })),
+                // a ctime-only change (a rename, a link) raises no IN_ATTRIB natively either
+                Kind::File if perm || mtime => fx.push(Effect::Synth(Synth::Attrib { node: id })),
                 Kind::Dir if perm => fx.push(Effect::Synth(Synth::Attrib { node: id })),
                 _ => {}
             }
@@ -779,6 +1077,9 @@ impl GTree {
             return;
         }
         if self.mounted && vis == Vis::Live && self.reachable(id) {
+            if dir {
+                self.delete_known_kids(id, fx);
+            }
             if let Some(n) = self.get_mut(id) {
                 n.vis = Vis::PendingDelete;
             }
@@ -790,6 +1091,39 @@ impl GTree {
         if self.mounted && vis != Vis::PendingCreate {
             fx.push(Effect::InvalEntry(parent, name));
             fx.push(Effect::InvalInode(parent));
+        }
+    }
+
+    // a host subtree removal is deleted bottom-up like rm -r; a watch pins its inode, so only
+    // directories the kernel knows can have watchers that would see their entries go
+    fn delete_known_kids(&mut self, dir: NodeId, fx: &mut Vec<Effect>) {
+        let mut found: Vec<(NodeId, NodeId, Name, bool)> = Vec::new();
+        let mut walk = vec![dir];
+        while let Some(d) = walk.pop() {
+            let Some(n) = self.get(d) else { continue };
+            if n.nlookup.load(Relaxed) == 0 {
+                continue;
+            }
+            let Some(kids) = n.children.as_ref() else {
+                continue;
+            };
+            for (name, &kid) in kids {
+                let Some(k) = self.get(kid) else { continue };
+                if k.vis != Vis::Live || k.parent != d || k.domain == GDomain::Local {
+                    continue;
+                }
+                let isdir = k.is_dir();
+                found.push((kid, d, name.clone(), isdir));
+                if isdir {
+                    walk.push(kid);
+                }
+            }
+        }
+        for (kid, parent, name, dir) in found.into_iter().rev() {
+            if let Some(n) = self.get_mut(kid) {
+                n.vis = Vis::PendingDelete;
+            }
+            fx.push(Effect::Synth(Synth::Delete { parent, name, dir }));
         }
     }
 
@@ -819,10 +1153,16 @@ impl GTree {
         if fp == tp && fname == tname {
             return;
         }
+        let mut shadow = None;
         if let Some(r) = self.child(tp, tname.as_str())
             && r != id
         {
-            self.detach(r, fx);
+            shadow = Some(
+                self.get(r)
+                    .filter(|n| n.vis == Vis::Live && n.nlookup.load(Relaxed) > 0)
+                    .map(|n| (r, n.r#gen)),
+            );
+            self.detach_at(r, tp, tname.as_str(), fx);
         }
         if let Some(k) = self.get_mut(fp).and_then(|p| p.children.as_mut()) {
             k.remove(fname.as_str());
@@ -848,6 +1188,9 @@ impl GTree {
             }
             self.ghosts.insert(key, id);
             self.moving.insert(id, (fp, fname.clone()));
+            if let Some(s) = shadow {
+                self.shadows.insert(id, s);
+            }
             fx.push(Effect::Synth(Synth::Move {
                 from_parent: fp,
                 from: fname,
@@ -941,6 +1284,7 @@ impl GTree {
         }
         self.ghosts.remove(&key);
         self.moving.remove(&id);
+        self.shadows.remove(&id);
         true
     }
 
@@ -1318,6 +1662,106 @@ mod tests {
         assert_eq!(t.lookup(src, "z.rs").map(|(i, _)| i), Some(a));
     }
 
+    fn deletes(fx: &[Effect]) -> Vec<String> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Synth(Synth::Delete { name, .. }) => Some(name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn removed_dir_deletes_known_entries_bottom_up() {
+        let mut t = mounted_tree();
+        for (p, m) in [
+            ("src/d", dir()),
+            ("src/d/e", dir()),
+            ("src/d/e/f", file(5)),
+            ("src/d/g", file(6)),
+            ("src/d/u", dir()),
+            ("src/d/u/x", file(7)),
+        ] {
+            up(&mut t, p, m);
+            let (dir, name) = rp(p)
+                .split_last()
+                .map(|(d, n)| (d.to_owned(), n.to_owned()))
+                .unwrap();
+            let parent = t.resolve(&rp(&dir)).unwrap();
+            t.complete_create(parent, &name);
+        }
+        for p in ["src/d", "src/d/e"] {
+            t.add_lookup(t.resolve(&rp(p)).unwrap());
+        }
+        let mut fx = Vec::new();
+        t.apply(&Change::Remove { path: rp("src/d") }, &mut fx);
+        let d = deletes(&fx);
+        let at = |n: &str| {
+            d.iter()
+                .position(|x| x == n)
+                .unwrap_or_else(|| panic!("{n}: {d:?}"))
+        };
+        assert!(at("f") < at("e") && at("e") < at("d") && at("g") < at("d") && at("u") < at("d"));
+        assert!(
+            !d.iter().any(|x| x == "x"),
+            "a directory the kernel never looked up has no watchers"
+        );
+        let src = t.resolve(&rp("src")).unwrap();
+        assert_eq!(
+            t.lookup(src, "d").map(|(_, n)| n.vis),
+            Some(Vis::PendingDelete)
+        );
+        let e = t.resolve(&rp("src/d/e")).unwrap();
+        assert!(t.complete_delete(e, "f"));
+        assert!(t.complete_delete(t.resolve(&rp("src/d")).unwrap(), "e"));
+    }
+
+    #[test]
+    fn ctime_only_change_raises_no_attrib() {
+        let mut t = mounted_tree();
+        let mut m = file(1);
+        m.ctime_ns = 99;
+        let fx = up(&mut t, "src/a.rs", m.clone());
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Synth(_))), "{fx:?}");
+        m.mtime_ns = 100;
+        let fx = up(&mut t, "src/a.rs", m);
+        assert!(
+            fx.iter()
+                .any(|e| matches!(e, Effect::Synth(Synth::Attrib { .. })))
+        );
+    }
+
+    #[test]
+    fn rename_over_keeps_the_replaced_node_visible_until_injected() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        up(&mut t, "src/b.rs", file(2));
+        t.complete_create(src, "b.rs");
+        let a = t.resolve(&rp("src/a.rs")).unwrap();
+        let b = t.resolve(&rp("src/b.rs")).unwrap();
+        t.add_lookup(b);
+        let mut fx = Vec::new();
+        t.apply(
+            &Change::Rename {
+                from: rp("src/a.rs"),
+                to: rp("src/b.rs"),
+            },
+            &mut fx,
+        );
+        // readers get the new file at once; the injector's rename finds the inode it replaces
+        assert_eq!(t.lookup(src, "b.rs").map(|(i, _)| i), Some(a));
+        assert_eq!(t.lookup_as(src, "b.rs", true).map(|(i, _)| i), Some(b));
+        assert_eq!(t.lookup(src, "a.rs").map(|(i, _)| i), Some(a));
+        let mut l = Vec::new();
+        t.list(src, &mut l);
+        assert!(
+            l.contains(&(a, None)) && l.contains(&(a, Some(nm("a.rs")))),
+            "{l:?}"
+        );
+        assert!(t.complete_move(src, "a.rs", src, "b.rs"));
+        assert_eq!(t.lookup_as(src, "b.rs", true).map(|(i, _)| i), Some(a));
+    }
+
     fn entry(parent: u32, name: &str, meta: Meta) -> SnapEntry {
         SnapEntry {
             parent,
@@ -1510,9 +1954,20 @@ mod tests {
             Err(Refuse::Invalid)
         );
 
+        // the host making a directory the guest has only locally merges the two: nothing guest-only is lost
         let src = t.resolve(&rp("src")).unwrap();
-        t.insert(src, nm("out"), dir(), GDomain::Local, Vis::Live);
+        let mine = t.insert(src, nm("mine"), dir(), GDomain::Local, Vis::Live);
+        let kept = t.insert(mine, nm("g.txt"), file(9), GDomain::Local, Vis::Live);
         t.set_mounted(true);
+        let fx = up(&mut t, "src/mine", dir());
+        assert_eq!(t.resolve(&rp("src/mine")), Some(mine));
+        assert_eq!(t.get(mine).unwrap().domain, GDomain::Synced);
+        assert_eq!(t.resolve(&rp("src/mine/g.txt")), Some(kept));
+        assert!(fx.contains(&Effect::Promote(rp("src/mine"))));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::LocalDiscarded(_))));
+
+        // a guest-only file the host also makes loses to the host copy
+        t.insert(src, nm("out"), file(3), GDomain::Local, Vis::Live);
         let fx = up(&mut t, "src/out", dir());
         assert!(fx.contains(&Effect::LocalDiscarded(rp("src/out"))));
         let out = t.resolve(&rp("src/out")).unwrap();
@@ -1527,5 +1982,87 @@ mod tests {
         );
         assert!(fx.is_empty(), "a node the kernel never saw leaves silently");
         assert!(t.resolve(&rp("src/out")).is_none());
+    }
+
+    fn names(t: &GTree, dir: NodeId) -> Vec<(NodeId, String)> {
+        let mut l = Vec::new();
+        t.list(dir, &mut l);
+        let mut v: Vec<_> = l
+            .into_iter()
+            .map(|(id, g)| {
+                let n = g.unwrap_or_else(|| t.get(id).unwrap().name.clone());
+                (id, n.as_str().to_owned())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn overlay_links_share_one_node_until_the_last_name_goes() {
+        let mut t = GTree::new();
+        let tg = t.insert(ROOT, nm("target"), dir(), GDomain::Local, Vis::Live);
+        let sub = t.insert(tg, nm("sub"), dir(), GDomain::Local, Vis::Live);
+        let a = t.insert(tg, nm("a"), file(1), GDomain::Local, Vis::Live);
+        assert!(t.add_link(a, sub, nm("b")));
+        assert!(t.add_link(a, tg, nm("c")));
+        assert!(!t.add_link(a, tg, nm("c")), "a taken name");
+        assert!(!t.add_link(sub, tg, nm("d")), "directories have one name");
+        assert_eq!(t.child(sub, "b"), Some(a));
+        assert_eq!(names(&t, sub), vec![(a, "b".to_owned())]);
+        assert_eq!(names(&t, tg).len(), 3);
+
+        // the node's own name goes: another name takes its place
+        t.remove_at(a, tg, "a");
+        let n = t.get(a).unwrap();
+        assert!(n.attached());
+        assert_ne!((n.parent, n.name.as_str()), (tg, "a"));
+        assert_eq!(t.child(tg, "a"), None);
+
+        // renaming one name moves only that name
+        assert!(t.relink(a, (sub, "b"), tg, nm("e")));
+        assert_eq!(t.child(sub, "b"), None);
+        assert_eq!(t.child(tg, "e"), Some(a));
+        assert_eq!(t.child(tg, "c"), Some(a));
+
+        // a host file replacing one name leaves the other
+        let mut fx = Vec::new();
+        t.detach_at(a, tg, "e", &mut fx);
+        assert_eq!(t.child(tg, "c"), Some(a));
+        assert!(!t.has_links(a));
+        t.remove_at(a, tg, "c");
+        assert!(t.get(a).is_none_or(|n| !n.attached()));
+        assert_eq!(names(&t, tg), vec![(sub, "sub".to_owned())]);
+
+        // removing a directory drops the names inside it and keeps the file reachable elsewhere
+        let f = t.insert(tg, nm("f"), file(2), GDomain::Local, Vis::Live);
+        assert!(t.add_link(f, sub, nm("g")));
+        t.remove(sub);
+        assert_eq!(t.child(tg, "f"), Some(f));
+        assert!(!t.has_links(f));
+        let f2 = t.insert(tg, nm("f2"), file(3), GDomain::Local, Vis::Live);
+        let s2 = t.insert(tg, nm("s2"), dir(), GDomain::Local, Vis::Live);
+        assert!(t.add_link(f2, s2, nm("h")));
+        t.remove_at(f2, tg, "f2");
+        t.remove(s2);
+        assert!(t.get(f2).is_none_or(|n| !n.attached()));
+    }
+
+    #[test]
+    fn exchange_swaps_two_overlay_names() {
+        let mut t = GTree::new();
+        let tg = t.insert(ROOT, nm("target"), dir(), GDomain::Local, Vis::Live);
+        let a = t.insert(tg, nm("a"), file(1), GDomain::Local, Vis::Live);
+        let d = t.insert(tg, nm("d"), dir(), GDomain::Local, Vis::Live);
+        assert!(t.exchange((a, tg, &nm("a")), (d, tg, &nm("d"))));
+        assert_eq!(t.child(tg, "a"), Some(d));
+        assert_eq!(t.child(tg, "d"), Some(a));
+        assert_eq!(t.get(a).unwrap().name.as_str(), "d");
+        assert_eq!(t.rel_path(d).unwrap().as_str(), "target/a");
+        let inner = t.insert(d, nm("x"), file(2), GDomain::Local, Vis::Live);
+        assert!(
+            !t.exchange((d, tg, &nm("a")), (inner, d, &nm("x"))),
+            "a directory cannot swap with its own child"
+        );
     }
 }

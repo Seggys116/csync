@@ -5,6 +5,10 @@ pub mod cache;
 #[cfg(target_os = "linux")]
 pub mod fs;
 #[cfg(target_os = "linux")]
+pub mod fsops;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub mod gitindex;
+#[cfg(target_os = "linux")]
 pub mod inject;
 #[cfg(target_os = "linux")]
 pub mod prefetch;
@@ -25,7 +29,7 @@ mod live {
     use crate::config::{GUEST_TREE_FILE, GuestCfg, ensure_private_dir};
     use crate::crypto::noise::Reject;
     use crate::crypto::trust::{Identity, PeerKey, TrustEntry, now_unix};
-    use crate::ignore::rules::Rules;
+    use crate::ignore::rules::{Class, Rules};
     use crate::index::persist;
     use crate::net::conn::{self, CloseReason, Dial, In, Link, NetError, Session};
     use crate::net::rpc::Rpc;
@@ -35,7 +39,9 @@ mod live {
         hs::{HsHello, PAIR_TIMEOUT_S, PairStep, Role},
     };
     use crate::tui::{ConnState, PeerView, UiBus, UiCmd, now_ms};
-    use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, after, bounded, never, select};
+    use crossbeam_channel::{
+        Receiver, RecvTimeoutError, Sender, after, bounded, never, select, unbounded,
+    };
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustix::fs::{Mode, OFlags};
     use std::{
@@ -44,7 +50,7 @@ mod live {
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::{
-            Arc, Mutex, OnceLock, RwLock,
+            Arc, Condvar, Mutex, OnceLock, RwLock,
             atomic::{AtomicBool, Ordering::Relaxed},
         },
         thread::{self, JoinHandle},
@@ -67,7 +73,6 @@ mod live {
     // a FetchMany reply is one frame, so rule-file batches stay under FRAME_MAX
     const RULE_BATCH_BYTES: u64 = 3 << 20;
     const OVERLAY_DIR: &str = "overlay";
-    const GIT_HINT: &str = "git on the guest: export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.checkStat GIT_CONFIG_VALUE_0=minimal GIT_CONFIG_KEY_1=core.trustCtime GIT_CONFIG_VALUE_1=false";
 
     enum Fail {
         Retry,
@@ -378,6 +383,7 @@ mod live {
             prefetch,
             rules: RwLock::new(Rules::new(&[])),
             inj: OnceLock::new(),
+            inval: OnceLock::new(),
             overlay,
             uid: rustix::process::getuid().as_raw(),
             gid: rustix::process::getgid().as_raw(),
@@ -385,8 +391,15 @@ mod live {
             kicked: Mutex::new(Vec::new()),
             kick: kick_tx,
             case_fold: AtomicBool::new(false),
+            norm_fold: AtomicBool::new(false),
             passthrough: AtomicBool::new(false),
             notice,
+            staging_busy: Mutex::new(FxHashSet::default()),
+            staging_done: Condvar::new(),
+            promote_later: Mutex::new(FxHashSet::default()),
+            own_scopes: Mutex::new(FxHashSet::default()),
+            dir_moves: Mutex::new(Vec::new()),
+            dir_moved: Condvar::new(),
         });
         let rules = Arc::new(RuleState::default());
         let (rules_tx, rules_rx) = bounded(RULE_JOBS);
@@ -431,8 +444,7 @@ mod live {
             last_ping: Instant::now(),
             rtt_us: 0,
             skew_ms: 0,
-            work: VecDeque::new(),
-            seen: FxHashSet::default(),
+            notify: None,
             rule_paths: Vec::new(),
             bye: CloseReason::Local,
             cfg,
@@ -487,8 +499,7 @@ mod live {
         last_ping: Instant,
         rtt_us: u32,
         skew_ms: i64,
-        work: VecDeque<Effect>,
-        seen: FxHashSet<NodeId>,
+        notify: Option<Notify>,
         rule_paths: Vec<RelPath>,
         // what the host is told when the link closes at shutdown
         bye: CloseReason,
@@ -496,6 +507,95 @@ mod live {
 
     fn earliest(a: Option<Instant>, b: Instant) -> Option<Instant> {
         Some(a.map_or(b, |a| a.min(b)))
+    }
+
+    struct Notify {
+        tx: Sender<Vec<Effect>>,
+        join: JoinHandle<()>,
+    }
+
+    // a kernel notification can wait on a page or directory lock held by a request that is itself
+    // waiting for a host change, so they are sent from here and never hold up the loop applying changes
+    fn notify_loop(core: &Core, inval: &fs::Inval, rx: &Receiver<Vec<Effect>>) {
+        loop {
+            // the timeout runs only while a page cache waits for its readers to let go
+            let next = match inval.next_due() {
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                Some(due) => rx.recv_timeout(due.saturating_duration_since(Instant::now())),
+            };
+            let mut fx = match next {
+                Ok(fx) => fx,
+                Err(RecvTimeoutError::Timeout) => Vec::new(),
+                Err(RecvTimeoutError::Disconnected) => break,
+            };
+            while let Ok(more) = rx.try_recv() {
+                fx.extend(more);
+            }
+            run_effects(core, Some(inval), fx);
+            for id in inval.take_due(Instant::now()) {
+                core.reload(inval, id, true);
+            }
+        }
+    }
+
+    // every effect here was queued before the first runs, so one entry invalidation covers its repeats
+    fn run_effects(core: &Core, inval: Option<&fs::Inval>, fx: Vec<Effect>) {
+        let mut entries = FxHashSet::default();
+        let mut work: VecDeque<Effect> = fx
+            .into_iter()
+            .filter(|e| match e {
+                Effect::InvalEntry(p, n) => entries.insert((*p, n.clone())),
+                _ => true,
+            })
+            .collect();
+        let mut seen = FxHashSet::default();
+        while let Some(e) = work.pop_front() {
+            match e {
+                Effect::InvalInode(id) => {
+                    if seen.insert(id)
+                        && let Some(k) = inval
+                    {
+                        core.reload(k, id, false);
+                    }
+                }
+                Effect::Reshow(id) => {
+                    if !seen.contains(&id)
+                        && let Some(k) = inval
+                    {
+                        core.reshow(k, id);
+                    }
+                }
+                Effect::InvalEntry(p, n) => {
+                    if let Some(k) = inval {
+                        k.entry(p, &n);
+                    }
+                }
+                Effect::Synth(s) => {
+                    if !core.inj.get().is_some_and(|i| i.offer(s.clone())) {
+                        let mut more = Vec::new();
+                        core.tw().settle(&s, &mut more);
+                        work.extend(more);
+                    }
+                }
+                Effect::Warm(id, h) => core.prefetch.hint(Hint::Warm(id, h)),
+                Effect::ConflictPending(id) => {
+                    let h = core.t().get(id).and_then(|n| n.meta.hash);
+                    if let Some(h) = h {
+                        core.prefetch.hint(Hint::Warm(id, h));
+                    }
+                }
+                // read_ver blobs are protected by the cache's open-time window, not by pins
+                Effect::Unpin(_) => {}
+                Effect::LocalDiscarded(p) => {
+                    core.remove_overlay(&p);
+                    (core.notice)(Notice {
+                        kind: NoticeKind::Discarded,
+                        path: p,
+                    });
+                }
+                Effect::Promote(p) => core.promote(&p),
+            }
+        }
     }
 
     impl Guest {
@@ -599,6 +699,7 @@ mod live {
             self.snap_next = None;
             self.synced_entries = 0;
             self.core.case_fold.store(w.fs.case_fold, Relaxed);
+            self.core.norm_fold.store(w.fs.norm_fold, Relaxed);
             let project = w.project.clone();
             self.bus.update(|s| s.project = Some(project));
             rules_reset(&self.core, &self.rules, &w.excludes, &w.repos);
@@ -712,9 +813,16 @@ mod live {
                 }
                 other => other,
             };
-            let m = match &self.rpc {
-                Some(r) => r.dispatch(i),
-                None => match i {
+            let m = match (&self.rpc, i) {
+                // only directory move replies come this way; later pushes name the new path, so the move lands first
+                (Some(r), In::Msg(Msg::Resp { id, res })) => {
+                    if let Some(m) = r.route_ordered(id, res) {
+                        self.core.await_dir_move(&m);
+                    }
+                    None
+                }
+                (Some(r), i) => r.dispatch(i),
+                (None, i) => match i {
                     In::Msg(m) => Some(m),
                     _ => None,
                 },
@@ -784,9 +892,35 @@ mod live {
                         return Ok(());
                     }
                     let mut fx = Vec::new();
+                    // a remove of an entry this guest's own rule edit already ignores moves it to the overlay instead
+                    let demote: Vec<RelPath> = {
+                        let own = lock(&self.core.own_scopes);
+                        let t = self.core.t();
+                        let r = self.core.rules();
+                        changes
+                            .iter()
+                            .filter_map(|c| match c {
+                                Change::Remove { path }
+                                    if own.iter().any(|s| path.starts_with(s)) =>
+                                {
+                                    let n = t.resolve(path).and_then(|id| t.get(id))?;
+                                    (n.domain == GDomain::Synced
+                                        && r.classify(path, n.is_dir()) == Class::Ignored)
+                                        .then(|| path.clone())
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    };
+                    let kept = |p: &RelPath| demote.iter().any(|d| p.starts_with(d));
                     {
                         let mut t = self.core.tw();
                         for c in &changes {
+                            if let Change::Remove { path } = c
+                                && kept(path)
+                            {
+                                continue;
+                            }
                             t.apply(c, &mut fx);
                         }
                         let index = t.index_id();
@@ -796,6 +930,7 @@ mod live {
                         let r = self.core.rules();
                         for c in &changes {
                             match c {
+                                Change::Remove { path } if kept(path) => {}
                                 Change::Upsert { path, .. } | Change::Remove { path } => {
                                     if r.is_rule_file(path) {
                                         self.rule_paths.push(path.clone());
@@ -810,6 +945,9 @@ mod live {
                                 }
                             }
                         }
+                    }
+                    if !demote.is_empty() {
+                        self.rule_job(RuleJob::Demote(demote));
                     }
                     self.queue(fx);
                     self.synced(seq, false)?;
@@ -859,13 +997,16 @@ mod live {
             self.inj = Some(thread);
             self.back = back;
             self.core.tw().set_mounted(true);
+            let (tx, rx) = unbounded();
+            let (core, inval) = (self.core.clone(), m.inval());
+            let join = thread::Builder::new()
+                .name("csync-notify".into())
+                .spawn(move || notify_loop(&core, &inval, &rx))?;
+            self.notify = Some(Notify { tx, join });
             self.mounted = Some(m);
             self.synced = true;
             self.core.prefetch.hint(Hint::Start);
-            self.bus.update(|s| {
-                s.mounted = true;
-                s.hint(GIT_HINT);
-            });
+            self.bus.update(|s| s.mounted = true);
             Ok(())
         }
 
@@ -873,51 +1014,27 @@ mod live {
             if fx.is_empty() {
                 return;
             }
-            self.work.extend(fx);
-            self.drain();
-        }
-
-        // the only place kernel notifications are sent; the tree lock is never held here
-        fn drain(&mut self) {
-            self.seen.clear();
-            while let Some(e) = self.work.pop_front() {
-                match e {
-                    Effect::InvalInode(id) => {
-                        if self.seen.insert(id)
-                            && let Some(m) = &self.mounted
-                        {
-                            m.inval_inode(id);
-                        }
-                    }
-                    Effect::InvalEntry(p, n) => {
-                        if let Some(m) = &self.mounted {
-                            m.inval_entry(p, &n);
-                        }
-                    }
-                    Effect::Synth(s) => {
-                        if !self.core.inj.get().is_some_and(|i| i.offer(s.clone())) {
-                            let mut more = Vec::new();
-                            self.core.tw().settle(&s, &mut more);
-                            self.work.extend(more);
-                        }
-                    }
-                    Effect::Warm(id, h) => self.core.prefetch.hint(Hint::Warm(id, h)),
-                    Effect::ConflictPending(id) => {
-                        let h = self.core.t().get(id).and_then(|n| n.meta.hash);
-                        if let Some(h) = h {
-                            self.core.prefetch.hint(Hint::Warm(id, h));
-                        }
-                    }
-                    // read_ver blobs are protected by the cache's open-time window, not by pins
-                    Effect::Unpin(_) => {}
-                    Effect::LocalDiscarded(p) => {
-                        self.core.remove_overlay(&p);
-                        (self.core.notice)(Notice {
-                            kind: NoticeKind::Discarded,
-                            path: p,
-                        });
+            // promotions take host round trips, so the rules worker runs them, not the notifier
+            let (up, fx): (Vec<Effect>, Vec<Effect>) = fx
+                .into_iter()
+                .partition(|e| matches!(e, Effect::Promote(_)));
+            let up: Vec<RelPath> = up
+                .into_iter()
+                .filter_map(|e| match e {
+                    Effect::Promote(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            if !up.is_empty() {
+                self.rule_job(RuleJob::Promote(up));
+            }
+            match &self.notify {
+                Some(n) => {
+                    if let Err(e) = n.tx.send(fx) {
+                        run_effects(&self.core, None, e.into_inner());
                     }
                 }
+                None => run_effects(&self.core, None, fx),
             }
             self.ui_soon();
         }
@@ -994,6 +1111,10 @@ mod live {
                 t.stop();
             }
             self.core.tw().set_mounted(false);
+            if let Some(n) = self.notify.take() {
+                drop(n.tx);
+                let _ = n.join.join();
+            }
             if let Some(m) = self.mounted.take() {
                 let _ = m.unmount();
             }
@@ -1025,23 +1146,33 @@ mod live {
     enum RuleJob {
         Scan,
         Paths(Vec<RelPath>),
+        Promote(Vec<RelPath>),
+        Demote(Vec<RelPath>),
     }
 
     fn rules_worker(core: &Core, st: &RuleState, rx: &Receiver<RuleJob>) {
         while let Ok(j) = rx.recv() {
             let mut scan = false;
             let mut paths = Vec::new();
+            let mut up = Vec::new();
+            let mut down = Vec::new();
             for j in std::iter::once(j).chain(rx.try_iter()) {
                 match j {
                     RuleJob::Scan => scan = true,
                     RuleJob::Paths(p) => paths.extend(p),
+                    RuleJob::Promote(p) => up.extend(p),
+                    RuleJob::Demote(p) => down.extend(p),
                 }
+            }
+            for p in down {
+                core.demote(&p);
             }
             if scan {
                 rules_scan(core, st);
-            } else {
+            } else if !paths.is_empty() {
                 rules_paths(core, st, paths);
             }
+            promote_all(core, up);
         }
     }
 
@@ -1063,10 +1194,14 @@ mod live {
     }
 
     // every rule file in the host tree; inside .git only the gitdir and its info directory are walked
-    fn collect_rule_files(core: &Core) -> Vec<(RelPath, Option<Hash32>, u64)> {
+    type Found = Vec<(RelPath, Option<Hash32>, u64)>;
+
+    // second list: guest-only rule files directly inside a synced directory
+    fn collect_rule_files(core: &Core) -> (Found, Vec<RelPath>) {
         let t = core.t();
         let rules = core.rules();
         let mut out = Vec::new();
+        let mut local = Vec::new();
         let mut stack: Vec<(NodeId, RelPath)> = vec![(ROOT, RelPath::root())];
         while let Some((d, path)) = stack.pop() {
             let Some(kids) = t.get(d).and_then(|n| n.children.as_ref()) else {
@@ -1075,6 +1210,13 @@ mod live {
             for (name, &c) in kids {
                 let Some(n) = t.get(c) else { continue };
                 if n.domain == GDomain::Local || n.vis == Vis::PendingDelete {
+                    if n.domain == GDomain::Local
+                        && n.meta.kind == Kind::File
+                        && let Ok(p) = path.join(name)
+                        && rules.is_rule_file(&p)
+                    {
+                        local.push(p);
+                    }
                     continue;
                 }
                 let Ok(p) = path.join(name) else { continue };
@@ -1090,11 +1232,11 @@ mod live {
                 }
             }
         }
-        out
+        (out, local)
     }
 
     fn rules_scan(core: &Core, st: &RuleState) {
-        let found = collect_rule_files(core);
+        let (found, local) = collect_rule_files(core);
         let gone: Vec<RelPath> = {
             let k = lock(&st.known);
             k.keys()
@@ -1110,6 +1252,9 @@ mod live {
             }
         }
         rules_apply(core, st, found, &mut scopes);
+        for p in &local {
+            core.local_rule(p);
+        }
         promote_all(core, scopes);
     }
 

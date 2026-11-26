@@ -23,9 +23,11 @@ linux_test!(
     odd_trees,
     branch_switch_under_readers,
     two_guests,
+    dir_moves_under_host_writes,
     shutdown_signals,
     link_flapping,
     load,
+    refused_unlink_of_a_file_the_host_made_a_symlink,
 );
 
 #[cfg(target_os = "linux")]
@@ -495,6 +497,49 @@ mod chaos {
         host.quit(SYNC);
     }
 
+    // a slow link lets the guest unlink a file the host has already replaced with a symlink; the refusal must
+    // not turn the inode the kernel holds into another file type, which the kernel answers with EIO
+    pub fn refused_unlink_of_a_file_the_host_made_a_symlink() {
+        if bin().is_none() {
+            return;
+        }
+        let mut w = World::new("kindswap", cold_project);
+        let g = w.guest("g");
+        let mut host = w.spawn_host();
+        let relay = Relay::new(&w.addr);
+        let mut guest = w.spawn_guest(&g, &relay.addr.clone(), &[]);
+        let mut problems = Vec::new();
+        for round in 0..3 {
+            let name = format!("swap{round}.txt");
+            let (hp, gp) = (w.proj.join(&name), g.mnt.join(&name));
+            fs::write(&hp, "file\n").unwrap();
+            eventually("the file on the guest", SYNC, || {
+                read(&gp).as_deref() == Some("file\n")
+            });
+            let held = File::open(&gp).unwrap();
+            relay.delay_ms.store(1500, Ordering::Relaxed);
+            fs::remove_file(&hp).unwrap();
+            std::os::unix::fs::symlink("README.md", &hp).unwrap();
+            let unlinked = fs::remove_file(&gp).map_err(|e| e.raw_os_error());
+            relay.delay_ms.store(0, Ordering::Relaxed);
+            match held.metadata() {
+                Ok(m) if m.is_file() => {}
+                r => problems.push(format!(
+                    "round {round}: unlink {unlinked:?}, then fstat on the held file gave {:?}",
+                    r.map(|m| m.file_type()).map_err(|e| e.raw_os_error())
+                )),
+            }
+            drop(held);
+            eventually("the host symlink on the guest", SYNC, || {
+                fs::symlink_metadata(&gp).is_ok_and(|m| m.file_type().is_symlink())
+            });
+        }
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        must_converge("after the refused unlinks", &w.proj, &g.mnt, &skip_git);
+        guest.quit(SYNC);
+        host.quit(SYNC);
+    }
+
     fn mount_tmpfs(at: &Path, size: &str) -> bool {
         fs::create_dir_all(at).unwrap();
         Command::new("mount")
@@ -554,7 +599,7 @@ mod chaos {
             }
             thread::sleep(Duration::from_millis(200));
         };
-        // once cached, opens may be served by kernel passthrough from the tmpfs blob
+        // once cached, opens are served from the tmpfs blob
         for _ in 0..3 {
             let again = fs::read_to_string(g.mnt.join("README.md"));
             assert_eq!(
@@ -938,8 +983,25 @@ mod chaos {
             "branches: slowest guest command {:?}",
             worst.lock().unwrap()
         );
-        let skip = |r: &str| r.split('/').any(|c| c == "target") || r == ".git/index.lock";
+        // the guest serves .git/index with its own stat data (guest/gitindex.rs), so the index is
+        // compared by its entries rather than its bytes
+        let skip = |r: &str| {
+            r.split('/').any(|c| c == "target") || r == ".git/index.lock" || r == ".git/index"
+        };
         must_converge("after branch switches", &w.proj, &g.mnt, &skip);
+        let staged = |dir: &Path| {
+            Command::new("git")
+                .args(["ls-files", "-s"])
+                .current_dir(dir)
+                .output()
+                .map(|o| o.stdout)
+                .unwrap_or_default()
+        };
+        let want = staged(&w.proj);
+        assert!(!want.is_empty(), "git ls-files on the host printed nothing");
+        eventually("the same index entries on both sides", SYNC, || {
+            staged(&g.mnt) == want
+        });
         let st = Command::new("git")
             .args(["status", "--porcelain"])
             .current_dir(&g.mnt)
@@ -1013,6 +1075,69 @@ mod chaos {
         assert_clean(&[&w.proj, &g1.mnt, &g2.mnt]);
         p1.quit(SYNC);
         p2.quit(SYNC);
+        host.quit(SYNC);
+    }
+
+    // the guest renames directories while the host rewrites files in them: a host edit made under the old
+    // name just before the move must still reach the guest under the new one
+    pub fn dir_moves_under_host_writes() {
+        if bin().is_none() {
+            return;
+        }
+        let mut w = World::new("dirmoves", |p| {
+            for d in ["a", "b", "c", "d"] {
+                fs::create_dir_all(p.join(d)).unwrap();
+                for i in 0..4 {
+                    fs::write(p.join(format!("{d}/f{i}.txt")), format!("{d}{i}\n")).unwrap();
+                }
+            }
+        });
+        let g = w.guest("g");
+        let mut host = w.spawn_host();
+        let mut guest = w.spawn_guest(&g, &w.addr.clone(), &[]);
+        eventually("the tree on the guest", SYNC, || {
+            g.mnt.join("a/f0.txt").exists()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let pick = |root: &Path, n: u64| -> Option<PathBuf> {
+            let mut ds: Vec<PathBuf> = fs::read_dir(root)
+                .ok()?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_dir() && !p.ends_with(".git"))
+                .collect();
+            ds.sort();
+            (!ds.is_empty()).then(|| ds.remove(n as usize % ds.len()))
+        };
+        let (proj, mnt, s1, s2) = (w.proj.clone(), g.mnt.clone(), stop.clone(), stop.clone());
+        let writer = thread::spawn(move || {
+            let mut n = 0u64;
+            while !s1.load(Ordering::Relaxed) {
+                if let Some(d) = pick(&proj, n.wrapping_mul(7)) {
+                    let _ = fs::write(
+                        d.join(format!("f{}.txt", n % 6)),
+                        format!("h {n}\n").repeat(1 + n as usize % 40),
+                    );
+                }
+                n += 1;
+                thread::sleep(Duration::from_millis(3));
+            }
+        });
+        let mover = thread::spawn(move || {
+            let mut n = 0u64;
+            while !s2.load(Ordering::Relaxed) {
+                if let Some(d) = pick(&mnt, n.wrapping_mul(13)) {
+                    let _ = fs::rename(&d, mnt.join(format!("g{n}")));
+                }
+                n += 1;
+                thread::sleep(Duration::from_millis(15));
+            }
+        });
+        thread::sleep(Duration::from_secs(15));
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        mover.join().unwrap();
+        must_converge("after directory moves", &w.proj, &g.mnt, &skip_git);
+        guest.quit(SYNC);
         host.quit(SYNC);
     }
 

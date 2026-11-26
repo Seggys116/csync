@@ -10,13 +10,14 @@ use crate::index::{
 };
 use crate::proto::{
     Bytes, Change, DeltaOp, Expect, FILE_MAX, Hash32, INLINE_MAX, Kind, LinkTarget, Meta, Mk, Op,
-    RelPath, Reply, ReqId, Version, WireErr,
+    RelPath, Reply, ReqId, Seq, Version, WireErr,
 };
-use crate::sys::{self, Swap};
+use crate::sys::{self, Swap, WatchEvent, wflag};
 use crossbeam_channel::Receiver;
 use rustix::fs::{AtFlags, Mode, OFlags, RenameFlags};
 use rustix::io::Errno;
 use std::{
+    cell::Cell,
     io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::{Arc, atomic::Ordering},
@@ -64,6 +65,22 @@ impl Staged {
         self.done = true;
     }
 
+    // the writable fd closes under the temp name, so no close_write lands on the destination
+    fn read_only(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            let me = format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+            );
+            if let Ok(fd) =
+                rustix::fs::open(me.as_str(), OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            {
+                self.fd = fd;
+            }
+        }
+    }
+
     // after a failed swap: true when our inode still sits under the temp name
     fn still_named(&self) -> bool {
         match (
@@ -81,6 +98,70 @@ impl Drop for Staged {
         if !self.done {
             let _ = rustix::fs::unlinkat(self.dir.as_fd(), self.name.as_str(), AtFlags::empty());
         }
+    }
+}
+
+const SINK_BUF: usize = 1 << 20;
+const PAR_HASH_MIN: usize = 256 << 10;
+
+// an upload landing in its temp: chunks are gathered so each write and hash covers a large span, the two run side by side
+pub(crate) struct Sink {
+    pub(crate) staged: Staged,
+    hasher: Option<blake3::Hasher>,
+    buf: Vec<u8>,
+    at: u64,
+}
+
+impl Sink {
+    pub(crate) fn new(staged: Staged, hash: bool, len: u64) -> Self {
+        let cap = usize::try_from(len).unwrap_or(SINK_BUF).min(SINK_BUF);
+        Self {
+            staged,
+            hasher: hash.then(blake3::Hasher::new),
+            buf: Vec::with_capacity(cap),
+            at: 0,
+        }
+    }
+
+    pub(crate) fn put(&mut self, data: &[u8]) -> io::Result<()> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= SINK_BUF {
+            self.drain()?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let (fd, buf, at) = (self.staged.fd.as_fd(), &self.buf[..], self.at);
+        match self.hasher.as_mut() {
+            Some(h) if buf.len() >= PAR_HASH_MIN => {
+                let (w, _) = rayon::join(
+                    || write_all_at(fd, buf, at),
+                    || {
+                        h.update_rayon(buf);
+                    },
+                );
+                w?;
+            }
+            Some(h) => {
+                write_all_at(fd, buf, at)?;
+                h.update(buf);
+            }
+            None => write_all_at(fd, buf, at)?,
+        }
+        self.at += buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
+
+    // the temp with everything written, and the hash of the bytes when one was asked for
+    pub(crate) fn finish(mut self) -> io::Result<(Staged, Option<Hash32>)> {
+        self.drain()?;
+        let h = self.hasher.map(|h| *h.finalize().as_bytes());
+        Ok((self.staged, h))
     }
 }
 
@@ -116,8 +197,60 @@ pub(crate) fn run(core: &Core, rx: &Receiver<Job>) {
             guest.reply(id, Err(WireErr::Gone));
             continue;
         }
-        let res = exec(core, op, payload, Some(guest.id));
-        guest.reply(id, res);
+        let asker = Asker::new(&guest, id);
+        let res = exec(core, op, payload, Some(&asker));
+        if !asker.answered.get() {
+            guest.reply(id, res);
+        }
+    }
+}
+
+// the guest that sent a request; a reply it must see before later pushes goes out under the tree lock
+pub(crate) struct Asker<'a> {
+    guest: &'a Guest,
+    id: ReqId,
+    answered: Cell<bool>,
+}
+
+impl<'a> Asker<'a> {
+    pub(crate) fn new(guest: &'a Guest, id: ReqId) -> Self {
+        Self {
+            guest,
+            id,
+            answered: Cell::new(false),
+        }
+    }
+
+    fn answer(&self, seq: Seq, r: Reply) {
+        self.answered.set(true);
+        self.guest.reply_after(seq, self.id, r);
+    }
+}
+
+// marks paths in flight until dropped, so the applier never publishes a half-done swap it sampled
+pub(crate) struct Hold<'a> {
+    core: &'a Core,
+    paths: [Option<RelPath>; 2],
+}
+
+impl<'a> Hold<'a> {
+    pub(crate) fn new(core: &'a Core, paths: [Option<&RelPath>; 2]) -> Self {
+        let paths = paths.map(|p| p.filter(|p| !p.is_root()).cloned());
+        // taken under the tree lock so no hold can start while the applier rescans a subtree
+        let _tree = core.tree();
+        super::lock(&core.inflight).extend(paths.iter().flatten().cloned());
+        Self { core, paths }
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        let mut v = super::lock(&self.core.inflight);
+        for p in self.paths.iter().flatten() {
+            if let Some(i) = v.iter().position(|q| q == p) {
+                v.swap_remove(i);
+            }
+        }
     }
 }
 
@@ -125,8 +258,17 @@ pub(crate) fn exec(
     core: &Core,
     op: Op,
     payload: Payload,
-    origin: Option<u64>,
+    asker: Option<&Asker<'_>>,
 ) -> Result<Reply, WireErr> {
+    let origin = asker.map(|a| a.guest.id);
+    let _hold = match &op {
+        Op::Commit { path, .. }
+        | Op::Mk { path, .. }
+        | Op::Remove { path, .. }
+        | Op::SetAttr { path, .. } => Some(Hold::new(core, [Some(path), None])),
+        Op::Rename { from, to, .. } => Some(Hold::new(core, [Some(from), Some(to)])),
+        Op::Fetch { .. } | Op::FetchMany { .. } => None,
+    };
     let r = match op {
         Op::Commit {
             path,
@@ -146,7 +288,7 @@ pub(crate) fn exec(
             body,
         } => {
             let body = body.map(|(v, _)| (v, payload));
-            rename(core, &from, &to, from_expect, to_expect, body, origin)
+            rename(core, &from, &to, from_expect, to_expect, body, asker)
         }
         Op::SetAttr {
             path,
@@ -245,12 +387,8 @@ fn spelled(core: &Core, dir: BorrowedFd<'_>, path: &RelPath, name: &str) -> bool
     !folds(core) || core.tree().get(path).is_some() || listed(dir, name)
 }
 
-fn kind_at(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Kind>, WireErr> {
-    match sys::stat_key_at(dir, name) {
-        Ok(st) => Ok(Some(sys::kind_of_mode(st.mode).unwrap_or(Kind::File))),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(wire(&e)),
-    }
+fn kind_of(st: Option<StatKey>) -> Option<Kind> {
+    st.map(|s| sys::kind_of_mode(s.mode).unwrap_or(Kind::File))
 }
 
 // the existing entry a remove, attribute change or rename source names, checked before it is opened or hashed
@@ -261,11 +399,12 @@ fn existing(
     name: &str,
     gate: &Gate,
 ) -> Result<Cur, WireErr> {
-    gate.pass(kind_at(dir, name)?)?;
+    let st = lstat(dir, name)?;
+    gate.pass(kind_of(st))?;
     if !spelled(core, dir, path, name) {
         return Err(WireErr::NotFound);
     }
-    let c = current(core, dir, path, name)?.ok_or(WireErr::NotFound)?;
+    let c = current_from(core, dir, path, name, st)?.ok_or(WireErr::NotFound)?;
     gate.pass(Some(c.kind))?;
     Ok(c)
 }
@@ -327,6 +466,10 @@ pub(crate) fn open_parent<'p>(core: &Core, p: &'p RelPath) -> Result<(OwnedFd, &
     let dp = RelPath::new(dir).map_err(|_| WireErr::Invalid)?;
     let fd = sys::open_beneath(core.root.as_fd(), &dp, OFlags::RDONLY | OFlags::DIRECTORY)
         .map_err(|e| wire(&e))?;
+    // volumes mounted inside the root are not synced, so nothing is written into them
+    if !dir.is_empty() && sys::stat_key(fd.as_fd()).map_err(|e| wire(&e))?.dev != core.root_id.0 {
+        return Err(WireErr::Denied);
+    }
     Ok((fd, name))
 }
 
@@ -355,10 +498,27 @@ fn current(
     path: &RelPath,
     name: &str,
 ) -> Result<Option<Cur>, WireErr> {
-    let st = match sys::stat_key_at(dir, name) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(wire(&e)),
+    current_from(core, dir, path, name, lstat(dir, name)?)
+}
+
+fn lstat(dir: BorrowedFd<'_>, name: &str) -> Result<Option<StatKey>, WireErr> {
+    match sys::stat_key_at(dir, name) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(wire(&e)),
+    }
+}
+
+// as current, from an lstat the caller already took
+fn current_from(
+    core: &Core,
+    dir: BorrowedFd<'_>,
+    path: &RelPath,
+    name: &str,
+    st: Option<StatKey>,
+) -> Result<Option<Cur>, WireErr> {
+    let Some(st) = st else {
+        return Ok(None);
     };
     match sys::kind_of_mode(st.mode) {
         Some(Kind::File) => {
@@ -376,7 +536,11 @@ fn current(
             let hash = match known {
                 Some(h) => h,
                 None => {
-                    let h = hash_fd(fd.as_fd(), k1.size).map_err(|e| wire(&e))?;
+                    // a host write that shrank the file mid-hash is a race like any other, not an i/o error
+                    let h = hash_fd(fd.as_fd(), k1.size).map_err(|e| match e.kind() {
+                        io::ErrorKind::UnexpectedEof => WireErr::Busy,
+                        _ => wire(&e),
+                    })?;
                     let k2 = sys::stat_key(fd.as_fd()).map_err(|e| wire(&e))?;
                     if !sys::same_version(&k1, &k2) {
                         return Err(WireErr::Busy);
@@ -500,8 +664,13 @@ fn record(
     core.publish_locked(&tree, changes, origin);
 }
 
-fn dup(fd: &OwnedFd) -> Result<OwnedFd, WireErr> {
-    rustix::io::dup(fd).map_err(wire_errno)
+// a swap the watcher was told to skip that then went unrecorded is handed to the applier instead
+fn reindex(core: &Core, path: &RelPath) {
+    let _ = core.events.send(vec![WatchEvent {
+        path: path.clone(),
+        flags: wflag::MODIFIED,
+        cookie: 0,
+    }]);
 }
 
 fn chmod(fd: BorrowedFd<'_>, perm: u32) -> Result<(), WireErr> {
@@ -531,14 +700,15 @@ fn commit(
         }
         _ => {}
     }
-    let kind = kind_at(dir.as_fd(), name)?;
+    let st = lstat(dir.as_fd(), name)?;
+    let kind = kind_of(st);
     if kind == Some(Kind::Dir) {
         gate.dir?;
     }
     if collides(core, dir.as_fd(), path, name, kind.is_some()) {
         return Err(WireErr::Exists);
     }
-    let cur = current(core, dir.as_fd(), path, name)?;
+    let cur = current_from(core, dir.as_fd(), path, name, st)?;
     if cur.as_ref().is_some_and(|c| c.kind == Kind::Dir) {
         gate.dir?;
     }
@@ -562,12 +732,13 @@ fn commit(
         .or(cur.as_ref().map(|c| c.stat.mode))
         .unwrap_or(0o644)
         & 0o777;
+    // the parent fd moves into the temp; an uploaded temp already holds the same directory
     let mut tmp = match payload {
         Payload::Bytes(b) => {
             if b.len() as u64 != new.size || *blake3::hash(&b).as_bytes() != new.hash {
                 return Err(WireErr::Invalid);
             }
-            let s = Staged::create(core, dup(&dir)?, 0o600).map_err(|e| wire(&e))?;
+            let s = Staged::create(core, dir, 0o600).map_err(|e| wire(&e))?;
             write_all_at(s.fd.as_fd(), &b, 0).map_err(|e| wire(&e))?;
             s
         }
@@ -585,11 +756,14 @@ fn commit(
             let Some(c) = cur.as_ref().filter(|_| matches!(base, Expect::Is(_))) else {
                 return Err(WireErr::Invalid);
             };
-            build_delta(core, dup(&dir)?, c, &ops, data_len, lits.as_ref(), new)?
+            build_delta(core, dir, c, &ops, data_len, lits.as_ref(), new)?
         }
         Payload::None => return Err(WireErr::Invalid),
     };
     chmod(tmp.fd.as_fd(), mode)?;
+    if let Some(old) = cur.as_ref().and_then(|c| c.fd.as_ref()) {
+        let _ = sys::copy_xattrs(old.as_fd(), tmp.fd.as_fd());
+    }
     if sync {
         sys::full_fsync(tmp.fd.as_fd()).map_err(|e| wire(&e))?;
     }
@@ -599,9 +773,17 @@ fn commit(
     } else {
         note_rule(core, path, &[key]);
     }
+    if core.echoes.is_on() {
+        tmp.read_only();
+    }
     let pre = sys::stat_key(tmp.fd.as_fd()).map_err(|e| wire(&e))?;
+    // the watcher must still see a rule file land so the host re-reads its rules
+    if !core.rules_r().is_rule_file(path) {
+        core.echoes
+            .expect(path, &tmp.name, if cur.is_some() { 2 } else { 1 });
+    }
     let swapped = match &cur {
-        None => match sys::rename_noreplace(dir.as_fd(), &tmp.name, name) {
+        None => match sys::rename_noreplace(tmp.dir.as_fd(), &tmp.name, name) {
             Ok(()) => {
                 tmp.consumed();
                 true
@@ -611,7 +793,7 @@ fn commit(
         },
         Some(c) => {
             let old = c.fd.as_ref().ok_or(WireErr::Busy)?;
-            match sys::exchange_checked(dir.as_fd(), &tmp.name, name, old.as_fd(), &c.stat) {
+            match sys::exchange_checked(tmp.dir.as_fd(), &tmp.name, name, old.as_fd(), &c.stat) {
                 Ok(Swap::Committed) => {
                     tmp.consumed();
                     true
@@ -630,19 +812,23 @@ fn commit(
         }
     };
     if !swapped {
+        let again = current(core, tmp.dir.as_fd(), path, name);
         drop(tmp);
-        let again = current(core, dir.as_fd(), path, name)?;
-        return Ok(conflict(again.as_ref()));
+        return Ok(conflict(again?.as_ref()));
     }
     if sync {
-        let _ = sys::fsync(dir.as_fd());
+        let _ = sys::fsync(tmp.dir.as_fd());
     }
     // our inode is now the destination; a host write that landed after the swap means rehashing
-    let post = sys::stat_key(tmp.fd.as_fd()).map_err(|e| wire(&e))?;
+    let unindexed = |e: io::Error| {
+        reindex(core, path);
+        wire(&e)
+    };
+    let post = sys::stat_key(tmp.fd.as_fd()).map_err(&unindexed)?;
     let hash = if sys::same_version(&post, &pre) {
         new.hash
     } else {
-        hash_fd(tmp.fd.as_fd(), post.size).map_err(|e| wire(&e))?
+        hash_fd(tmp.fd.as_fd(), post.size).map_err(&unindexed)?
     };
     let meta = file_meta(&post, hash, false);
     record(
@@ -775,7 +961,7 @@ fn mk(core: &Core, path: &RelPath, what: &Mk, origin: Option<u64>) -> Result<Rep
                 Err(e) => return Err(wire_errno(e)),
             }
             let st = sys::stat_key_at(dir.as_fd(), name).map_err(|e| wire(&e))?;
-            if sys::kind_of_mode(st.mode) != Some(Kind::Dir) {
+            if sys::kind_of_mode(st.mode) != Some(Kind::Dir) || st.dev != core.root_id.0 {
                 return Err(WireErr::Exists);
             }
             (dir_meta(&st, false), st)
@@ -830,10 +1016,16 @@ fn remove(
         note_rule(core, path, &[None]);
     }
     if c.kind == Kind::Dir {
-        rustix::fs::unlinkat(dir.as_fd(), name, AtFlags::REMOVEDIR).map_err(wire_errno)?;
+        match rustix::fs::unlinkat(dir.as_fd(), name, AtFlags::REMOVEDIR) {
+            Err(Errno::NOTEMPTY) if clear_leftovers(core, dir.as_fd(), path, name) => {
+                rustix::fs::unlinkat(dir.as_fd(), name, AtFlags::REMOVEDIR).map_err(wire_errno)?
+            }
+            r => r.map_err(wire_errno)?,
+        }
     } else {
         // move aside, verify it is still the inode we checked, then unlink; a racing replacement is put back
         let tmp = core.tmp_name();
+        core.echoes.expect(path, &tmp, 1);
         sys::rename_noreplace(dir.as_fd(), name, &tmp).map_err(|e| wire(&e))?;
         let moved = sys::stat_key_at(dir.as_fd(), &tmp).ok();
         let now = match &c.fd {
@@ -846,10 +1038,83 @@ fn remove(
             let again = current(core, dir.as_fd(), path, name)?;
             return Ok(conflict(again.as_ref()));
         }
-        rustix::fs::unlinkat(dir.as_fd(), tmp.as_str(), AtFlags::empty()).map_err(wire_errno)?;
+        rustix::fs::unlinkat(dir.as_fd(), tmp.as_str(), AtFlags::empty()).map_err(|e| {
+            reindex(core, path);
+            wire_errno(e)
+        })?;
     }
     record(core, path, Observed::Absent, Vec::new(), origin);
     Ok(Reply::Done { meta })
+}
+
+// what a guest's own self-ignoring rule left on the host (python -m venv, tool caches): empty directories,
+// links that stay inside, and rule files the guest wrote; anything else, a host file above all, keeps the directory
+fn clear_leftovers(core: &Core, parent: BorrowedFd<'_>, path: &RelPath, name: &str) -> bool {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let Ok(d) = rustix::fs::openat(parent, name, flags, Mode::empty()) else {
+        return false;
+    };
+    let rules = core.rules_r();
+    let mut n = 0;
+    leftovers(&rules, d.as_fd(), path, 0, &mut n, false)
+        && leftovers(&rules, d.as_fd(), path, 0, &mut 0, true)
+}
+
+fn leftovers(
+    rules: &Rules,
+    d: BorrowedFd<'_>,
+    dir: &RelPath,
+    depth: usize,
+    n: &mut usize,
+    wipe: bool,
+) -> bool {
+    let mut ents = Vec::new();
+    if depth > 16 || sys::read_dir_plus(d, &mut ents).is_err() {
+        return false;
+    }
+    for e in ents {
+        *n += 1;
+        let Ok(p) = dir.join(&e.name) else {
+            return false;
+        };
+        let kind = sys::kind_of_mode(e.stat.mode);
+        if *n > 4096 || rules.classify(&p, kind == Some(Kind::Dir)) != Class::Ignored {
+            return false;
+        }
+        let nm = e.name.as_str();
+        let ok = match kind {
+            Some(Kind::Dir) => {
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                rustix::fs::openat(d, nm, flags, Mode::empty())
+                    .is_ok_and(|s| leftovers(rules, s.as_fd(), &p, depth + 1, n, wipe))
+            }
+            Some(Kind::Symlink) => rustix::fs::readlinkat(d, nm, Vec::new())
+                .ok()
+                .and_then(|t| LinkTarget::new(t.to_str().ok()?).ok())
+                .is_some_and(|t| t.stays_within(&p)),
+            Some(Kind::File) if e.stat.size <= RULE_MAX && rules.is_rule_file(&p) => {
+                let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+                rustix::fs::openat(d, nm, flags, Mode::empty())
+                    .ok()
+                    .and_then(|f| read_all(f.as_fd(), e.stat.size).ok())
+                    .is_some_and(|b| rules.guest_wrote(&p, blake3::hash(&b).as_bytes()))
+            }
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+        if wipe {
+            let fl = match kind {
+                Some(Kind::Dir) => AtFlags::REMOVEDIR,
+                _ => AtFlags::empty(),
+            };
+            if rustix::fs::unlinkat(d, nm, fl).is_err() {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn systime(ns: i64) -> SystemTime {
@@ -878,6 +1143,41 @@ fn set_attr(
     }
     if perm.is_some() {
         note_rule(core, path, &[None]);
+    }
+    // lutimes: a symlink has times but no mode of its own
+    if c.kind == Kind::Symlink {
+        if perm.is_some() {
+            return Err(WireErr::Invalid);
+        }
+        if let Some(t) = mtime_ns {
+            let omit = rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_OMIT,
+            };
+            let ts = rustix::fs::Timestamps {
+                last_access: omit,
+                last_modification: rustix::fs::Timespec {
+                    tv_sec: t.div_euclid(1_000_000_000) as _,
+                    tv_nsec: t.rem_euclid(1_000_000_000) as _,
+                },
+            };
+            rustix::fs::utimensat(dir.as_fd(), name, &ts, AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(wire_errno)?;
+        }
+        let post = lstat(dir.as_fd(), name)?.ok_or(WireErr::NotFound)?;
+        let meta = link_meta(&post, c.link.clone().ok_or(WireErr::Io)?, false);
+        record(
+            core,
+            path,
+            Observed::Present {
+                meta: meta.clone(),
+                stat: post,
+                domain: Domain::Synced,
+            },
+            Vec::new(),
+            origin,
+        );
+        return Ok(Reply::Done { meta });
     }
     let opened;
     let fd = match c.kind {
@@ -940,8 +1240,9 @@ fn rename(
     fe: Expect,
     te: Expect,
     body: Option<(Version, Payload)>,
-    origin: Option<u64>,
+    asker: Option<&Asker<'_>>,
 ) -> Result<Reply, WireErr> {
+    let origin = asker.map(|a| a.guest.id);
     if from == to || from.is_root() || to.is_root() || to.starts_with(from) {
         return Err(WireErr::Invalid);
     }
@@ -972,14 +1273,21 @@ fn rename(
     if !matches_expect(Some(&fc), fe) {
         return Ok(conflict(Some(&fc)));
     }
-    let tkind = kind_at(tdir.as_fd(), tname)?;
+    let tst = lstat(tdir.as_fd(), tname)?;
+    // a case or normalisation only rename: on a folding volume the new spelling resolves to the source itself
+    let respell = folds(core)
+        && tst.is_some_and(|t| t.dev == fc.stat.dev && t.ino == fc.stat.ino)
+        && same_dir(fdir.as_fd(), tdir.as_fd()).is_ok()
+        && !listed(tdir.as_fd(), tname);
+    let tst = tst.filter(|_| !respell);
+    let tkind = kind_of(tst);
     if tkind.is_some() {
         tgate.pass(tkind)?;
     }
-    if collides(core, tdir.as_fd(), to, tname, tkind.is_some()) {
+    if !respell && collides(core, tdir.as_fd(), to, tname, tkind.is_some()) {
         return Err(WireErr::Exists);
     }
-    let tc = current(core, tdir.as_fd(), to, tname)?;
+    let tc = current_from(core, tdir.as_fd(), to, tname, tst)?;
     if !matches_expect(tc.as_ref(), te) {
         return Ok(conflict(tc.as_ref()));
     }
@@ -994,6 +1302,9 @@ fn rename(
         note_rule(core, to, &[moved]);
     }
     match &tc {
+        None if respell => {
+            rustix::fs::renameat(fdir.as_fd(), fname, tdir.as_fd(), tname).map_err(wire_errno)?
+        }
         None => match rustix::fs::renameat_with(
             fdir.as_fd(),
             fname,
@@ -1078,12 +1389,18 @@ fn rename(
         let mut rules = core.rules_w();
         let mut tree = core.tree();
         changes.extend(tree.observe(to, present));
+        let start = changes.len();
         copy_subtree(&mut tree, &rules, from, to, &mut changes);
+        // the origin may have moved its copy before host edits under the old path reached it
+        let mut found = changes[start..].to_vec();
         changes.extend(tree.observe(from, Observed::Absent));
         core.publish_locked(&tree, changes, origin);
+        // the origin moves its copy on this reply, so it must precede every push naming the new path
+        if let Some(a) = asker {
+            a.answer(tree.seq(), Reply::Done { meta: meta.clone() });
+        }
         // rule files and repos moved with the directory, so the new location is reconciled against disk;
         // whatever that finds came from host writes the origin never saw, so it is told too
-        let mut found = Vec::new();
         let _ = scan::scan_subtree(&core.root_path, to, &mut rules, &mut tree, &mut found);
         drop(rules);
         core.publish_locked(&tree, found, None);
@@ -1447,6 +1764,85 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn guest_edits_keep_host_extended_attributes() {
+        let t = tmpdir("xattr");
+        let f = t.0.join("tagged.txt");
+        fs::write(&f, b"v1").unwrap();
+        let fd = fs::File::open(&f).unwrap();
+        if rustix::fs::fsetxattr(
+            &fd,
+            "user.csync-tag",
+            b"red",
+            rustix::fs::XattrFlags::empty(),
+        )
+        .is_err()
+        {
+            return;
+        }
+        drop(fd);
+        let (core, _rx) = core_at(&t.0);
+        assert!(matches!(
+            put(&core, "tagged.txt", Expect::Is(ver(b"v1")), b"v2"),
+            Ok(Reply::Done { .. })
+        ));
+        assert_eq!(fs::read(&f).unwrap(), b"v2");
+        let fd = fs::File::open(&f).unwrap();
+        let mut v = [0u8; 16];
+        let n = rustix::fs::fgetxattr(&fd, "user.csync-tag", &mut v[..]).unwrap();
+        assert_eq!(&v[..n], b"red");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn case_and_normalisation_only_renames_respell_in_place() {
+        let t = tmpdir("respell");
+        fs::write(t.0.join("foo.txt"), b"foo").unwrap();
+        fs::write(t.0.join("bar.txt"), b"bar").unwrap();
+        fs::write(t.0.join("caf\u{e9}.txt"), b"nfc").unwrap();
+        fs::create_dir(t.0.join("Docs")).unwrap();
+        fs::write(t.0.join("Docs/a.txt"), b"doc").unwrap();
+        let (core, _rx) = core_at(&t.0);
+        if !(core.fs.case_fold && core.fs.norm_fold) {
+            return;
+        }
+        let names = || {
+            let mut v: Vec<String> = fs::read_dir(&t.0)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        let done = |op| matches!(exec(&core, op, Payload::None, None), Ok(Reply::Done { .. }));
+        assert!(done(op_mv("foo.txt", "FOO.txt")));
+        assert!(done(op_mv("Docs", "docs")));
+        assert!(done(op_mv("caf\u{e9}.txt", "cafe\u{301}.txt")));
+        assert_eq!(names(), ["FOO.txt", "bar.txt", "cafe\u{301}.txt", "docs"]);
+        assert_eq!(fs::read(t.0.join("FOO.txt")).unwrap(), b"foo");
+        assert_eq!(fs::read(t.0.join("docs/a.txt")).unwrap(), b"doc");
+        {
+            let tree = core.tree();
+            for (p, there) in [
+                ("FOO.txt", true),
+                ("foo.txt", false),
+                ("docs/a.txt", true),
+                ("Docs/a.txt", false),
+                ("cafe\u{301}.txt", true),
+                ("caf\u{e9}.txt", false),
+            ] {
+                assert_eq!(tree.get(&rp(p)).is_some(), there, "{p}");
+            }
+        }
+        // another file's spelling is still a collision, not a respelling
+        assert_eq!(
+            exec(&core, op_mv("FOO.txt", "BAR.TXT"), Payload::None, None),
+            Err(WireErr::Exists)
+        );
+        assert_eq!(fs::read(t.0.join("bar.txt")).unwrap(), b"bar");
+        assert_eq!(fs::read(t.0.join("FOO.txt")).unwrap(), b"foo");
+    }
+
     // what the applier does when the watcher reports the rule file
     fn reread(core: &Core, p: &str) {
         let text = super::super::read_rule(core.root.as_fd(), &rp(p));
@@ -1502,6 +1898,36 @@ mod tests {
         fs::write(t.0.join(".gitignore"), b"# none\n").unwrap();
         reread(&core, ".gitignore");
         assert_eq!(class(".env"), Class::Synced);
+    }
+
+    // python -m venv in a synced directory: what the guest's `*` rule left behind goes with the directory,
+    // a host file under it keeps it
+    #[test]
+    fn removing_a_self_ignored_dir_clears_only_guest_leftovers() {
+        let t = tmpdir("venv");
+        for v in ["v", "w"] {
+            fs::create_dir_all(t.0.join(v).join("lib/site")).unwrap();
+            std::os::unix::fs::symlink("lib", t.0.join(v).join("lib64")).unwrap();
+        }
+        fs::write(t.0.join("w/data.txt"), b"host\n").unwrap();
+        let (core, _rx) = core_at(&t.0);
+        for v in ["v", "w"] {
+            let p = format!("{v}/.gitignore");
+            assert!(matches!(
+                put(&core, &p, Expect::Absent, b"*\n"),
+                Ok(Reply::Done { .. })
+            ));
+            reread(&core, &p);
+            assert_eq!(core.rules_r().classify(&rp(&p), false), Class::Ignored);
+        }
+        assert!(matches!(
+            exec(&core, op_rm("v"), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        assert!(!t.0.join("v").exists());
+        assert!(exec(&core, op_rm("w"), Payload::None, None).is_err());
+        assert_eq!(fs::read(t.0.join("w/data.txt")).unwrap(), b"host\n");
+        assert_eq!(fs::read(t.0.join("w/.gitignore")).unwrap(), b"*\n");
     }
 
     #[test]

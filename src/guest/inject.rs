@@ -1,6 +1,6 @@
 use super::tree::{Effect, GTree, NodeId, Synth, Vis};
 use crate::proto::{Kind, Name};
-use crossbeam_channel::{Receiver, Sender, bounded, select_biased};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, select_biased};
 use rustc_hash::FxHashSet;
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
@@ -10,16 +10,23 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, RwLock,
-        atomic::{AtomicI32, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
+
+// set when the kernel takes file sizes from attribute replies: a truncate would then only hold back
+// every size it learns until its own reply, so a modify is raised another way
+pub static SIZES_FROM_ATTRS: AtomicBool = AtomicBool::new(false);
 
 pub const QUEUE_MAX: usize = 4_096;
 const BACK_MAX: usize = 1_024;
+const OFFER_WAIT: Duration = Duration::from_secs(1);
 
 struct Shared {
     tid: AtomicI32,
+    stalled: AtomicBool,
     queued: Mutex<FxHashSet<(bool, NodeId)>>,
 }
 
@@ -63,6 +70,7 @@ impl Injector {
         let (back_tx, back_rx) = bounded(BACK_MAX);
         let sh = Arc::new(Shared {
             tid: AtomicI32::new(0),
+            stalled: AtomicBool::new(false),
             queued: Mutex::new(FxHashSet::default()),
         });
         let w = Worker {
@@ -86,28 +94,38 @@ impl Injector {
         ))
     }
 
-    // false means the queue is full: the caller settles the node without an event, like an inotify overflow
+    // a full queue applies backpressure, so a burst reaches watchers as events or as their own queue
+    // overflow; false (settle without an event) only once the injector has been stuck for OFFER_WAIT
     pub fn offer(&self, s: Synth) -> bool {
         let key = match &s {
             Synth::Modify { node } => Some((true, *node)),
             Synth::Attrib { node } => Some((false, *node)),
             _ => None,
         };
-        let mut q = key.map(|_| lock(&self.sh.queued));
-        if let (Some(q), Some(k)) = (q.as_mut(), key)
-            && !q.insert(k)
+        if let Some(k) = key
+            && !lock(&self.sh.queued).insert(k)
         {
             return true;
         }
-        match self.tx.try_send(s) {
+        let s = match self.tx.try_send(s) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(s)) if !self.sh.stalled.load(Ordering::Acquire) => s,
+            Err(_) => return self.unqueue(key),
+        };
+        match self.tx.send_timeout(s, OFFER_WAIT) {
             Ok(()) => true,
             Err(_) => {
-                if let (Some(q), Some(k)) = (q.as_mut(), key) {
-                    q.remove(&k);
-                }
-                false
+                self.sh.stalled.store(true, Ordering::Release);
+                self.unqueue(key)
             }
         }
+    }
+
+    fn unqueue(&self, key: Option<(bool, NodeId)>) -> bool {
+        if let Some(k) = key {
+            lock(&self.sh.queued).remove(&k);
+        }
+        false
     }
 
     pub fn is_self(&self, req_pid: u32) -> bool {
@@ -153,6 +171,9 @@ impl Worker {
                 recv(self.rx) -> m => m.ok(),
             };
             let Some(s) = next else { break };
+            if self.sh.stalled.load(Ordering::Relaxed) && self.rx.len() < QUEUE_MAX / 2 {
+                self.sh.stalled.store(false, Ordering::Release);
+            }
             if let Synth::Modify { node } | Synth::Attrib { node } = &s {
                 lock(&self.sh.queued).remove(&(matches!(s, Synth::Modify { .. }), *node));
             }
@@ -164,14 +185,28 @@ impl Worker {
                 )
                 .ok();
             }
+            let begun = match &s {
+                Synth::Modify { node } => {
+                    let t = self.tree.read().unwrap_or_else(|e| e.into_inner());
+                    t.get(*node).map(|n| (*node, n.size_gen))
+                }
+                _ => None,
+            };
             if let Some(r) = &root {
                 let _ = self.inject(r, &s, &mut a, &mut b);
             }
             let mut fx = Vec::new();
-            self.tree
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .settle(&s, &mut fx);
+            let mut t = self.tree.write().unwrap_or_else(|e| e.into_inner());
+            // a truncate begun after the version was shown has returned: the kernel's size is that version's
+            if let Some((node, gen_)) = begun
+                && let Some(n) = t.get_mut(node)
+                && n.size_gen == gen_
+                && n.kernel_ver() == n.meta.version()
+            {
+                n.size_pending = false;
+            }
+            t.settle(&s, &mut fx);
+            drop(t);
             if !fx.is_empty() && self.back.send(fx).is_err() {
                 break;
             }
@@ -183,7 +218,7 @@ impl Worker {
     fn inject(&self, root: &OwnedFd, s: &Synth, a: &mut String, b: &mut String) -> io::Result<()> {
         match s {
             Synth::Create { parent, name, .. } => {
-                let (kind, perm, link) = {
+                let (kind, perm, link, size) = {
                     let t = self.tree.read().unwrap_or_else(|e| e.into_inner());
                     let Some(n) = t.child(*parent, name.as_str()).and_then(|id| t.get(id)) else {
                         return Ok(());
@@ -191,7 +226,7 @@ impl Worker {
                     if n.vis != Vis::PendingCreate || !t.visible_path_of(*parent, a) {
                         return Ok(());
                     }
-                    (n.meta.kind, n.meta.perm, n.meta.link.clone())
+                    (n.meta.kind, n.meta.perm, n.meta.link.clone(), n.meta.size)
                 };
                 push_name(a, name);
                 match kind {
@@ -206,7 +241,11 @@ impl Worker {
                             | OFlags::WRONLY
                             | OFlags::NOFOLLOW
                             | OFlags::CLOEXEC;
-                        drop(rustix::fs::openat(root, a.as_str(), flags, mode(perm))?);
+                        let fd = rustix::fs::openat(root, a.as_str(), flags, mode(perm))?;
+                        // a file born with content also shows IN_MODIFY before its close, as natively
+                        if size > 0 {
+                            rustix::fs::ftruncate(&fd, size)?;
+                        }
                     }
                 }
             }
@@ -230,6 +269,10 @@ impl Worker {
                         OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     ) {
+                        Ok(fd) if SIZES_FROM_ATTRS.load(Ordering::Relaxed) => {
+                            let keep = rustix::fs::FallocateFlags::KEEP_SIZE;
+                            return Ok(rustix::fs::fallocate(&fd, keep, 0, 1)?);
+                        }
                         Ok(fd) => return Ok(rustix::fs::ftruncate(&fd, size)?),
                         Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::TXTBSY) => {}
                         Err(e) => return Err(e.into()),

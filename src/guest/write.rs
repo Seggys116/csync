@@ -1,6 +1,6 @@
 use super::cache::{
-    BlobCache, BlobRef, DELTA_CAP, Done, Remote, RemoteSlot, TmpBlob, WAIT, io_errno, lock,
-    pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
+    BlobCache, BlobRef, DELTA_CAP, Done, Remote, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno,
+    lock, pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
 };
 use super::tree::{GNode, Vis};
 use crate::delta;
@@ -20,6 +20,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MERGE_TRIES: u32 = 3;
 pub const REFUSED: i32 = libc::ECANCELED;
 const RACY_NS: i64 = 100_000_000;
+const BUSY_MIN: Duration = Duration::from_millis(1);
+const BUSY_MAX: Duration = Duration::from_millis(50);
+// a new file this large commits in place and waits for the host instead of pipelining a copy
+const BORROW_MIN: u64 = 1 << 20;
+// staging reads for a streamed body, split into wire chunks
+const READ_BLOCK: usize = CHUNK_MAX * 16;
 
 pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
 
@@ -133,11 +139,16 @@ fn overwrite(fd: BorrowedFd<'_>, data: &[u8]) -> Result<(), i32> {
 struct Cell {
     r: Mutex<Option<Result<Reply, RpcError>>>,
     cv: Condvar,
+    // answered, even after a waiter took the answer: a release waiting only for the reply must not miss it
+    fired: std::sync::atomic::AtomicBool,
 }
 
 impl Cell {
     fn put(&self, r: Result<Reply, RpcError>) {
-        *lock(&self.r) = Some(r);
+        let mut g = lock(&self.r);
+        *g = Some(r);
+        self.fired.store(true, std::sync::atomic::Ordering::Release);
+        drop(g);
         self.cv.notify_all();
     }
 
@@ -160,7 +171,7 @@ impl Cell {
 
     fn ready(&self, deadline: Instant) {
         let mut g = lock(&self.r);
-        while g.is_none() {
+        while g.is_none() && !self.fired.load(std::sync::atomic::Ordering::Acquire) {
             let now = Instant::now();
             if now >= deadline {
                 return;
@@ -190,8 +201,16 @@ struct Staged {
     perm: u16,
     synced: Option<Mark>,
     pending: Option<Pending>,
+    // committed straight from the staging file: the cache gets it when the last handle goes
+    unpublished: Option<Version>,
     handles: u32,
     refused: bool,
+    // a truncate without a handle owns one handle count until an open adopts it or it is committed
+    deferred: bool,
+    // out of the table: a reopen racing the last release must not reuse it
+    closed: bool,
+    // its name was unlinked: open handles keep a private copy that is never committed
+    unlinked: bool,
 }
 
 #[derive(Default)]
@@ -276,15 +295,19 @@ fn send_chunks(remote: &dyn Remote, id: ReqId, chunks: &Chunks<'_>) -> Result<()
     match chunks {
         Chunks::None => Ok(()),
         Chunks::File { fd, len } => {
+            let mut block = vec![0u8; (*len).min(READ_BLOCK as u64) as usize];
             let mut off = 0u64;
             while off < *len {
-                let n = (*len - off).min(CHUNK_MAX as u64) as usize;
-                let mut buf = vec![0u8; n];
-                match pread_full(*fd, &mut buf, off) {
+                let n = (*len - off).min(block.len() as u64) as usize;
+                match pread_full(*fd, &mut block[..n], off) {
                     Ok(k) if k == n => {}
                     _ => return Err(RpcError::Wire(WireErr::Io)),
                 }
-                remote.send_chunk(id, off, off + n as u64 == *len, buf)?;
+                for (i, c) in block[..n].chunks(CHUNK_MAX).enumerate() {
+                    let at = off + (i * CHUNK_MAX) as u64;
+                    let end = at + c.len() as u64;
+                    remote.send_chunk(id, at, end == *len, c.to_vec())?;
+                }
                 off += n as u64;
             }
             Ok(())
@@ -352,6 +375,30 @@ impl Writer {
         }
     }
 
+    // no other handle can change the staging file, so it is hashed and sent in place, not copied
+    fn snap_staged(&self, st: &Staged, size: u64, sync: bool) -> Result<(TmpBlob, Version), i32> {
+        let waits = st.base.is_some() || sync || size >= BORROW_MIN;
+        if size > INLINE_MAX as u64 && st.handles <= 1 && waits && self.cache.room_for(size) {
+            let v = Version {
+                hash: hash_fd(st.fd.as_fd(), size)?,
+                size,
+            };
+            return Ok((self.cache.borrow(st.fd.clone(), v), v));
+        }
+        self.snap(st.fd.as_fd(), size)
+    }
+
+    // small content is read once and hashed in memory instead of being copied and read back
+    fn snap(&self, fd: BorrowedFd<'_>, size: u64) -> Result<(TmpBlob, Version), i32> {
+        if size <= INLINE_MAX as u64 {
+            let mut b = vec![0u8; size as usize];
+            if pread_full(fd, &mut b, 0).map_err(|e| io_errno(&e))? == b.len() {
+                return self.cache.tmp_from_bytes(&b);
+            }
+        }
+        self.cache.snapshot(fd)
+    }
+
     fn entry(&self, id: u32) -> Option<Arc<Mutex<Staged>>> {
         lock(&self.table).map.get(&id).cloned()
     }
@@ -373,12 +420,16 @@ impl Writer {
             && let Some(e) = self.entry(id)
         {
             let mut st = lock(&e);
-            if !st.refused {
+            if !st.refused && !st.closed {
                 if o.trunc {
                     rustix::fs::ftruncate(&*st.fd, 0).map_err(|e| e.raw_os_error())?;
                     st.synced = None;
                 }
-                st.handles += 1;
+                if st.deferred {
+                    st.deferred = false;
+                } else {
+                    st.handles += 1;
+                }
                 return Ok((id, st.fd.clone()));
             }
         }
@@ -409,6 +460,10 @@ impl Writer {
             pending: None,
             handles: 1,
             refused: false,
+            deferred: false,
+            closed: false,
+            unlinked: false,
+            unpublished: None,
         };
         let mut t = lock(&self.table);
         let id = loop {
@@ -437,6 +492,14 @@ impl Writer {
         self.flush_locked(&mut st, sync)
     }
 
+    // the content must reach the host before a following op on the path, but need not be durable: the
+    // ordered stream carries a new file's commit ahead of it without a wait or an fsync
+    pub fn flush_ordered(&self, id: u32) -> Result<Flushed, Refusal> {
+        let e = self.entry(id).ok_or(Refusal::err(libc::EBADF))?;
+        let mut st = lock(&e);
+        self.flush_locked(&mut st, false)
+    }
+
     // on the last handle: commits anything still dirty, settles a pipelined create, drops the staging
     pub fn release(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
         let e = self.entry(id)?;
@@ -453,6 +516,7 @@ impl Writer {
             c.ready(commit_deadline(size));
         }
         let mut st = lock(&e);
+        let mut settled = false;
         let out = if st.refused || st.handles > 0 {
             None
         } else {
@@ -465,9 +529,16 @@ impl Writer {
                 Err(e) if !e.refused && st.base.is_none() => self.give_up(&mut st, e),
                 r => r,
             };
+            settled = r.is_ok();
             (r != Ok(Flushed::Clean)).then_some(r)
         };
         let keep = st.handles > 0;
+        st.closed = !keep;
+        let unpublished = if keep { None } else { st.unpublished.take() };
+        // the last flush proved the staging file holds exactly the committed version
+        if let Some(v) = unpublished.filter(|v| settled && st.base == Some(*v)) {
+            let _ = self.cache.adopt(st.fd.as_fd(), v, Some(&st.path));
+        }
         drop(st);
         if !keep {
             lock(&self.table).map.remove(&id);
@@ -475,25 +546,88 @@ impl Writer {
         out
     }
 
+    // the handle count taken by open_for_write now stands for a truncate that no handle holds yet
+    pub fn defer(&self, id: u32) {
+        if let Some(e) = self.entry(id) {
+            lock(&e).deferred = true;
+        }
+    }
+
+    pub fn end_deferred(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
+        let e = self.entry(id)?;
+        {
+            let mut st = lock(&e);
+            if !st.deferred {
+                return None;
+            }
+            st.deferred = false;
+        }
+        self.release(id)
+    }
+
+    // the name is gone but handles stay open: they keep reading and writing the copy, which is then dropped
+    pub fn unlinked(&self, id: u32) {
+        if let Some(e) = self.entry(id) {
+            lock(&e).unlinked = true;
+        }
+    }
+
+    // the file was removed or replaced: a truncate nobody adopted is dropped unsent
+    pub fn cancel_deferred(&self, id: u32) {
+        let Some(e) = self.entry(id) else { return };
+        let mut st = lock(&e);
+        if !st.deferred {
+            return;
+        }
+        st.deferred = false;
+        st.handles = st.handles.saturating_sub(1);
+        if st.handles == 0 {
+            st.closed = true;
+            drop(st);
+            lock(&self.table).map.remove(&id);
+        }
+    }
+
+    pub fn staged_stat(&self, id: u32) -> Option<StatKey> {
+        let e = self.entry(id)?;
+        let st = e.try_lock().ok()?;
+        sys::stat_key(st.fd.as_fd()).ok()
+    }
+
     fn flush_locked(&self, st: &mut Staged, sync: bool) -> Result<Flushed, Refusal> {
         if st.refused {
             return Err(Refusal::err(REFUSED));
+        }
+        if st.unlinked {
+            st.pending = None;
+            return Ok(Flushed::Clean);
         }
         let settled = self.settle(st)?;
         let stat = sys::stat_key(st.fd.as_fd()).map_err(|e| Refusal::err(io_errno(&e)))?;
         if trusted(st.synced.as_ref(), &stat) {
             return Ok(settled.unwrap_or(Flushed::Clean));
         }
-        let (tmp, ver) = self.cache.snapshot(st.fd.as_fd()).map_err(Refusal::err)?;
+        let (tmp, ver) = self
+            .snap_staged(st, stat.size, sync)
+            .map_err(Refusal::err)?;
         if st.base == Some(ver) {
             st.synced = Some(mark(stat));
             return Ok(settled.unwrap_or(Flushed::Clean));
         }
-        if st.base.is_none() && !sync {
+        if st.base.is_none() && !sync && !tmp.is_borrowed() {
             self.send_async(st, tmp, ver, mark(stat))?;
             return Ok(Flushed::Sent(ver));
         }
-        self.commit(st, tmp, ver, mark(stat), sync, None)
+        let borrowed = tmp.is_borrowed();
+        match self.commit(st, tmp, ver, mark(stat), sync, None) {
+            // the staging file changed while it was sent: commit a stable copy instead
+            Err(e) if borrowed && !e.refused && e.errno == libc::EINVAL => {
+                let stat = sys::stat_key(st.fd.as_fd()).map_err(|e| Refusal::err(io_errno(&e)))?;
+                let (tmp, ver) = self.cache.snapshot(st.fd.as_fd()).map_err(Refusal::err)?;
+                self.commit(st, tmp, ver, mark(stat), sync, None)
+            }
+            r => r,
+        }
     }
 
     // a new file's first commit does not wait; the ordered stream lets a following rename rely on it
@@ -549,6 +683,10 @@ impl Writer {
                 .commit(st, p.tmp, p.ver, p.stat, false, Some(reply))
                 .map(Some),
             Ok(_) => Err(Refusal::err(libc::EIO)),
+            // nothing landed, so it is sent again with the backoff every other busy commit gets
+            Err(RpcError::Wire(WireErr::Busy)) => {
+                self.commit(st, p.tmp, p.ver, p.stat, false, None).map(Some)
+            }
             Err(RpcError::Wire(w)) => Err(Refusal::err(wire_errno(w))),
             // the link dropped under the pipelined create: replay it, the host answers Done if it already landed
             Err(_) => match self.commit(st, p.tmp, p.ver, p.stat, false, None) {
@@ -615,6 +753,7 @@ impl Writer {
         let _busy = self.cache.gate().enter();
         let (mut gen_seen, mut remote) = self.remote.get(deadline)?;
         let mut retried = false;
+        let mut backoff = BUSY_MIN;
         loop {
             let op = mk(body.clone()).ok_or(libc::EINVAL)?;
             // replays are safe: the host answers Done when the current content already equals `new`
@@ -622,6 +761,11 @@ impl Writer {
                 Err(RpcError::Closed) if !retried => {
                     retried = true;
                     (gen_seen, remote) = self.remote.newer(gen_seen, deadline)?;
+                }
+                // busy means the host changed nothing: it caught a host write mid-flight or was out of slots
+                Err(RpcError::Wire(WireErr::Busy)) if Instant::now() + backoff < deadline => {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(BUSY_MAX);
                 }
                 r => return r.map_err(|e| rpc_errno(&e)),
             }
@@ -691,6 +835,12 @@ impl Writer {
             };
             match reply {
                 Reply::Done { meta } => {
+                    // sent in place, so it is stamped once sent, as a copy is once copied
+                    if tmp.is_borrowed() && sys::stat_key(st.fd.as_fd()).is_ok_and(|k| k == stat.0)
+                    {
+                        stat = mark(stat.0);
+                    }
+                    st.unpublished = tmp.is_borrowed().then_some(ver);
                     let _ = self.cache.publish(tmp, Some(&st.path));
                     st.base = Some(ver);
                     st.base_ref = self.cache.get(&ver.hash);
@@ -714,8 +864,7 @@ impl Writer {
                     ) {
                         Next::Merged(m, theirs) => {
                             overwrite(st.fd.as_fd(), &m).map_err(Refusal::err)?;
-                            (tmp, ver) =
-                                self.cache.snapshot(st.fd.as_fd()).map_err(Refusal::err)?;
+                            (tmp, ver) = self.cache.tmp_from_bytes(&m).map_err(Refusal::err)?;
                             stat = mark(
                                 sys::stat_key(st.fd.as_fd())
                                     .map_err(|e| Refusal::err(io_errno(&e)))?,
@@ -1026,12 +1175,15 @@ impl Writer {
         // content the host does not have yet travels inside the rename itself
         let mut content = None;
         if !clean || host_ver.is_none() {
-            let (t, v) = self.cache.snapshot(st.fd.as_fd()).map_err(Refusal::err)?;
+            let (t, v) = self
+                .snap_staged(st, stat.size, true)
+                .map_err(Refusal::err)?;
             if Some(v) != host_ver {
                 content = Some((t, v));
             }
         }
         let mut sent = content.as_ref().map(|c| c.1);
+        let mut in_place = content.as_ref().is_some_and(|c| c.0.is_borrowed());
         let from_expect = host_ver.map_or(Expect::Absent, Expect::Is);
         let mut out = self.cas_write(
             r.to,
@@ -1048,6 +1200,7 @@ impl Writer {
             let (t, v) = self.cache.snapshot(st.fd.as_fd()).map_err(Refusal::err)?;
             sent = Some(v);
             host_ver = None;
+            in_place = false;
             out = self.cas_write(
                 r.to,
                 Target::Rename {
@@ -1066,6 +1219,11 @@ impl Writer {
                     overwrite(st.fd.as_fd(), m).map_err(Refusal::err)?;
                 }
                 st.base = w.ver.or(sent).or(host_ver);
+                st.unpublished = match (sent, &w.merged) {
+                    (None, _) => st.unpublished,
+                    (Some(_), None) if in_place => w.ver,
+                    _ => None,
+                };
                 st.base_ref = st.base.and_then(|v| self.cache.get(&v.hash));
                 st.synced = if w.merged.is_some() {
                     None
@@ -1465,6 +1623,199 @@ mod tests {
         assert!(e.refused && e.errno == libc::ECANCELED);
         assert_eq!(lock(&r.script.ops).len(), MERGE_TRIES as usize + 1);
         assert_eq!(files(&r.d.0.join("tmp")), 0);
+    }
+
+    // a rename that took a pipelined create's answer must not leave the last release waiting out its deadline
+    #[test]
+    fn ready_sees_an_answer_already_taken() {
+        let c = Cell::default();
+        c.put(Err(RpcError::Closed));
+        assert!(c.wait(Instant::now()).is_some());
+        let t = Instant::now();
+        c.ready(t + Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    // busy means the host caught its own writer mid-flight and changed nothing: the save goes again
+    #[test]
+    fn busy_commit_is_sent_again_not_surfaced() {
+        let r = rig("busy");
+        let p = RelPath::new("busy.txt").unwrap();
+        let (base, ours) = (b"one\ntwo\n", b"ONE\ntwo\n");
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let (vb, vo) = (ver(base), ver(ours));
+        for _ in 0..2 {
+            lock(&r.script.replies).push_back(Err(RpcError::Wire(WireErr::Busy)));
+        }
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vo) }));
+        assert_eq!(
+            r.w.flush(id, false),
+            Ok(Flushed::Committed {
+                meta: meta(vo),
+                merged: false
+            })
+        );
+        let ops = lock(&r.script.ops);
+        assert_eq!(ops.len(), 3);
+        for op in ops.iter() {
+            match op {
+                Op::Commit { base: b, new, .. } => assert_eq!((*b, *new), (Expect::Is(vb), vo)),
+                o => panic!("unexpected {o:?}"),
+            }
+        }
+    }
+
+    // the pipelined create of a new file is replayed the same way once its busy answer arrives
+    #[test]
+    fn busy_pipelined_create_is_sent_again() {
+        let r = rig("busynew");
+        let p = RelPath::new("new.txt").unwrap();
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: None,
+            })
+            .unwrap();
+        let body = b"fresh\n";
+        overwrite(fd.as_fd(), body).unwrap();
+        let v = ver(body);
+        lock(&r.script.replies).push_back(Err(RpcError::Wire(WireErr::Busy)));
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        assert_eq!(
+            r.w.release(id),
+            Some(Ok(Flushed::Committed {
+                meta: meta(v),
+                merged: false
+            }))
+        );
+        let ops = lock(&r.script.ops);
+        assert_eq!(ops.len(), 2);
+        assert!(ops.iter().all(|o| matches!(o, Op::Commit {
+            base: Expect::Absent,
+            new,
+            ..
+        } if *new == v)));
+    }
+
+    fn held_truncate(r: &Rig, p: &RelPath, base: &[u8]) -> u32 {
+        let vb = ver(base);
+        r.cache.insert_bytes(&vb.hash, base, Some(p)).unwrap();
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: p,
+                base: Some(vb),
+                perm: 0o644,
+                trunc: true,
+                staging: None,
+            })
+            .unwrap();
+        r.w.defer(id);
+        assert!(staged(&fd).is_empty());
+        id
+    }
+
+    #[test]
+    fn held_truncate_folds_into_the_next_write() {
+        let r = rig("hold");
+        let p = RelPath::new("out.txt").unwrap();
+        let base = b"old\ncontent\n";
+        let id = held_truncate(&r, &p, base);
+        let (again, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: Some(ver(base)),
+                perm: 0o644,
+                trunc: false,
+                staging: Some(id),
+            })
+            .unwrap();
+        assert_eq!(again, id);
+        overwrite(fd.as_fd(), b"new\n").unwrap();
+        let vn = ver(b"new\n");
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vn) }));
+        assert_eq!(
+            r.w.flush(id, false),
+            Ok(Flushed::Committed {
+                meta: meta(vn),
+                merged: false
+            })
+        );
+        assert_eq!(r.w.end_deferred(id), None);
+        assert_eq!(r.w.release(id), None);
+        assert!(r.w.staging_fd(id).is_none());
+        let ops = lock(&r.script.ops);
+        assert_eq!(ops.len(), 1, "the truncate and the write are one commit");
+        match &ops[0] {
+            Op::Commit { base: b, new, .. } => assert_eq!((*b, *new), (Expect::Is(ver(base)), vn)),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn held_truncate_alone_commits_empty_and_cancel_sends_nothing() {
+        let r = rig("hold-alone");
+        let p = RelPath::new("log.txt").unwrap();
+        let id = held_truncate(&r, &p, b"some lines\n");
+        let ve = ver(b"");
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(ve) }));
+        assert_eq!(
+            r.w.end_deferred(id),
+            Some(Ok(Flushed::Committed {
+                meta: meta(ve),
+                merged: false
+            }))
+        );
+        assert!(r.w.staging_fd(id).is_none());
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { new, body, .. }] => assert_eq!((*new, body), (ve, &Body::Empty)),
+            o => panic!("unexpected {o:?}"),
+        }
+
+        let q = RelPath::new("gone.txt").unwrap();
+        let id = held_truncate(&r, &q, b"x\n");
+        r.w.cancel_deferred(id);
+        assert!(r.w.staging_fd(id).is_none());
+        assert_eq!(r.w.end_deferred(id), None);
+        assert_eq!(lock(&r.script.ops).len(), 1);
+    }
+
+    #[test]
+    fn large_commit_reads_the_staging_file_in_place() {
+        let r = rig("in-place");
+        let p = RelPath::new("big.bin").unwrap();
+        let base: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let ours: Vec<u8> = (0..300_000u32).map(|i| (i % 241) as u8).collect();
+        let (id, fd) = open_edit(&r, &p, &base, &ours);
+        let vo = ver(&ours);
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vo) }));
+        assert_eq!(
+            r.w.flush(id, false),
+            Ok(Flushed::Committed {
+                meta: meta(vo),
+                merged: false
+            })
+        );
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { new, body, .. }] => {
+                assert_eq!((*new, body), (vo, &Body::Stream { len: vo.size }))
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert_eq!(files(&r.d.0.join("tmp")), 0, "no snapshot copy was made");
+        assert!(!r.cache.contains(&vo.hash));
+        assert_eq!(r.w.release(id), None);
+        assert!(
+            r.cache.contains(&vo.hash),
+            "the released staging file became the blob"
+        );
+        let b = r.cache.get(&vo.hash).unwrap();
+        assert_eq!(b.read_all(1 << 20).unwrap(), ours);
+        assert_eq!(staged(&fd), ours);
+        assert_eq!(lock(&r.script.ops).len(), 1);
     }
 
     #[test]

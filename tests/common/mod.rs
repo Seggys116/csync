@@ -52,6 +52,10 @@ impl TempDir {
         let base = std::env::var_os("CSYNC_TEST_TMP")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        Self::new_in(&base, tag)
+    }
+
+    pub fn new_in(base: &Path, tag: &str) -> Self {
         let base = fs::canonicalize(base).expect("temp dir");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -378,8 +382,11 @@ pub struct Guest {
 
 impl World {
     pub fn new(tag: &str, populate: impl FnOnce(&Path)) -> Self {
+        Self::with_tmp(TempDir::new(tag), populate)
+    }
+
+    pub fn with_tmp(tmp: TempDir, populate: impl FnOnce(&Path)) -> Self {
         let bin = bin().expect("checked by the caller");
-        let tmp = TempDir::new(tag);
         let proj = tmp.0.join("proj");
         let host_home = tmp.0.join("host-home");
         fs::create_dir_all(&proj).unwrap();

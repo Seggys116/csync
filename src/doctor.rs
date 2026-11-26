@@ -74,9 +74,13 @@ pub fn run(dirs: &Dirs, o: &Opts) -> Vec<Check> {
         out.push(cap_sys_admin(kernel));
         out.push(fuse_conf(o.allow_other));
     }
-    out.push(mount_point(o.mount.as_deref()));
     if cfg!(target_os = "linux") {
+        out.push(mount_point(o.mount.as_deref()));
         out.push(stale_mounts());
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(cwd) = std::env::current_dir() {
+        out.push(project_volume(&cwd));
     }
     out.push(cache_space(&dirs.cache));
     #[cfg(target_os = "linux")]
@@ -365,6 +369,33 @@ pub fn mount_point_problem(p: &Path) -> Option<(Level, String, Option<String>)> 
             )),
             Err(e) => Some((Level::Fail, format!("cannot list: {e}"), None)),
         },
+    }
+}
+
+// the volume csync host would serve from this directory
+#[cfg(target_os = "macos")]
+fn project_volume(dir: &Path) -> Check {
+    const N: &str = "project volume";
+    match crate::sys::volume_of(dir) {
+        Err(e) => check(N, Level::Warn, format!("{}: {e}", dir.display()), None),
+        Ok((ty, false, _)) => check(
+            N,
+            Level::Warn,
+            format!(
+                "{} is on a network volume ({ty}): its changes are not reported to csync",
+                dir.display()
+            ),
+            Some("keep the project on a local disk and run csync host there".into()),
+        ),
+        Ok((ty, true, true)) => check(N, Level::Pass, format!("{ty}, case-sensitive"), None),
+        Ok((ty, true, false)) => check(
+            N,
+            Level::Info,
+            format!(
+                "{ty}, case-insensitive: guests cannot create names that differ only by case or unicode form"
+            ),
+            None,
+        ),
     }
 }
 

@@ -14,7 +14,7 @@ const VREG: u32 = 1;
 const VDIR: u32 = 2;
 const VLNK: u32 = 5;
 const BUF_WORDS: usize = 16 << 10;
-const FIXED: usize = 96;
+const FIXED: usize = 92;
 
 thread_local! {
     static BUF: RefCell<Box<[u64]>> = RefCell::new(vec![0u64; BUF_WORDS].into_boxed_slice());
@@ -47,7 +47,7 @@ pub fn read_dir_plus(dir: BorrowedFd<'_>, out: &mut Vec<DirEntryPlus>) -> io::Re
             | libc::ATTR_CMN_FILEID
             | ATTR_CMN_ERROR,
         volattr: 0,
-        dirattr: 0,
+        dirattr: libc::ATTR_DIR_MOUNTSTATUS,
         fileattr: libc::ATTR_FILE_DATALENGTH,
         forkattr: 0,
     };
@@ -101,6 +101,46 @@ pub fn read_dir_plus(dir: BorrowedFd<'_>, out: &mut Vec<DirEntryPlus>) -> io::Re
     })
 }
 
+// the stored name of the entry `name` resolves to, which differs in case or normalisation on folding volumes
+pub fn stored_name_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<Vec<u8>> {
+    let c = std::ffi::CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let mut al = libc::attrlist {
+        bitmapcount: libc::ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: libc::ATTR_CMN_NAME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = [0u64; 136];
+    let cap = std::mem::size_of_val(&buf);
+    // SAFETY: al is a valid attrlist, buf is cap writable bytes, c is nul terminated and dir is open.
+    let r = unsafe {
+        libc::getattrlistat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            (&raw mut al).cast(),
+            buf.as_mut_ptr().cast(),
+            cap,
+            libc::FSOPT_NOFOLLOW as libc::c_ulong,
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the u64 buffer is initialised and viewing it as bytes is always valid.
+    let b: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), cap) };
+    let len = (rd_u32(b, 0) as usize).min(cap);
+    let off = 4i64 + i64::from(rd_u32(b, 4) as i32);
+    let n = rd_u32(b, 8) as usize;
+    let raw = usize::try_from(off)
+        .ok()
+        .and_then(|o| b.get(o..o.checked_add(n)?.min(len)))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad attr_cmn_name"))?;
+    Ok(raw.split(|&x| x == 0).next().unwrap_or_default().to_vec())
+}
+
 // fixed layout under fsopt_pack_inval_attrs: every requested attribute is present, in bit order,
 // except that the kernel packs attr_cmn_error directly after the returned-attributes set
 fn parse(e: &[u8]) -> Option<DirEntryPlus> {
@@ -120,7 +160,19 @@ fn parse(e: &[u8]) -> Option<DirEntryPlus> {
     let ctime_ns = ts_ns(rd_i64(e, 60), rd_i64(e, 68));
     let perm = rd_u32(e, 76) & 0o7777;
     let ino = rd_i64(e, 80) as u64;
-    let datalen = rd_i64(e, 88).max(0) as u64;
+    // directory and file attributes are packed only for the object type they apply to
+    let mut at = 88;
+    let mut mounted = false;
+    if rd_u32(e, 12) & libc::ATTR_DIR_MOUNTSTATUS != 0 {
+        mounted = rd_u32(e, at) & libc::DIR_MNTSTATUS_MNTPOINT != 0;
+        at += 4;
+    }
+    let datalen = if rd_u32(e, 16) & libc::ATTR_FILE_DATALENGTH != 0 {
+        e.get(at..at + 8)?;
+        rd_i64(e, at).max(0) as u64
+    } else {
+        0
+    };
     let ftype = match objtype {
         VREG => S_IFREG,
         VDIR => S_IFDIR,
@@ -128,9 +180,10 @@ fn parse(e: &[u8]) -> Option<DirEntryPlus> {
         _ => 0,
     };
     let mode = ftype | perm;
+    // another volume mounted here: listed by name only, so nothing walks into it
     Some(DirEntryPlus {
         name,
-        kind: kind_of_mode(mode),
+        kind: kind_of_mode(mode).filter(|_| !mounted),
         stat: StatKey {
             dev: dev as u64,
             ino,
@@ -151,6 +204,64 @@ mod tests {
         fs,
         os::unix::fs::{MetadataExt, symlink},
     };
+
+    #[test]
+    fn mount_points_are_listed_without_a_kind() {
+        let Ok(fd) = rustix::fs::open(
+            "/System/Volumes",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        ) else {
+            return;
+        };
+        let mut got = Vec::new();
+        read_dir_plus(std::os::fd::AsFd::as_fd(&fd), &mut got).unwrap();
+        let data = got.iter().find(|e| e.name.as_str() == "Data");
+        assert!(data.is_some_and(|e| e.kind.is_none()), "{data:?}");
+    }
+
+    #[test]
+    fn dataless_files_are_not_materialised() {
+        unsafe extern "C" {
+            fn getiopolicy_np(iotype: libc::c_int, scope: libc::c_int) -> libc::c_int;
+        }
+        crate::sys::keep_dataless();
+        // SAFETY: plain int arguments; the call only reads this process's policy.
+        assert_eq!(unsafe { getiopolicy_np(3, 0) }, 1);
+    }
+
+    #[test]
+    fn stored_names_follow_case_and_normalisation_renames() {
+        let root = std::env::temp_dir().join(format!("csync-sys-spell-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("cafe\u{301}.txt"), b"nfd").unwrap();
+        fs::write(root.join("foo.txt"), b"x").unwrap();
+        fs::hard_link(root.join("foo.txt"), root.join("link.txt")).unwrap();
+        let fd = rustix::fs::open(
+            &root,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let d = std::os::fd::AsFd::as_fd(&fd);
+        let (case, norm) = crate::sys::probe_fold(d).unwrap();
+        assert!(crate::sys::spelled_at(d, "foo.txt").unwrap());
+        assert!(crate::sys::spelled_at(d, "link.txt").unwrap());
+        assert!(crate::sys::spelled_at(d, "cafe\u{301}.txt").unwrap());
+        assert!(stored_name_at(d, "missing").is_err());
+        if case {
+            fs::rename(root.join("foo.txt"), root.join("FOO.txt")).unwrap();
+            assert_eq!(stored_name_at(d, "foo.txt").unwrap(), b"FOO.txt");
+            assert!(!crate::sys::spelled_at(d, "foo.txt").unwrap());
+            assert!(crate::sys::spelled_at(d, "FOO.txt").unwrap());
+            assert!(crate::sys::spelled_at(d, "link.txt").unwrap());
+        }
+        if norm {
+            assert!(!crate::sys::spelled_at(d, "caf\u{e9}.txt").unwrap());
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn read_dir_plus_agrees_with_std() {

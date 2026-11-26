@@ -359,8 +359,8 @@ fn start_ctl(
     bus: &Arc<UiBus>,
     forget: ForgetFn,
 ) -> io::Result<ctl::CtlServer> {
-    let path = dirs.ctl_socket(role, id)?;
-    ctl::serve(&path, ctl_handler(bus.clone(), forget))
+    let paths = dirs.ctl_socket_candidates(role, id)?;
+    ctl::serve_first(&paths, ctl_handler(bus.clone(), forget))
 }
 
 // the host owns its trust store, so forgetting goes through its loop, which also drops the session

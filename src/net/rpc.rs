@@ -1,5 +1,5 @@
 use crate::net::conn::{In, Link};
-use crate::proto::{Body, FILE_MAX, INFLIGHT_MAX, Msg, Op, Reply, ReqId, WireErr};
+use crate::proto::{Body, Expect, FILE_MAX, INFLIGHT_MAX, Msg, Op, RelPath, Reply, ReqId, WireErr};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use rustc_hash::FxHashMap;
 use std::{
@@ -48,6 +48,24 @@ struct Pending {
     last: bool,
     next_off: Option<u64>,
     cancelled: bool,
+    // a directory move, answered in order with the pushes around it
+    moves: Option<Box<(RelPath, RelPath)>>,
+    queued: bool,
+}
+
+// the guest moves a directory in its own tree only on the reply, so the reply keeps its place in the push
+// stream: pushes before it name the old path, pushes after it the new one
+fn ordered(op: &Op) -> Option<Box<(RelPath, RelPath)>> {
+    match op {
+        Op::Rename {
+            from,
+            to,
+            from_expect: Expect::Dir,
+            body: None,
+            ..
+        } => Some(Box::new((from.clone(), to.clone()))),
+        _ => None,
+    }
 }
 
 impl Pending {
@@ -133,6 +151,7 @@ impl Rpc {
         waiter: Waiter,
         sink: Option<Box<dyn ChunkSink>>,
         deadline: Option<Instant>,
+        moves: Option<Box<(RelPath, RelPath)>>,
     ) -> Result<ReqId, RpcError> {
         let mut t = self.lock();
         loop {
@@ -175,6 +194,8 @@ impl Rpc {
                 last: false,
                 next_off: None,
                 cancelled: false,
+                moves,
+                queued: false,
             },
         );
         Ok(id)
@@ -187,7 +208,7 @@ impl Rpc {
         sink: Option<Box<dyn ChunkSink>>,
         deadline: Option<Instant>,
     ) -> Result<ReqId, RpcError> {
-        let id = self.register(waiter, sink, deadline)?;
+        let id = self.register(waiter, sink, deadline, ordered(&op))?;
         if self.link.send(Msg::Req { id, op }).is_err() {
             let mut t = self.lock();
             // absent means fail_all already fired the waiter with Closed
@@ -274,6 +295,46 @@ impl Rpc {
         if let Some((w, r)) = a.fire {
             w.fire(r);
         }
+    }
+
+    // the reader's entry point: an ordered reply is handed back for the inbox, the rest are routed here
+    pub(crate) fn on_resp(
+        &self,
+        id: ReqId,
+        res: Result<Reply, WireErr>,
+    ) -> Option<Result<Reply, WireErr>> {
+        {
+            let mut t = self.lock();
+            if let Some(p) = t.map.get_mut(&id)
+                && p.moves.is_some()
+                && !p.resp
+                && !p.queued
+            {
+                p.queued = true;
+                return Some(res);
+            }
+        }
+        self.route_resp(id, res);
+        None
+    }
+
+    // routes a reply taken from the inbox; returns the move it confirmed to a caller still waiting
+    pub fn route_ordered(
+        &self,
+        id: ReqId,
+        res: Result<Reply, WireErr>,
+    ) -> Option<(RelPath, RelPath)> {
+        let moved = if matches!(res, Ok(Reply::Done { .. })) {
+            let t = self.lock();
+            t.map
+                .get(&id)
+                .filter(|p| p.waiter.is_some() && !p.cancelled)
+                .and_then(|p| p.moves.as_deref().cloned())
+        } else {
+            None
+        };
+        self.route_resp(id, res);
+        moved
     }
 
     pub(crate) fn route_resp(&self, id: ReqId, res: Result<Reply, WireErr>) {
@@ -383,10 +444,16 @@ impl Rpc {
         let waiters: Vec<Waiter> = {
             let mut t = self.lock();
             t.closed = true;
-            t.map
-                .drain()
-                .filter_map(|(_, mut p)| p.waiter.take())
-                .collect()
+            // a reply already in the inbox is still delivered from there, in order
+            let mut out = Vec::new();
+            t.map.retain(|_, p| {
+                if p.queued {
+                    return true;
+                }
+                out.extend(p.waiter.take());
+                false
+            });
+            out
         };
         self.slot.notify_all();
         for w in waiters {
@@ -567,5 +634,74 @@ mod tests {
             rpc.submit(op(), Box::new(|_: Result<Reply, RpcError>| {})),
             Err(RpcError::Closed)
         ));
+    }
+
+    #[test]
+    fn a_dir_move_reply_keeps_its_place_among_the_pushes() {
+        let (g, h) = test_pair();
+        let rpc = Rpc::new(g.link.clone());
+        let mv = Op::Rename {
+            from: RelPath::new("d1").unwrap(),
+            to: RelPath::new("m2").unwrap(),
+            from_expect: Expect::Dir,
+            to_expect: Expect::Absent,
+            body: None,
+        };
+        let (tx, rx) = bounded(4);
+        let (t1, t2) = (tx.clone(), tx);
+        let a = rpc
+            .submit(
+                mv,
+                Box::new(move |r: Result<Reply, RpcError>| t1.send(("mv", r.is_ok())).unwrap()),
+            )
+            .unwrap();
+        let b = rpc
+            .submit(
+                op(),
+                Box::new(move |r: Result<Reply, RpcError>| t2.send(("rm", r.is_ok())).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(next_req(&h), a);
+        assert_eq!(next_req(&h), b);
+        let push = Msg::Push(crate::proto::Push::Changes {
+            seq: 5,
+            changes: Vec::new(),
+        });
+        for m in [
+            Msg::Resp {
+                id: a,
+                res: Ok(done_meta()),
+            },
+            push,
+            Msg::Resp {
+                id: b,
+                res: Ok(done_meta()),
+            },
+        ] {
+            h.link.send(m).unwrap();
+        }
+        // an ordinary reply is routed at once, the move's waits in the inbox ahead of the push
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(("rm", true)));
+        let (id, res) = match g.inbox.recv_timeout(Duration::from_secs(5)).unwrap() {
+            In::Msg(Msg::Resp { id, res }) => (id, res),
+            _ => panic!("expected the move's reply first"),
+        };
+        assert!(matches!(
+            g.inbox.recv_timeout(Duration::from_secs(5)),
+            Ok(In::Msg(Msg::Push(_)))
+        ));
+        assert!(rx.try_recv().is_err());
+        // a link lost before the inbox is drained still delivers the reply that arrived
+        h.link.close(crate::net::conn::CloseReason::Local);
+        while !matches!(
+            g.inbox.recv_timeout(Duration::from_secs(5)).unwrap(),
+            In::Closed(_)
+        ) {}
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            rpc.route_ordered(id, res),
+            Some((RelPath::new("d1").unwrap(), RelPath::new("m2").unwrap()))
+        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(("mv", true)));
     }
 }

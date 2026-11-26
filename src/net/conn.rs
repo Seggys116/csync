@@ -7,14 +7,14 @@ use crate::proto::{
     frame::{Decoder, Encoder, Frame, FrameError, NOISE_MAX},
     hs::{HsHello, HsMode, Role},
 };
-use crossbeam_channel::{Receiver, Sender, bounded, select_biased};
+use crossbeam_channel::{Receiver, Select, Sender, TryRecvError, bounded};
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
 use std::{
     collections::{HashMap, VecDeque},
-    io::{self, BufReader, Read, Write},
+    io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -26,7 +26,7 @@ const BULK_CAP: usize = 512;
 const INBOX_CAP: usize = 4_096;
 const BATCH_BYTES: usize = 1 << 20;
 const SOCK_BUF: usize = 4 << 20;
-const RD_BUF: usize = 256 << 10;
+const RD_BUF: usize = 1 << 20;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const HS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -100,6 +100,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn try_lock<T>(m: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match m.try_lock() {
+        Ok(g) => Some(g),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 struct Shared {
     closed: AtomicBool,
     reason: Mutex<Option<CloseReason>>,
@@ -148,6 +156,43 @@ struct LinkInner {
     sig: Signal,
     bulk: Sender<Out>,
     peer: PeerKey,
+    tx: Arc<Mutex<Tx>>,
+    kick: Sender<()>,
+}
+
+impl LinkInner {
+    // a control message with nothing queued ahead of it is written by the caller, saving the writer thread's wakeup
+    fn direct(&self, mut g: MutexGuard<'_, Tx>, o: Out) -> Result<(), Closed> {
+        let t = &mut *g;
+        t.begin();
+        if let Err(e) = t.put(o, &self.sig.shared).and_then(|()| t.seal(true)) {
+            let _ = t.sock.shutdown(Shutdown::Both);
+            drop(g);
+            self.sig.close(CloseReason::Protocol(e), false);
+            return Err(Closed);
+        }
+        let mut done = 0;
+        while done < t.out.len() {
+            match SockRef::from(&t.sock).send_with_flags(&t.out[done..], SEND_NOWAIT) {
+                Ok(0) => break,
+                Ok(n) => done += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    let _ = t.sock.shutdown(Shutdown::Both);
+                    drop(g);
+                    self.sig.close(CloseReason::Io(e.kind()), false);
+                    return Err(Closed);
+                }
+            }
+        }
+        if done < t.out.len() {
+            t.spill.extend_from_slice(&t.out[done..]);
+            let _ = self.kick.try_send(());
+        }
+        t.trim();
+        Ok(())
+    }
 }
 
 impl Drop for LinkInner {
@@ -184,6 +229,17 @@ impl Link {
     pub fn send_out(&self, o: Out) -> Result<(), Closed> {
         if self.is_closed() {
             return Err(Closed);
+        }
+        let inner = &*self.inner;
+        // the writer only dequeues while holding tx, so an empty control queue under tx means nothing is ahead;
+        // pushes stay queued since they are sent under the host's tree lock
+        if matches!(&o, Out::Msg(Prio::Ctl, m) if !matches!(m, Msg::Push(_)))
+            && inner.sig.ctl.is_empty()
+            && let Some(g) = try_lock(&inner.tx)
+            && g.spill.is_empty()
+            && inner.sig.ctl.is_empty()
+        {
+            return inner.direct(g, o);
         }
         let q = match &o {
             Out::Msg(Prio::Ctl, _) => &self.inner.sig.ctl,
@@ -291,12 +347,14 @@ fn start(stream: TcpStream, est: Established, hello: HsHello) -> io::Result<Sess
         stop: stop_tx,
         shared: shared.clone(),
     };
+    let (kick_tx, kick_rx) = bounded(1);
+    let tx = Arc::new(Mutex::new(Tx::new(stream.try_clone()?, sealer)));
     let w = Writer {
-        sock: stream.try_clone()?,
+        tx: tx.clone(),
         ctl: ctl_rx,
         bulk: bulk_rx,
         stop: stop_rx,
-        sealer,
+        kick: kick_rx,
         shared,
     };
     thread::Builder::new()
@@ -320,6 +378,8 @@ fn start(stream: TcpStream, est: Established, hello: HsHello) -> io::Result<Sess
             sig,
             bulk: bulk_tx,
             peer,
+            tx,
+            kick: kick_tx,
         }),
     };
     Ok(Session {
@@ -353,109 +413,181 @@ fn seal_with(
     Ok(())
 }
 
-struct Writer {
+// the sending half; whoever holds it frames, seals and writes, so frames leave in the order they were taken
+struct Tx {
     sock: TcpStream,
+    sealer: Sealer,
+    enc: Encoder,
+    out: Vec<u8>,
+    // a batch is framed into plain first and sealed in one go, so a large one is sealed on all cores
+    plain: Vec<u8>,
+    spans: Vec<(usize, usize)>,
+    // what a caller could not hand to a full socket; the writer thread sends it before anything else
+    spill: Vec<u8>,
+}
+
+impl Tx {
+    fn new(sock: TcpStream, sealer: Sealer) -> Self {
+        Self {
+            sock,
+            sealer,
+            enc: Encoder::default(),
+            out: Vec::with_capacity(BATCH_BYTES + NOISE_MAX + 2),
+            plain: Vec::with_capacity(BATCH_BYTES + NOISE_MAX),
+            spans: Vec::new(),
+            spill: Vec::new(),
+        }
+    }
+
+    fn begin(&mut self) {
+        self.out.clear();
+        self.plain.clear();
+        self.spans.clear();
+    }
+
+    fn put(&mut self, o: Out, shared: &Shared) -> Result<(), &'static str> {
+        let (plain, spans) = (&mut self.plain, &mut self.spans);
+        let mut emit = |seg: &[u8]| {
+            spans.push((plain.len(), seg.len()));
+            plain.extend_from_slice(seg);
+        };
+        match o {
+            // rekeys are only emitted by seal, in step with sealer.rekey()
+            Out::Msg(_, Msg::Rekey) => Ok(()),
+            Out::Msg(_, m) => {
+                if matches!(m, Msg::Resp { .. }) {
+                    // saturating decrement; try_update is past the msrv and fetch_update is deprecated
+                    let inflight = &shared.peer_inflight;
+                    let mut cur = inflight.load(Ordering::Acquire);
+                    while let Some(next) = cur.checked_sub(1) {
+                        match inflight.compare_exchange_weak(
+                            cur,
+                            next,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(seen) => cur = seen,
+                        }
+                    }
+                }
+                self.enc
+                    .msg(&m, &mut emit)
+                    .map_err(|_| "frame encode failed")
+            }
+            Out::Chunk {
+                id,
+                off,
+                last,
+                data,
+            } => {
+                if data.len() > CHUNK_MAX {
+                    return Err("chunk too large");
+                }
+                self.enc
+                    .chunk(id, off, last, &data, &mut emit)
+                    .map_err(|_| "frame encode failed")
+            }
+        }
+    }
+
+    fn seal(&mut self, rekey: bool) -> Result<(), &'static str> {
+        self.sealer
+            .seal_many(&self.plain, &self.spans, &mut self.out)
+            .map_err(|_| "seal failed")?;
+        if rekey && self.sealer.rekey_due() {
+            let enc = &mut self.enc;
+            seal_with(&mut self.sealer, &mut self.out, |e| enc.msg(&Msg::Rekey, e))?;
+            self.sealer.rekey();
+        }
+        Ok(())
+    }
+
+    fn trim(&mut self) {
+        if self.out.capacity() > 2 * (BATCH_BYTES + NOISE_MAX) {
+            self.out = Vec::with_capacity(BATCH_BYTES + NOISE_MAX + 2);
+        }
+        if self.plain.capacity() > 2 * (BATCH_BYTES + NOISE_MAX) {
+            self.plain = Vec::with_capacity(BATCH_BYTES + NOISE_MAX);
+        }
+        if self.spill.capacity() > 2 * (BATCH_BYTES + NOISE_MAX) && self.spill.is_empty() {
+            self.spill = Vec::new();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const SEND_NOWAIT: i32 = libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
+#[cfg(not(target_os = "linux"))]
+const SEND_NOWAIT: i32 = libc::MSG_DONTWAIT;
+
+struct Writer {
+    tx: Arc<Mutex<Tx>>,
     ctl: Receiver<Out>,
     bulk: Receiver<Out>,
     stop: Receiver<()>,
-    sealer: Sealer,
+    kick: Receiver<()>,
     shared: Arc<Shared>,
 }
 
 impl Writer {
     fn run(self) {
         let Writer {
-            mut sock,
+            tx,
             ctl,
             bulk,
             stop,
-            mut sealer,
+            kick,
             shared,
         } = self;
-        let mut enc = Encoder::default();
-        let mut out: Vec<u8> = Vec::with_capacity(BATCH_BYTES + NOISE_MAX + 2);
-        let put = |o: Out,
-                   enc: &mut Encoder,
-                   out: &mut Vec<u8>,
-                   sealer: &mut Sealer|
-         -> Result<(), &'static str> {
-            match o {
-                // rekeys are only emitted below, in step with sealer.rekey()
-                Out::Msg(_, Msg::Rekey) => Ok(()),
-                Out::Msg(_, m) => {
-                    if matches!(m, Msg::Resp { .. }) {
-                        // saturating decrement; try_update is past the msrv and fetch_update is deprecated
-                        let inflight = &shared.peer_inflight;
-                        let mut cur = inflight.load(Ordering::Acquire);
-                        while let Some(next) = cur.checked_sub(1) {
-                            match inflight.compare_exchange_weak(
-                                cur,
-                                next,
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            ) {
-                                Ok(_) => break,
-                                Err(seen) => cur = seen,
-                            }
-                        }
-                    }
-                    seal_with(sealer, out, |e| enc.msg(&m, e))
-                }
-                Out::Chunk {
-                    id,
-                    off,
-                    last,
-                    data,
-                } => {
-                    if data.len() > CHUNK_MAX {
-                        return Err("chunk too large");
-                    }
-                    seal_with(sealer, out, |e| enc.chunk(id, off, last, &data, e))
-                }
-            }
-        };
+        // nothing is taken off a queue until the sending half is held, so a caller writing directly never overtakes it
+        let mut sel = Select::new();
+        sel.recv(&stop);
+        sel.recv(&ctl);
+        sel.recv(&bulk);
+        sel.recv(&kick);
         let why = loop {
-            let first = select_biased! {
-                recv(stop) -> _ => None,
-                recv(ctl) -> m => m.ok(),
-                recv(bulk) -> m => m.ok(),
-            };
-            let stopping = first.is_none();
-            out.clear();
-            let mut res = match first {
-                Some(o) => put(o, &mut enc, &mut out, &mut sealer),
-                None => Ok(()),
-            };
-            while res.is_ok() && out.len() < BATCH_BYTES {
-                if let Ok(o) = ctl.try_recv() {
-                    res = put(o, &mut enc, &mut out, &mut sealer);
-                    continue;
+            sel.ready();
+            let mut stopping = stop.try_recv().is_ok();
+            let _ = kick.try_recv();
+            let mut g = lock(&tx);
+            let t = &mut *g;
+            if !t.spill.is_empty() {
+                if let Err(e) = t.sock.write_all(&t.spill) {
+                    break Some(CloseReason::Io(e.kind()));
+                }
+                t.spill.clear();
+            }
+            t.begin();
+            let mut res = Ok(());
+            while res.is_ok() && t.plain.len() < BATCH_BYTES {
+                match ctl.try_recv() {
+                    Ok(o) => {
+                        res = t.put(o, &shared);
+                        continue;
+                    }
+                    Err(TryRecvError::Disconnected) => stopping = true,
+                    Err(TryRecvError::Empty) => {}
                 }
                 if stopping {
                     break;
                 }
                 match bulk.try_recv() {
-                    Ok(o) => res = put(o, &mut enc, &mut out, &mut sealer),
-                    Err(_) => break,
+                    Ok(o) => res = t.put(o, &shared),
+                    Err(TryRecvError::Disconnected) => stopping = true,
+                    Err(TryRecvError::Empty) => break,
                 }
             }
-            if let Err(e) = res {
+            if let Err(e) = res.and_then(|()| t.seal(!stopping)) {
                 break Some(CloseReason::Protocol(e));
             }
-            if !stopping && sealer.rekey_due() {
-                if let Err(e) = seal_with(&mut sealer, &mut out, |e| enc.msg(&Msg::Rekey, e)) {
-                    break Some(CloseReason::Protocol(e));
-                }
-                sealer.rekey();
-            }
-            if !out.is_empty()
-                && let Err(e) = sock.write_all(&out)
+            if !t.out.is_empty()
+                && let Err(e) = t.sock.write_all(&t.out)
             {
                 break Some(CloseReason::Io(e.kind()));
             }
-            if out.capacity() > 2 * (BATCH_BYTES + NOISE_MAX) {
-                out = Vec::with_capacity(BATCH_BYTES + NOISE_MAX + 2);
-            }
+            t.trim();
+            drop(g);
             if stopping {
                 break None;
             }
@@ -464,7 +596,7 @@ impl Writer {
             shared.set_reason(w);
         }
         shared.closed.store(true, Ordering::Release);
-        let _ = sock.shutdown(Shutdown::Both);
+        let _ = lock(&tx).sock.shutdown(Shutdown::Both);
     }
 }
 
@@ -497,62 +629,119 @@ impl Reader {
             inbox,
             sig,
         } = self;
-        let mut rd = BufReader::with_capacity(RD_BUF, &sock);
-        let mut ct = vec![0u8; NOISE_MAX].into_boxed_slice();
-        let mut pt = vec![0u8; NOISE_MAX].into_boxed_slice();
+        // every segment that has fully arrived is opened as one run, so a backlog is opened on all cores
+        let mut rb = vec![0u8; RD_BUF];
+        let (mut lo, mut hi) = (0usize, 0usize);
+        let mut arena: Vec<u8> = Vec::new();
+        let mut cts: Vec<(usize, usize)> = Vec::new();
+        let mut res = Vec::new();
         let mut dec = Decoder::default();
-        let why = loop {
-            let mut l = [0u8; 2];
-            if let Err(e) = rd.read_exact(&mut l) {
-                break io_reason(&e);
+        let why = 'run: loop {
+            cts.clear();
+            let mut p = lo;
+            let mut empty = false;
+            while hi - p >= 2 {
+                let n = u16::from_be_bytes([rb[p], rb[p + 1]]) as usize;
+                if n == 0 {
+                    empty = true;
+                    break;
+                }
+                if hi - p - 2 < n {
+                    break;
+                }
+                cts.push((p + 2, n));
+                p += 2 + n;
             }
-            let n = u16::from_be_bytes(l) as usize;
-            if n == 0 {
-                break CloseReason::Protocol("empty segment");
+            if cts.is_empty() {
+                if empty {
+                    break CloseReason::Protocol("empty segment");
+                }
+                if lo > 0 {
+                    rb.copy_within(lo..hi, 0);
+                    hi -= lo;
+                    lo = 0;
+                }
+                match (&sock).read(&mut rb[hi..]) {
+                    Ok(0) => break CloseReason::Eof,
+                    Ok(k) => hi += k,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => break io_reason(&e),
+                }
+                continue;
             }
-            if let Err(e) = rd.read_exact(&mut ct[..n]) {
-                break io_reason(&e);
+            let total: usize = cts.iter().map(|c| c.1).sum();
+            if arena.len() < total {
+                arena.resize(total, 0);
             }
-            let m = match opener.open(&ct[..n], &mut pt) {
-                Ok(m) => m,
-                Err(_) => break CloseReason::Protocol("segment failed authentication"),
+            let base = {
+                let refs: Vec<&[u8]> = cts.iter().map(|&(a, n)| &rb[a..a + n]).collect();
+                let mut outs = Vec::with_capacity(cts.len());
+                let mut rest = &mut arena[..total];
+                for &(_, n) in &cts {
+                    let (o, t) = rest.split_at_mut(n);
+                    outs.push(o);
+                    rest = t;
+                }
+                match opener.open_many(&refs, outs, &mut res) {
+                    Ok(b) => b,
+                    Err(_) => break CloseReason::Protocol("segment failed authentication"),
+                }
             };
-            if sig.shared.closed.load(Ordering::Acquire) {
-                break CloseReason::Local;
-            }
-            let frame = match dec.push(&pt[..m]) {
-                Ok(Some(f)) => f,
-                Ok(None) => continue,
-                Err(_) => break CloseReason::Protocol("bad frame"),
-            };
-            match frame {
-                Frame::Msg(msg) => {
-                    if let Some(why) = on_msg(msg, &mut opener, &inbox, &sig) {
-                        break why;
+            let epoch = opener.epoch();
+            let mut at = 0usize;
+            for (i, &(a, n)) in cts.iter().enumerate() {
+                let slot = at;
+                at += n;
+                let opened = if opener.epoch() == epoch {
+                    res[i]
+                } else {
+                    opener.open_at(base + i as u64, &rb[a..a + n], &mut arena[slot..slot + n])
+                };
+                let Ok(m) = opened else {
+                    break 'run CloseReason::Protocol("segment failed authentication");
+                };
+                if sig.shared.closed.load(Ordering::Acquire) {
+                    break 'run CloseReason::Local;
+                }
+                let frame = match dec.push(&arena[slot..slot + m]) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => continue,
+                    Err(_) => break 'run CloseReason::Protocol("bad frame"),
+                };
+                match frame {
+                    Frame::Msg(msg) => {
+                        if let Some(why) = on_msg(msg, &mut opener, &inbox, &sig) {
+                            break 'run why;
+                        }
+                    }
+                    Frame::Chunk {
+                        id,
+                        off,
+                        last,
+                        data,
+                    } => {
+                        if data.len() > CHUNK_MAX {
+                            break 'run CloseReason::Protocol("chunk too large");
+                        }
+                        let handled = sig
+                            .shared
+                            .router()
+                            .is_some_and(|r| r.route_chunk(id, off, last, data));
+                        if !handled {
+                            let _ = inbox.send(In::Chunk {
+                                id,
+                                off,
+                                last,
+                                data: data.to_vec(),
+                            });
+                        }
                     }
                 }
-                Frame::Chunk {
-                    id,
-                    off,
-                    last,
-                    data,
-                } => {
-                    if data.len() > CHUNK_MAX {
-                        break CloseReason::Protocol("chunk too large");
-                    }
-                    let handled = sig
-                        .shared
-                        .router()
-                        .is_some_and(|r| r.route_chunk(id, off, last, data));
-                    if !handled {
-                        let _ = inbox.send(In::Chunk {
-                            id,
-                            off,
-                            last,
-                            data: data.to_vec(),
-                        });
-                    }
-                }
+            }
+            lo = p;
+            if lo == hi {
+                lo = 0;
+                hi = 0;
             }
         };
         let protocol = matches!(why, CloseReason::Protocol(_));
@@ -581,12 +770,15 @@ fn on_msg(msg: Msg, opener: &mut Opener, inbox: &Sender<In>, sig: &Signal) -> Op
             ));
         }
         Msg::Rekey => opener.rekey(),
-        Msg::Resp { id, res } => match sh.router() {
-            Some(r) => r.route_resp(id, res),
-            None => {
+        Msg::Resp { id, res } => {
+            let res = match sh.router() {
+                Some(r) => r.on_resp(id, res),
+                None => Some(res),
+            };
+            if let Some(res) = res {
                 let _ = inbox.send(In::Msg(Msg::Resp { id, res }));
             }
-        },
+        }
         Msg::Req { id, op } => {
             if sh.peer_inflight.fetch_add(1, Ordering::AcqRel) >= INFLIGHT_MAX {
                 return Some(CloseReason::Protocol("too many requests in flight"));
@@ -1281,6 +1473,76 @@ pub(crate) mod tests {
                 x as u8
             })
             .collect()
+    }
+
+    #[test]
+    fn large_runs_cross_a_rekey_in_both_directions() {
+        let (g, mut raw) = raw_pair();
+        let parts: Vec<Vec<u8>> = (0..16).map(|i| noise_bytes(CHUNK_MAX + i)).collect();
+        // one write holds a parallel run, a rekey, then a run under the new key
+        let mut plain = Vec::new();
+        let mut spans = Vec::new();
+        let mut out = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
+            let d = &p[..CHUNK_MAX];
+            let mut emit = |s: &[u8]| {
+                spans.push((plain.len(), s.len()));
+                plain.extend_from_slice(s);
+            };
+            raw.enc
+                .chunk(3, (i * CHUNK_MAX) as u64, i == 15, d, &mut emit)
+                .unwrap();
+            if i == 7 {
+                raw.sealer.seal_many(&plain, &spans, &mut out).unwrap();
+                plain.clear();
+                spans.clear();
+                let enc = &mut raw.enc;
+                seal_with(&mut raw.sealer, &mut out, |e| enc.msg(&Msg::Rekey, e)).unwrap();
+                raw.sealer.rekey();
+            }
+        }
+        raw.sealer.seal_many(&plain, &spans, &mut out).unwrap();
+        raw.s.write_all(&out).unwrap();
+        for (i, p) in parts.iter().enumerate() {
+            match recv(&g) {
+                In::Chunk {
+                    id: 3, off, data, ..
+                } => {
+                    assert_eq!(off, (i * CHUNK_MAX) as u64);
+                    assert_eq!(data, p[..CHUNK_MAX]);
+                }
+                _ => panic!("expected chunk {i}"),
+            }
+        }
+
+        for (i, p) in parts.iter().enumerate() {
+            g.link
+                .send_out(Out::Chunk {
+                    id: 4,
+                    off: i as u64,
+                    last: i == 15,
+                    data: p[..CHUNK_MAX].to_vec(),
+                })
+                .unwrap();
+        }
+        let mut ct = vec![0u8; NOISE_MAX];
+        let mut pt = vec![0u8; NOISE_MAX];
+        let mut seen = 0;
+        while seen < 16 {
+            let mut l = [0u8; 2];
+            raw.s.read_exact(&mut l).unwrap();
+            let n = u16::from_be_bytes(l) as usize;
+            raw.s.read_exact(&mut ct[..n]).unwrap();
+            let m = raw.opener.open(&ct[..n], &mut pt).unwrap();
+            if let Some(Frame::Chunk {
+                id: 4, off, data, ..
+            }) = raw.dec.push(&pt[..m]).unwrap()
+            {
+                assert_eq!(off, seen as u64);
+                assert_eq!(data, &parts[seen][..CHUNK_MAX]);
+                seen += 1;
+            }
+        }
     }
 
     #[test]

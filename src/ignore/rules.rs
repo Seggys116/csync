@@ -70,6 +70,37 @@ fn may_fold_to_fixed(c: &str) -> bool {
         .is_some_and(|&b| b == b'.' || !b.is_ascii())
 }
 
+// files macos itself scatters around (finder, spotlight, time machine, icloud, appledouble on foreign volumes);
+// always ignored unless git tracks them, so they never sync, never reach the guest and never conflict
+pub const OS_JUNK: [&str; 13] = [
+    ".DS_Store",
+    ".AppleDouble",
+    ".AppleDB",
+    ".AppleDesktop",
+    ".apdisk",
+    ".DocumentRevisions-V100",
+    ".fseventsd",
+    ".Spotlight-V100",
+    ".TemporaryItems",
+    ".Trashes",
+    ".VolumeIcon.icns",
+    ".com.apple.timemachine.donotpresent",
+    "Icon\r",
+];
+
+// OS_JUNK plus `._*` appledouble twins and `.name.icloud` placeholders of files not downloaded yet
+pub fn is_os_junk(c: &str) -> bool {
+    match c.as_bytes() {
+        [b'.', b'_', ..] => true,
+        [b'.', rest @ ..] => {
+            (rest.len() > 7 && rest[rest.len() - 7..].eq_ignore_ascii_case(b".icloud"))
+                || OS_JUNK.iter().any(|j| c.eq_ignore_ascii_case(j))
+        }
+        [b'I' | b'i', .., b'\r'] => c.eq_ignore_ascii_case("Icon\r"),
+        _ => false,
+    }
+}
+
 struct Matcher {
     gi: Gitignore,
     text: Box<[u8]>,
@@ -462,6 +493,12 @@ impl Rules {
         d.guest.push(content);
     }
 
+    pub fn guest_wrote(&self, file: &RelPath, content: &Hash32) -> bool {
+        self.gitignore_dir(file)
+            .and_then(|d| self.dirs.get(d))
+            .is_some_and(|d| d.guest.contains(&Some(*content)))
+    }
+
     pub fn fold_known(&self) -> bool {
         self.fold_known
     }
@@ -675,7 +712,7 @@ impl Rules {
                 Lvl::Fixed(Class::Ignored)
             };
         }
-        if !self.ignored(path, e, is_dir, stack, cur.repo) {
+        if !is_os_junk(comp) && !self.ignored(path, e, is_dir, stack, cur.repo) {
             return Lvl::Pass { ign: false };
         }
         if excepted() {
@@ -960,6 +997,48 @@ mod tests {
         );
         r.set_exceptions(Vec::new());
         check(&r, &[("Cargo.lock", false, Ignored)]);
+    }
+
+    #[test]
+    fn macos_junk_is_ignored_without_rules_unless_tracked() {
+        use Class::*;
+        let mut r = Rules::new(&[]);
+        check(
+            &r,
+            &[
+                (".DS_Store", false, Ignored),
+                ("src/.ds_store", false, Ignored),
+                ("src/._main.c", false, Ignored),
+                ("._dir", true, Ignored),
+                ("._dir/x", false, Ignored),
+                ("Icon\r", false, Ignored),
+                ("a/Icon\r", false, Ignored),
+                (".Spotlight-V100", true, Ignored),
+                (".Spotlight-V100/Store-V2/x", false, Ignored),
+                (".Trashes", true, Ignored),
+                (".fseventsd", true, Ignored),
+                (".TemporaryItems", true, Ignored),
+                (".DocumentRevisions-V100", true, Ignored),
+                (".AppleDouble", true, Ignored),
+                ("docs/.notes.md.icloud", false, Ignored),
+                ("Icon", false, Synced),
+                ("Icon\rx", false, Synced),
+                (".icloud", false, Synced),
+                ("x.icloud", false, Synced),
+                (".DS_Store2", false, Synced),
+                ("_x", false, Synced),
+                (".gitignore", false, Synced),
+                (".git", true, GitRo),
+            ],
+        );
+        r.set_exceptions(vec![rp("assets/.DS_Store")]);
+        check(
+            &r,
+            &[
+                ("assets/.DS_Store", false, Synced),
+                ("other/.DS_Store", false, Ignored),
+            ],
+        );
     }
 
     #[test]

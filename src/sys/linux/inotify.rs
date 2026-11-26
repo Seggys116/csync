@@ -1,8 +1,9 @@
 use crate::{
     proto::RelPath,
+    proto::path::TMP_PREFIX,
     sys::{
-        DirFilter, ResumeToken, WatchEvent, Watcher, fs_unix::open_beneath, linux::dir::subdirs,
-        lock, strictly_under, wflag,
+        DirFilter, Echoes, ResumeToken, WatchEvent, Watcher, fs_unix::open_beneath,
+        linux::dir::subdirs, lock, strictly_under, wflag,
     },
 };
 use ::inotify::{EventMask, Inotify, WatchDescriptor, WatchMask, Watches};
@@ -184,6 +185,7 @@ struct Shared {
     table: Mutex<Table>,
     stop: AtomicBool,
     limit: usize,
+    echoes: Arc<Echoes>,
 }
 
 pub struct InotifyWatcher {
@@ -196,9 +198,13 @@ impl InotifyWatcher {
         root: &Path,
         tx: Sender<Vec<WatchEvent>>,
         accept: Option<DirFilter>,
+        echoes: Arc<Echoes>,
     ) -> io::Result<Self> {
         let root = std::fs::canonicalize(root)?;
         let ino = Inotify::init()?;
+        // a blocking fd lets each read sleep in the kernel instead of toggling O_NONBLOCK around it
+        rustix::fs::fcntl_setfl(&ino, OFlags::empty())?;
+        echoes.enable();
         let root_fd = rustix::fs::open(
             &root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -218,6 +224,7 @@ impl InotifyWatcher {
             table: Mutex::new(table),
             stop: AtomicBool::new(false),
             limit: max_user_watches(),
+            echoes,
         });
         let sh = shared.clone();
         let thread = std::thread::Builder::new()
@@ -337,10 +344,19 @@ fn reader(mut ino: Inotify, sh: &Shared, tx: &Sender<Vec<WatchEvent>>) {
     let mut scratch = String::new();
     let mut moved_from: Vec<(u32, RelPath)> = Vec::new();
     let mut fresh: Vec<RelPath> = Vec::new();
+    let mut own: Vec<(u32, WatchDescriptor, String)> = Vec::new();
+    let mut own_prev: Vec<(u32, WatchDescriptor, String)> = Vec::new();
     loop {
-        let events = match ino.read_events_blocking(&mut buf) {
-            Ok(ev) => ev,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+        let events: Vec<_> = match ino.read_events(&mut buf) {
+            Ok(ev) => ev.collect(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(_) => {
                 if !sh.stop.load(Ordering::Acquire) {
                     let ev = WatchEvent {
@@ -357,6 +373,20 @@ fn reader(mut ino: Inotify, sh: &Shared, tx: &Sender<Vec<WatchEvent>>) {
             return;
         }
         let mut out = Vec::new();
+        // renames paired with a committer temp name; the last read's too, as a read can split a rename
+        std::mem::swap(&mut own, &mut own_prev);
+        own.clear();
+        for ev in &events {
+            if ev.cookie != 0
+                && ev
+                    .mask
+                    .intersects(EventMask::MOVED_FROM | EventMask::MOVED_TO)
+                && let Some(n) = ev.name.and_then(OsStr::to_str)
+                && n.starts_with(TMP_PREFIX)
+            {
+                own.push((ev.cookie, ev.wd.clone(), n.to_owned()));
+            }
+        }
         {
             let mut t = lock(&sh.table);
             for ev in events {
@@ -399,6 +429,17 @@ fn reader(mut ino: Inotify, sh: &Shared, tx: &Sender<Vec<WatchEvent>>) {
                 let Some(path) = child_path(&mut scratch, dir, name) else {
                     continue;
                 };
+                // the committer's own swap into this name; it already indexed the result
+                if ev.cookie != 0
+                    && !ev.mask.contains(EventMask::ISDIR)
+                    && let Some((_, _, tmp)) = own
+                        .iter()
+                        .chain(&own_prev)
+                        .find(|(c, wd, _)| *c == ev.cookie && *wd == ev.wd)
+                    && sh.echoes.take(&path, tmp)
+                {
+                    continue;
+                }
                 if ev.mask.contains(EventMask::ISDIR) {
                     if ev.mask.contains(EventMask::MOVED_FROM) {
                         moved_from.push((ev.cookie, path.clone()));
@@ -583,6 +624,51 @@ mod tests {
                 .any(|e| e.path.as_str().starts_with("node_modules/")
                     || e.path.as_str().starts_with("target/"))
         );
+        drop(w);
+    }
+
+    #[test]
+    fn committer_swaps_are_dropped_and_every_other_edit_is_not() {
+        let t = tmp("echo");
+        fs::write(t.0.join("f.rs"), b"0").unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let echoes = Arc::new(Echoes::default());
+        let w = crate::sys::start_watcher_echoes(&t.0, None, tx, None, echoes.clone()).unwrap();
+        let mut seen = Vec::new();
+        let f = RelPath::new("f.rs").unwrap();
+        let mark = |name: &str| {
+            fs::write(t.0.join(name), b"m").unwrap();
+            name.to_owned()
+        };
+
+        // an exchange with the expected temp: nothing for f.rs reaches the applier
+        let ours = format!("{TMP_PREFIX}00ab1");
+        fs::write(t.0.join(&ours), b"1").unwrap();
+        echoes.expect(&f, &ours, 2);
+        let dir =
+            rustix::fs::open(&t.0, OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
+        crate::sys::exchange(dir.as_fd(), &ours, "f.rs").unwrap();
+        fs::remove_file(t.0.join(&ours)).unwrap();
+        let m = mark("m1");
+        wait(&rx, &mut seen, |e| e.path.as_str() == m);
+        assert!(
+            !seen.iter().any(|e| e.path == f),
+            "own swap leaked: {seen:?}"
+        );
+
+        // an unexpected temp rename, a save from another name and a plain write all arrive
+        seen.clear();
+        fs::write(t.0.join(&ours), b"2").unwrap();
+        fs::rename(t.0.join(&ours), t.0.join("f.rs")).unwrap();
+        wait(&rx, &mut seen, |e| is(e, "f.rs", wflag::RENAMED));
+        seen.clear();
+        echoes.expect(&f, &format!("{TMP_PREFIX}00ab2"), 1);
+        fs::write(t.0.join("f.rs.tmp"), b"3").unwrap();
+        fs::rename(t.0.join("f.rs.tmp"), t.0.join("f.rs")).unwrap();
+        wait(&rx, &mut seen, |e| is(e, "f.rs", wflag::RENAMED));
+        seen.clear();
+        fs::write(t.0.join("f.rs"), b"4").unwrap();
+        wait(&rx, &mut seen, |e| is(e, "f.rs", wflag::MODIFIED));
         drop(w);
     }
 

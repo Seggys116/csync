@@ -12,7 +12,7 @@ use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +33,8 @@ const EVICT_SCAN: usize = 1 << 14;
 const UNIT: u64 = RANGE_UNIT as u64;
 const LRU_FILE: &str = "lru.bin";
 const HEX: &[u8; 16] = b"0123456789abcdef";
+const LANDERS: usize = 4;
+const LAND_SPLIT: usize = 16;
 
 pub type Done = Box<dyn FnOnce(Result<Reply, RpcError>) + Send>;
 
@@ -437,11 +439,17 @@ pub struct TmpBlob {
     fd: Arc<OwnedFd>,
     ver: Option<Version>,
     live: bool,
+    // a writer's staging file read in place: it is sent from but never published
+    borrowed: bool,
 }
 
 impl TmpBlob {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    pub fn is_borrowed(&self) -> bool {
+        self.borrowed
     }
 
     pub fn version(&self) -> Option<Version> {
@@ -500,11 +508,18 @@ struct Fill {
     h: Hash32,
     path: RelPath,
     size: u64,
-    fd: Arc<OwnedFd>,
+    // none for a batch fill: its verified bytes are written straight to the final name
+    fd: Option<Arc<OwnedFd>>,
     tmp: Mutex<Option<TmpBlob>>,
     st: Mutex<FillState>,
     cv: Condvar,
     batch: bool,
+}
+
+impl Fill {
+    fn fd(&self) -> Result<BorrowedFd<'_>, i32> {
+        self.fd.as_deref().map(AsFd::as_fd).ok_or(libc::EIO)
+    }
 }
 
 enum Join {
@@ -646,7 +661,8 @@ impl ChunkSink for FillSink {
             .checked_add(data.len() as u64)
             .filter(|&e| e <= self.limit)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
-        pwrite_all(self.fill.fd.as_fd(), data, self.base + self.got)?;
+        let fd = self.fill.fd().map_err(io::Error::from_raw_os_error)?;
+        pwrite_all(fd, data, self.base + self.got)?;
         if let Some(h) = self.hasher.as_mut() {
             h.update(data);
         }
@@ -689,7 +705,67 @@ impl Shared {
             fd: Arc::new(fd),
             ver: None,
             live: true,
+            borrowed: false,
         })
+    }
+
+    fn borrow(&self, fd: Arc<OwnedFd>, v: Version) -> TmpBlob {
+        TmpBlob {
+            dir: self.tmp.clone(),
+            name: String::new(),
+            fd,
+            ver: Some(v),
+            live: false,
+            borrowed: true,
+        }
+    }
+
+    // a released staging file holding v becomes the blob; one that cannot be linked is copied
+    fn adopt(&self, fd: BorrowedFd<'_>, v: Version, path: Option<&RelPath>) -> Result<(), i32> {
+        if lock(&self.inner).slots.contains_key(&v.hash) {
+            lock(&self.inner).add(v.hash, v.size, path.cloned());
+            return Ok(());
+        }
+        let n = self.names.fetch_add(1, Ordering::Relaxed);
+        let name = format!("{:x}-{n:x}", self.pid);
+        let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let linked = rustix::fs::linkat(
+            rustix::fs::CWD,
+            proc.as_str(),
+            &*self.tmp,
+            name.as_str(),
+            AtFlags::SYMLINK_FOLLOW,
+        );
+        let t = match linked {
+            Ok(()) => {
+                let own = rustix::fs::openat(
+                    &*self.tmp,
+                    name.as_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                let mut t = TmpBlob {
+                    dir: self.tmp.clone(),
+                    name,
+                    fd: Arc::new(own.map_err(os)?),
+                    ver: Some(v),
+                    live: true,
+                    borrowed: false,
+                };
+                if sys::stat_key(t.fd.as_fd()).map_err(|e| io_errno(&e))?.size != v.size {
+                    t.ver = None;
+                    return Err(libc::EIO);
+                }
+                t
+            }
+            Err(_) => {
+                let mut t = self.new_tmp()?;
+                sys::clone_or_copy(fd, t.fd.as_fd()).map_err(|e| io_errno(&e))?;
+                t.ver = Some(v);
+                t
+            }
+        };
+        self.publish_tmp(t, path)
     }
 
     fn open_blob(&self, h: &Hash32) -> Result<OwnedFd, i32> {
@@ -772,6 +848,9 @@ impl Shared {
     }
 
     fn publish_tmp(&self, mut t: TmpBlob, path: Option<&RelPath>) -> Result<(), i32> {
+        if t.borrowed {
+            return Err(libc::EINVAL);
+        }
         let v = t.ver.ok_or(libc::EINVAL)?;
         if !lock(&self.inner).slots.contains_key(&v.hash) {
             self.rename_in(&mut t, &v.hash)?;
@@ -891,7 +970,7 @@ impl Shared {
             h: *h,
             path,
             size,
-            fd: tmp.fd.clone(),
+            fd: Some(tmp.fd.clone()),
             tmp: Mutex::new(Some(tmp)),
             st: Mutex::new(st),
             cv: Condvar::new(),
@@ -939,13 +1018,19 @@ impl Shared {
                     self.unpin(h);
                     r
                 }
-                Ok(false) => Ok(BlobRef {
-                    s: self.clone(),
-                    h: *h,
-                    size: fill.size,
-                    fd: fill.fd.clone(),
-                    complete: false,
-                }),
+                Ok(false) => match fill.fd.clone() {
+                    Some(fd) => Ok(BlobRef {
+                        s: self.clone(),
+                        h: *h,
+                        size: fill.size,
+                        fd,
+                        complete: false,
+                    }),
+                    None => {
+                        self.unpin(h);
+                        Err(libc::EIO)
+                    }
+                },
                 Err(e) => {
                     self.unpin(h);
                     // a failed prefetch batch is not this reader's failure: fetch on its own
@@ -961,31 +1046,25 @@ impl Shared {
 
     fn begin_batch(&self, items: &[(RelPath, Hash32, u64)]) -> Vec<Arc<Fill>> {
         let mut out = Vec::with_capacity(items.len());
+        let mut g = lock(&self.inner);
         for (path, h, size) in items {
-            if *size == 0 || *size >= RANGE_FILE_MIN {
+            if *size == 0
+                || *size >= RANGE_FILE_MIN
+                || g.slots.contains_key(h)
+                || g.fills.contains_key(h)
+            {
                 continue;
             }
-            {
-                let g = lock(&self.inner);
-                if g.slots.contains_key(h) || g.fills.contains_key(h) {
-                    continue;
-                }
-            }
-            let Ok(tmp) = self.new_tmp() else { break };
             let fill = Arc::new(Fill {
                 h: *h,
                 path: path.clone(),
                 size: *size,
-                fd: tmp.fd.clone(),
-                tmp: Mutex::new(Some(tmp)),
+                fd: None,
+                tmp: Mutex::new(None),
                 st: Mutex::new(FillState::default()),
                 cv: Condvar::new(),
                 batch: true,
             });
-            let mut g = lock(&self.inner);
-            if g.slots.contains_key(h) || g.fills.contains_key(h) {
-                continue;
-            }
             g.fills.insert(*h, fill.clone());
             out.push(fill);
         }
@@ -997,10 +1076,42 @@ impl Shared {
         let r = if data.len() as u64 != fill.size || blake3::hash(data).as_bytes() != &fill.h {
             Err(libc::EIO)
         } else {
-            pwrite_all(fill.fd.as_fd(), data, 0).map_err(|e| io_errno(&e))
+            self.write_final(&fill.h, data)
         };
         self.complete(fill, r);
         lock(&fill.st).done == Some(Ok(()))
+    }
+
+    // verified bytes go straight to the final name: a torn file left by a crash fails the startup size or hash check
+    fn write_final(&self, h: &Hash32, data: &[u8]) -> Result<(), i32> {
+        let name = hex(h);
+        let dir = self.shard(h)?;
+        let create = || {
+            rustix::fs::openat(
+                dir,
+                hex_str(&name),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+        };
+        let fd = match create() {
+            Ok(fd) => fd,
+            Err(Errno::EXIST) => {
+                if lock(&self.inner).slots.contains_key(h) {
+                    return Ok(());
+                }
+                // only one fill per hash runs, so a name nobody published is a leftover
+                let _ = rustix::fs::unlinkat(dir, hex_str(&name), AtFlags::empty());
+                create().map_err(os)?
+            }
+            Err(e) => return Err(os(e)),
+        };
+        if let Err(e) = pwrite_all(fd.as_fd(), data, 0) {
+            drop(fd);
+            let _ = rustix::fs::unlinkat(dir, hex_str(&name), AtFlags::empty());
+            return Err(io_errno(&e));
+        }
+        Ok(())
     }
 
     fn start(self: &Arc<Self>, fill: &Arc<Fill>, deadline: Instant) {
@@ -1149,7 +1260,7 @@ impl Shared {
         let Reply::Blob { body, .. } = reply else {
             return Err(libc::EIO);
         };
-        let fd = fill.fd.as_fd();
+        let fd = fill.fd()?;
         let got = match body {
             Body::Empty if fill.size == 0 => empty_hash(),
             Body::Inline(b) if b.0.len() as u64 == fill.size => {
@@ -1195,8 +1306,13 @@ impl Shared {
     }
 
     fn publish_fill(&self, fill: &Arc<Fill>) -> Result<(), i32> {
-        let mut t = lock(&fill.tmp).take().ok_or(libc::EIO)?;
-        self.rename_in(&mut t, &fill.h)?;
+        let t = lock(&fill.tmp).take();
+        match t {
+            Some(mut t) => self.rename_in(&mut t, &fill.h)?,
+            // a batch fill wrote its final name already
+            None if fill.fd.is_none() => {}
+            None => return Err(libc::EIO),
+        }
         let mut g = lock(&self.inner);
         g.add(fill.h, fill.size, Some(fill.path.clone()));
         if g.fills.get(&fill.h).is_some_and(|f| Arc::ptr_eq(f, fill)) {
@@ -1257,7 +1373,7 @@ impl Shared {
             let mark = st.mark;
             match st.ranges.as_mut() {
                 None => {
-                    if !whole && (start >= end || end <= mark) {
+                    if !whole && fill.fd.is_some() && (start >= end || end <= mark) {
                         return Ok(false);
                     }
                 }
@@ -1266,7 +1382,9 @@ impl Shared {
                         if !rg.verifying {
                             rg.verifying = true;
                             drop(st);
-                            let r = hash_fd(fill.fd.as_fd(), fill.size)
+                            let r = fill
+                                .fd()
+                                .and_then(|fd| hash_fd(fd, fill.size))
                                 .and_then(|h| if h == fill.h { Ok(()) } else { Err(libc::EIO) });
                             self.complete(fill, r);
                             st = lock(&fill.st);
@@ -1387,9 +1505,9 @@ impl Shared {
             Reply::Blob {
                 body: Body::Inline(b),
                 ..
-            } if b.0.len() as u64 == ulen => {
-                pwrite_all(fill.fd.as_fd(), &b.0, uoff).map_err(|e| io_errno(&e))
-            }
+            } if b.0.len() as u64 == ulen => fill
+                .fd()
+                .and_then(|fd| pwrite_all(fd, &b.0, uoff).map_err(|e| io_errno(&e))),
             _ => Err(libc::EIO),
         }
     }
@@ -1552,16 +1670,43 @@ impl Batch {
     pub fn land(mut self, items: Vec<(RelPath, Result<Bytes, WireErr>)>) -> usize {
         let fills = std::mem::take(&mut self.fills);
         let mut got = items.into_iter();
-        let mut landed = 0;
-        for f in &fills {
+        let mut ok = Vec::with_capacity(fills.len());
+        for f in fills {
             match got.next() {
-                Some((p, Ok(b))) if p == f.path => {
-                    landed += usize::from(self.s.land_one(f, &b.0));
-                }
-                _ => self.s.complete(f, Err(libc::EIO)),
+                Some((p, Ok(b))) if p == f.path => ok.push((f, b)),
+                _ => self.s.complete(&f, Err(libc::EIO)),
             }
         }
-        landed
+        let s = &*self.s;
+        let land = |part: &[(Arc<Fill>, Bytes)]| -> usize {
+            part.iter()
+                .map(|(f, b)| usize::from(s.land_one(f, &b.0)))
+                .sum()
+        };
+        // hashing and writing a batch is the warm-up's critical path: big ones spread over short-lived scoped threads
+        let n = ok.len().div_ceil(LANDERS).max(LAND_SPLIT);
+        let mut parts = ok.chunks(n);
+        let Some(first) = parts.next() else { return 0 };
+        std::thread::scope(|sc| {
+            let others: Vec<_> = parts
+                .map(|p| {
+                    (
+                        p,
+                        std::thread::Builder::new()
+                            .name("csync-land".into())
+                            .spawn_scoped(sc, move || land(p)),
+                    )
+                })
+                .collect();
+            let mut landed = land(first);
+            for (p, h) in others {
+                landed += match h {
+                    Ok(h) => h.join().unwrap_or(0),
+                    Err(_) => land(p),
+                };
+            }
+            landed
+        })
     }
 }
 
@@ -1632,6 +1777,17 @@ impl Clone for BlobRef {
 }
 
 impl Drop for BlobRef {
+    fn drop(&mut self) {
+        self.s.unpin(&self.h);
+    }
+}
+
+pub struct Pin {
+    s: Arc<Shared>,
+    h: Hash32,
+}
+
+impl Drop for Pin {
     fn drop(&mut self) {
         self.s.unpin(&self.h);
     }
@@ -1807,6 +1963,20 @@ impl BlobCache {
         self.s.fetch(h, 0, 0, true, deadline)
     }
 
+    // a verified blob pinned and marked opened under one lock without opening its file: page-cache hits never read
+    pub fn open_hit(&self, h: &Hash32) -> Option<Pin> {
+        let mut guard = lock(&self.s.inner);
+        let g = &mut *guard;
+        let s = g.slots.get_mut(h).filter(|s| s.checked)?;
+        s.opened = Some(Instant::now());
+        g.touch(h);
+        g.pin(h);
+        Some(Pin {
+            s: self.s.clone(),
+            h: *h,
+        })
+    }
+
     // marks the read_ver blob of an open so eviction keeps it for the atomic-save merge window
     pub fn note_open(&self, h: &Hash32) {
         if let Some(s) = lock(&self.s.inner).slots.get_mut(h) {
@@ -1837,6 +2007,20 @@ impl BlobCache {
 
     pub fn publish(&self, t: TmpBlob, path: Option<&RelPath>) -> Result<(), i32> {
         self.s.publish_tmp(t, path)
+    }
+
+    pub fn borrow(&self, fd: Arc<OwnedFd>, v: Version) -> TmpBlob {
+        self.s.borrow(fd, v)
+    }
+
+    // on a full disk a passthrough write may have been cut short unseen; such a file must not commit
+    pub fn room_for(&self, size: u64) -> bool {
+        rustix::fs::fstatvfs(&*self.s.tmp)
+            .is_ok_and(|v| v.f_bavail.saturating_mul(v.f_frsize) >= size)
+    }
+
+    pub fn adopt(&self, fd: BorrowedFd<'_>, v: Version, path: Option<&RelPath>) -> Result<(), i32> {
+        self.s.adopt(fd, v, path)
     }
 
     pub fn evict(&self) -> u64 {
@@ -2142,6 +2326,37 @@ mod tests {
         assert!(!blob_path(&d.0, &items[1].1).exists());
         assert_eq!(reader.join().unwrap().unwrap(), x);
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn big_batch_lands_in_parallel_over_a_torn_leftover() {
+        let d = tmpdir("bigbatch");
+        let fake = Arc::new(Fake::default());
+        let c = Arc::new(open(&d, 1 << 30, &fake));
+        let bodies: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("body {i}").into_bytes())
+            .collect();
+        let items: Vec<_> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let p = RelPath::new(&format!("f{i}")).unwrap();
+                (p, *blake3::hash(b).as_bytes(), b.len() as u64)
+            })
+            .collect();
+        std::fs::write(blob_path(&d.0, &items[7].1), b"torn").unwrap();
+        let batch = c.begin_batch(&items);
+        let replies = items
+            .iter()
+            .zip(&bodies)
+            .map(|(i, b)| (i.0.clone(), Ok(Bytes(b.clone()))))
+            .collect();
+        assert_eq!(batch.land(replies), 100);
+        for (i, b) in items.iter().zip(&bodies) {
+            assert!(c.contains(&i.1));
+            assert_eq!(&std::fs::read(blob_path(&d.0, &i.1)).unwrap(), b);
+        }
         assert_eq!(names(&d.0.join("tmp")), 0);
     }
 }

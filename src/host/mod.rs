@@ -62,7 +62,6 @@ const UI_EVERY: Duration = Duration::from_millis(200);
 pub(crate) const RULE_MAX: u64 = 8 << 20;
 // frame headroom: the encoder refuses anything above FRAME_MAX, so batches aim well below it
 pub(crate) const PUSH_BYTES: usize = FRAME_MAX / 2;
-const GIT_HINT: &str = "guest git: GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.checkStat GIT_CONFIG_VALUE_0=minimal GIT_CONFIG_KEY_1=core.trustCtime GIT_CONFIG_VALUE_1=false";
 const MDNS_HINT: &str = "mdns advertising failed: guests must join by address";
 const PAIR_LIMIT_HINT: &str =
     "pairing is rate limited: too many recent pairing attempts, new requests are refused for now";
@@ -365,6 +364,17 @@ struct Feed {
     sent: Seq,
     lagging: bool,
     live: bool,
+    // replies that must follow the journal replay up to their seq
+    replies: Vec<(Seq, ReqId, Reply)>,
+}
+
+impl Feed {
+    fn release(&mut self, link: &Link) {
+        let n = self.replies.iter().take_while(|r| r.0 <= self.sent).count();
+        for (_, id, r) in self.replies.drain(..n) {
+            let _ = link.send(Msg::Resp { id, res: Ok(r) });
+        }
+    }
 }
 
 pub(crate) struct Guest {
@@ -389,6 +399,7 @@ impl Guest {
                 sent: 0,
                 lagging: false,
                 live: false,
+                replies: Vec::new(),
             }),
             fetches: Mutex::new(FxHashMap::default()),
         }
@@ -396,6 +407,16 @@ impl Guest {
 
     pub(crate) fn reply(&self, id: ReqId, res: Result<Reply, WireErr>) {
         let _ = self.link.send(Msg::Resp { id, res });
+    }
+
+    // a reply the guest must see after every change up to seq, and before any later one
+    pub(crate) fn reply_after(&self, seq: Seq, id: ReqId, r: Reply) {
+        let mut f = lock(&self.feed);
+        if f.lagging && f.sent < seq {
+            f.replies.push((seq, id, r));
+        } else {
+            let _ = self.link.send(Msg::Resp { id, res: Ok(r) });
+        }
     }
 
     fn begin_fetch(&self, id: ReqId) -> Result<(), WireErr> {
@@ -439,8 +460,12 @@ pub(crate) struct Core {
     pub(crate) fs: FsTraits,
     pub(crate) hub: Hub,
     pub(crate) events: Sender<Vec<WatchEvent>>,
+    pub(crate) echoes: Arc<sys::Echoes>,
+    // paths the committer is changing on disk right now; it records them in the tree before letting go
+    pub(crate) inflight: Mutex<Vec<RelPath>>,
     pub(crate) dirty: AtomicBool,
     pub(crate) stats: Counters,
+    pub(crate) kept: serve::Kept,
     ui: Option<Arc<UiBus>>,
     kick: Option<Sender<()>>,
     tmp_seed: u64,
@@ -478,8 +503,11 @@ impl Core {
             fs,
             hub: Hub::default(),
             events,
+            echoes: Arc::default(),
+            inflight: Mutex::new(Vec::new()),
             dirty: AtomicBool::new(true),
             stats: Counters::default(),
+            kept: serve::Kept::default(),
             ui: None,
             kick: None,
             tmp_seed,
@@ -621,11 +649,12 @@ impl Core {
                     let s = base + done as u64;
                     match g.link.try_push(Push::Changes { seq: s, changes: b }) {
                         Ok(()) => f.sent = s,
-                        Err(_) => return,
+                        Err(_) => return f.release(&g.link),
                     }
                 }
                 f.sent = target;
                 f.lagging = false;
+                f.release(&g.link);
             }
             None => {
                 if send_snapshot(&g.link, &tree).is_err() {
@@ -633,6 +662,7 @@ impl Core {
                 }
                 f.sent = target;
                 f.lagging = false;
+                f.release(&g.link);
                 drop(f);
                 drop(tree);
                 self.notice(
@@ -704,6 +734,7 @@ impl Core {
             sent: seq,
             lagging: false,
             live: true,
+            replies: Vec::new(),
         };
         guests.push(g.clone());
         Ok(())
@@ -848,6 +879,7 @@ fn spawn<F: FnOnce() + Send + 'static>(name: &str, f: F) -> io::Result<JoinHandl
 
 pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Result<()> {
     let started = SystemTime::now();
+    sys::keep_dataless();
     let root_path = std::fs::canonicalize(&cfg.root)?;
     let project = match cfg.project.take() {
         Some(p) => p,
@@ -869,9 +901,6 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         s.project = Some(project.clone());
         s.peers.clear();
         s.pairing = None;
-        if !s.hints.contains(&GIT_HINT) {
-            s.hints.push(GIT_HINT);
-        }
     });
 
     let root_fd = rustix::fs::open(
@@ -907,7 +936,14 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     };
     let resume = loaded.as_ref().and_then(|(_, r)| *r);
     // the watcher starts before the scan so nothing that changes during the walk is missed
-    let watcher = sys::start_watcher_filtered(&root_path, resume, ev_tx.clone(), Some(filter))?;
+    let echoes = Arc::new(sys::Echoes::default());
+    let watcher = sys::start_watcher_echoes(
+        &root_path,
+        resume,
+        ev_tx.clone(),
+        Some(filter),
+        echoes.clone(),
+    )?;
     let replay = cfg!(target_os = "macos")
         && resume.is_some_and(|t| {
             t.event_id != 0 && watcher.resume_token().is_some_and(|w| w.volume == t.volume)
@@ -934,6 +970,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     let mut core = Core::new(root_path, project.clone(), tree, rules, ev_tx)?;
     core.ui = Some(ui.clone());
     core.kick = Some(kick_tx);
+    core.echoes = echoes;
     let core = Arc::new(core);
     core.stats_to_ui();
 
@@ -1300,10 +1337,9 @@ enum UpKind {
 struct Upload {
     op: Op,
     kind: UpKind,
-    staged: commit::Staged,
+    sink: commit::Sink,
     want: u64,
     got: u64,
-    hasher: blake3::Hasher,
     at: Instant,
 }
 
@@ -1318,10 +1354,7 @@ impl Upload {
             .checked_add(data.len() as u64)
             .filter(|&e| e <= self.want)
             .ok_or(WireErr::TooLarge)?;
-        write_all_at(self.staged.fd.as_fd(), data, off).map_err(|e| wire(&e))?;
-        if matches!(self.kind, UpKind::Stream { .. }) {
-            self.hasher.update(data);
-        }
+        self.sink.put(data).map_err(|e| wire(&e))?;
         self.got = end;
         self.at = Instant::now();
         if last {
@@ -1402,6 +1435,7 @@ impl SessionCtx {
 
     fn ping(&mut self) {
         self.last_ping = Instant::now();
+        self.core.kept.prune();
         let _ = self.g.link.send(Msg::Ping { t_ns: now_ns() });
     }
 
@@ -1633,13 +1667,13 @@ impl SessionCtx {
             });
         match staged {
             Ok(staged) => {
+                let hash = matches!(kind, UpKind::Stream { .. });
                 let up = Upload {
                     op,
                     kind,
-                    staged,
+                    sink: commit::Sink::new(staged, hash, len),
                     want: len,
                     got: 0,
-                    hasher: blake3::Hasher::new(),
                     at: Instant::now(),
                 };
                 self.order.push_back(id);
@@ -1672,14 +1706,17 @@ impl SessionCtx {
         let Upload {
             op,
             kind,
-            staged,
+            sink,
             want,
-            hasher,
             ..
         } = u;
+        let (staged, got) = match sink.finish() {
+            Ok(x) => x,
+            Err(e) => return self.fail(id, wire(&e)),
+        };
         match kind {
             UpKind::Stream { hash } => {
-                if *hasher.finalize().as_bytes() != hash {
+                if got != Some(hash) {
                     return self.fail(id, WireErr::Invalid);
                 }
                 self.uploaded(id, op, commit::Payload::File(staged));
@@ -1854,11 +1891,22 @@ mod tests {
             to_expect: Expect::Absent,
             body: None,
         };
-        assert!(commit::exec(&s.core, op, commit::Payload::None, Some(s.g.id)).is_ok());
+        let asker = commit::Asker::new(&s.g, 9);
+        assert!(commit::exec(&s.core, op, commit::Payload::None, Some(&asker)).is_ok());
         let mut seen = Vec::new();
+        let mut replied = false;
         while let Ok(i) = peer.inbox.recv_timeout(Duration::from_secs(2)) {
-            if let In::Msg(Msg::Push(Push::Changes { changes, .. })) = i {
-                seen.extend(changes);
+            match i {
+                In::Msg(Msg::Resp { id: 9, res }) => {
+                    assert!(matches!(res, Ok(Reply::Done { .. })), "{res:?}");
+                    replied = true;
+                }
+                // the guest moves its copy on the reply, so nothing under the new path may come first
+                In::Msg(Msg::Push(Push::Changes { changes, .. })) => {
+                    assert!(replied, "pushed before the reply: {changes:?}");
+                    seen.extend(changes);
+                }
+                _ => {}
             }
             if seen.len() >= 2 {
                 break;
@@ -1880,5 +1928,57 @@ mod tests {
             !seen.iter().any(|x| matches!(x, Change::Rename { .. })),
             "the origin already made the move itself: {seen:?}"
         );
+    }
+
+    #[test]
+    fn a_lagging_guest_gets_its_dir_move_reply_after_the_backlog() {
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::create_dir_all(root.join("d1")).unwrap();
+            std::fs::write(root.join("d1/a.txt"), "a\n").unwrap();
+        });
+        {
+            let mut f = lock(&s.g.feed);
+            f.live = true;
+            f.lagging = true;
+            f.sent = s.core.tree().seq();
+        }
+        lock(&s.core.hub.guests).push(s.g.clone());
+        let rm = Op::Remove {
+            path: RelPath::new("d1/a.txt").unwrap(),
+            expect: Expect::Any,
+        };
+        assert!(commit::exec(&s.core, rm, commit::Payload::None, None).is_ok());
+        let mv = Op::Rename {
+            from: RelPath::new("d1").unwrap(),
+            to: RelPath::new("m2").unwrap(),
+            from_expect: Expect::Dir,
+            to_expect: Expect::Absent,
+            body: None,
+        };
+        let asker = commit::Asker::new(&s.g, 4);
+        assert!(commit::exec(&s.core, mv, commit::Payload::None, Some(&asker)).is_ok());
+        // the remove under the old path is still in the journal, so the reply must wait for it
+        assert!(
+            peer.inbox.recv_timeout(Duration::from_millis(200)).is_err(),
+            "nothing may reach a lagging guest before its catch-up"
+        );
+        s.core.catch_up(&s.g);
+        let mut removed = false;
+        loop {
+            match peer.inbox.recv_timeout(Duration::from_secs(2)) {
+                Ok(In::Msg(Msg::Push(Push::Changes { changes, .. }))) => {
+                    removed |= changes.iter().any(
+                        |c| matches!(c, Change::Remove { path } if path.as_str() == "d1/a.txt"),
+                    );
+                }
+                Ok(In::Msg(Msg::Resp { id: 4, res })) => {
+                    assert!(matches!(res, Ok(Reply::Done { .. })), "{res:?}");
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => panic!("no reply after the catch-up: {e:?}"),
+            }
+        }
+        assert!(removed, "the reply overtook the backlog");
     }
 }

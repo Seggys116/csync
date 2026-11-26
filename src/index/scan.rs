@@ -106,6 +106,7 @@ fn walk(
 ) -> io::Result<()> {
     let root_fd = rustix::fs::open(root, DIR_FLAGS, Mode::empty())?;
     let rfd = root_fd.as_fd();
+    let dev = sys::stat_key(rfd)?.dev;
     let start = if dir.is_root() {
         Pending {
             path: RelPath::root(),
@@ -113,7 +114,7 @@ fn walk(
             class: Class::Synced,
         }
     } else {
-        match enter(rfd, dir, rules, tree, &mut out)? {
+        match enter(rfd, dev, dir, rules, tree, &mut out)? {
             Some(p) => p,
             None => return Ok(()),
         }
@@ -123,9 +124,9 @@ fn walk(
         // a handful of directories is cheaper on this thread than a pool wakeup
         let par = level.len() >= PAR_LEVEL;
         let raws: Vec<Raw> = if par {
-            level.par_iter().map(|p| read_one(rfd, p)).collect()
+            level.par_iter().map(|p| read_one(rfd, dev, p)).collect()
         } else {
-            level.iter().map(|p| read_one(rfd, p)).collect()
+            level.iter().map(|p| read_one(rfd, dev, p)).collect()
         };
         for (p, raw) in level.iter().zip(&raws) {
             register(root, rules, p, raw);
@@ -156,6 +157,7 @@ fn walk(
 // classifies and observes the subtree root itself; None when there is nothing to walk
 fn enter(
     rfd: BorrowedFd<'_>,
+    dev: u64,
     dir: &RelPath,
     rules: &Rules,
     tree: &mut Tree,
@@ -178,6 +180,11 @@ fn enter(
         Err(e) => return Err(e),
     };
     let stat = sys::stat_key(fd.as_fd())?;
+    if stat.dev != dev {
+        tree.remove_subtree(dir, &mut removed);
+        emit(out, removed);
+        return Ok(None);
+    }
     let git_ro = class == Class::GitRo;
     let domain = if git_ro {
         Domain::GitRo
@@ -216,7 +223,8 @@ fn emit(out: &mut Option<&mut Vec<Change>>, changes: impl IntoIterator<Item = Ch
     }
 }
 
-fn read_one(rfd: BorrowedFd<'_>, p: &Pending) -> Raw {
+// other filesystems mounted inside the project are not entered: the watcher never reports their changes
+fn read_one(rfd: BorrowedFd<'_>, dev: u64, p: &Pending) -> Raw {
     let mut raw = Raw::default();
     let Ok(fd) = sys::open_beneath(rfd, &p.path, DIR_FLAGS) else {
         return raw;
@@ -229,6 +237,9 @@ fn read_one(rfd: BorrowedFd<'_>, p: &Pending) -> Raw {
     raw.ents.reserve(ents.len());
     for e in ents {
         let Some(kind) = e.kind else { continue };
+        if kind == Kind::Dir && e.stat.dev != dev {
+            continue;
+        }
         let link = match kind {
             Kind::Symlink => match read_link(fd.as_fd(), &e.name) {
                 Some(l) => Some(l),

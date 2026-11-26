@@ -120,18 +120,35 @@ impl Dirs {
 
     // a socket path that fits sun_path; the private tmp fallback covers very long home dirs
     pub fn ctl_socket(&self, role: &str, id: &str) -> io::Result<PathBuf> {
+        self.ctl_socket_candidates(role, id)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| io::Error::other("no control socket path"))
+    }
+
+    // every run dir whose socket path fits, in preference order
+    pub fn ctl_socket_candidates(&self, role: &str, id: &str) -> io::Result<Vec<PathBuf>> {
         let file = format!("{role}-{id}.sock");
+        let mut out = Vec::new();
+        let mut err = None;
         for dir in self.run_dirs() {
             let p = dir.join(&file);
             if p.as_os_str().len() <= SOCK_PATH_MAX {
-                ensure_private_dir(&dir)?;
-                return Ok(p);
+                match ensure_private_dir(&dir) {
+                    Ok(()) => out.push(p),
+                    Err(e) => err = Some(e),
+                }
             }
         }
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "control socket path is too long; set CSYNC_HOME to a shorter directory",
-        ))
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        Err(err.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "control socket path is too long; set CSYNC_HOME to a shorter directory",
+            )
+        }))
     }
 
     pub fn ctl_sockets(&self) -> Vec<PathBuf> {

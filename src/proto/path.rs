@@ -92,11 +92,21 @@ fn check_link(s: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-fn fold(s: &str) -> Cow<'_, str> {
-    if s.chars().any(|c| !c.to_lowercase().eq(std::iter::once(c))) {
-        Cow::Owned(s.to_lowercase())
+// apfs and hfs+ compare names after canonical decomposition, and case-insensitive ones after lowercasing too
+fn fold(s: &str, case: bool, norm: bool) -> Cow<'_, str> {
+    use unicode_normalization::{UnicodeNormalization, is_nfd_quick};
+    let s: Cow<'_, str> = if norm
+        && !s.is_ascii()
+        && is_nfd_quick(s.chars()) != unicode_normalization::IsNormalized::Yes
+    {
+        Cow::Owned(s.nfd().collect())
     } else {
         Cow::Borrowed(s)
+    };
+    if case && s.chars().any(|c| !c.to_lowercase().eq(std::iter::once(c))) {
+        Cow::Owned(s.to_lowercase())
+    } else {
+        s
     }
 }
 
@@ -109,12 +119,8 @@ impl Name {
         &self.0
     }
     // collision key for case-insensitive host volumes; identity when the host is case sensitive
-    pub fn fold_key(&self, case_fold: bool) -> Cow<'_, str> {
-        if case_fold {
-            fold(&self.0)
-        } else {
-            Cow::Borrowed(&self.0)
-        }
+    pub fn fold_key(&self, case_fold: bool, norm_fold: bool) -> Cow<'_, str> {
+        fold(&self.0, case_fold, norm_fold)
     }
 }
 
@@ -173,12 +179,8 @@ impl RelPath {
             || self.0 == dir.0
             || (self.0.starts_with(&*dir.0) && self.0.as_bytes().get(dir.0.len()) == Some(&b'/'))
     }
-    pub fn fold_key(&self, case_fold: bool) -> Cow<'_, str> {
-        if case_fold {
-            fold(&self.0)
-        } else {
-            Cow::Borrowed(&self.0)
-        }
+    pub fn fold_key(&self, case_fold: bool, norm_fold: bool) -> Cow<'_, str> {
+        fold(&self.0, case_fold, norm_fold)
     }
 }
 
@@ -387,16 +389,26 @@ mod tests {
     #[test]
     fn fold_keys() {
         let n = Name::new("ReadMe.MD").unwrap();
-        assert_eq!(n.fold_key(true), "readme.md");
-        assert_eq!(n.fold_key(false), "ReadMe.MD");
+        assert_eq!(n.fold_key(true, false), "readme.md");
+        assert_eq!(n.fold_key(false, false), "ReadMe.MD");
         assert!(matches!(
-            Name::new("lower").unwrap().fold_key(true),
+            Name::new("lower").unwrap().fold_key(true, true),
             Cow::Borrowed(_)
         ));
         assert_eq!(
-            Name::new("\u{c9}t\u{c9}").unwrap().fold_key(true),
+            Name::new("\u{c9}t\u{c9}").unwrap().fold_key(true, false),
             "\u{e9}t\u{e9}"
         );
+        let nfc = Name::new("caf\u{e9}").unwrap();
+        let nfd = Name::new("cafe\u{301}").unwrap();
+        let upper = Name::new("CAF\u{c9}").unwrap();
+        assert_ne!(nfc.fold_key(true, false), nfd.fold_key(true, false));
+        assert_eq!(nfc.fold_key(false, true), nfd.fold_key(false, true));
+        assert_ne!(upper.fold_key(false, true), nfd.fold_key(false, true));
+        assert_eq!(upper.fold_key(true, true), nfd.fold_key(true, true));
+        assert!(matches!(nfd.fold_key(false, true), Cow::Borrowed(_)));
+        let hangul = Name::new("\u{d55c}").unwrap();
+        assert_eq!(hangul.fold_key(false, true), "\u{1112}\u{1161}\u{11ab}");
     }
 
     #[test]

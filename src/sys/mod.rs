@@ -3,11 +3,16 @@ use crate::{
     proto::{Kind, Name, RelPath},
 };
 use crossbeam_channel::Sender;
+use rustc_hash::FxHashMap;
 use std::{
     io,
     os::fd::{BorrowedFd, OwnedFd},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -58,6 +63,68 @@ pub mod wflag {
     pub const RESCAN: u32 = 128;
     pub const OVERFLOW: u32 = 256;
 }
+const ECHO_TTL: Duration = Duration::from_secs(2);
+const ECHO_PURGE: usize = 1_024;
+
+struct Echo {
+    tmp: String,
+    left: u8,
+    until: Instant,
+}
+
+// the committer's renames from its own temp names: a watcher drops exactly these, nothing else
+#[derive(Default)]
+pub struct Echoes {
+    on: AtomicBool,
+    m: Mutex<FxHashMap<RelPath, Echo>>,
+}
+
+impl Echoes {
+    pub fn enable(&self) {
+        self.on.store(true, Ordering::Release);
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.on.load(Ordering::Acquire)
+    }
+
+    // moves: how many rename events name `path` (two for an exchange)
+    pub fn expect(&self, path: &RelPath, tmp: &str, moves: u8) {
+        if !self.on.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        let mut m = lock(&self.m);
+        if m.len() >= ECHO_PURGE {
+            m.retain(|_, e| e.until > now);
+        }
+        m.insert(
+            path.clone(),
+            Echo {
+                tmp: tmp.to_owned(),
+                left: moves,
+                until: now + ECHO_TTL,
+            },
+        );
+    }
+
+    // true when this rename of `path` paired with `tmp` is the one expected; consumes it
+    pub fn take(&self, path: &RelPath, tmp: &str) -> bool {
+        let mut m = lock(&self.m);
+        let Some(e) = m.get_mut(path) else {
+            return false;
+        };
+        if e.tmp != tmp || e.until <= Instant::now() {
+            return false;
+        }
+        e.left = e.left.saturating_sub(1);
+        if e.left == 0 {
+            m.remove(path);
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct WatchEvent {
     pub path: RelPath,
@@ -95,8 +162,19 @@ pub fn start_watcher_filtered(
     tx: Sender<Vec<WatchEvent>>,
     accept: Option<DirFilter>,
 ) -> io::Result<Box<dyn Watcher>> {
+    start_watcher_echoes(root, resume, tx, accept, Arc::default())
+}
+
+pub fn start_watcher_echoes(
+    root: &Path,
+    resume: Option<ResumeToken>,
+    tx: Sender<Vec<WatchEvent>>,
+    accept: Option<DirFilter>,
+    echoes: Arc<Echoes>,
+) -> io::Result<Box<dyn Watcher>> {
     #[cfg(target_os = "macos")]
     {
+        let _ = echoes;
         Ok(Box::new(macos::fsevents::FsEventsWatcher::start(
             root, resume, tx, accept,
         )?))
@@ -105,17 +183,120 @@ pub fn start_watcher_filtered(
     {
         let _ = resume;
         Ok(Box::new(linux::inotify::InotifyWatcher::start(
-            root, tx, accept,
+            root, tx, accept, echoes,
         )?))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (root, resume, tx, accept);
+        let _ = (root, resume, tx, accept, echoes);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "no file watcher on this platform",
         ))
     }
+}
+
+// (filesystem type, on a local disk, case sensitive) of the volume holding path
+#[cfg(target_os = "macos")]
+pub fn volume_of(path: &Path) -> io::Result<(String, bool, bool)> {
+    let st = rustix::fs::statfs(path)?;
+    let ty: Vec<u8> = st
+        .f_fstypename
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    let local = st.f_flags & libc::MNT_LOCAL as u32 != 0;
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: c is a valid nul-terminated path for the duration of the call.
+    let cs = unsafe { libc::pathconf(c.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    Ok((String::from_utf8_lossy(&ty).into_owned(), local, cs == 1))
+}
+
+// icloud drive and file provider placeholders (dataless files) fail to read instead of downloading on scan or hash
+pub fn keep_dataless() {
+    #[cfg(target_os = "macos")]
+    {
+        const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
+        const IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+        const IOPOL_MATERIALIZE_DATALESS_FILES_OFF: libc::c_int = 1;
+        unsafe extern "C" {
+            fn setiopolicy_np(
+                iotype: libc::c_int,
+                scope: libc::c_int,
+                policy: libc::c_int,
+            ) -> libc::c_int;
+        }
+        // SAFETY: setiopolicy_np takes three plain ints and only changes this process's io policy.
+        unsafe {
+            setiopolicy_np(
+                IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+                IOPOL_SCOPE_PROCESS,
+                IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+            );
+        }
+    }
+}
+
+// a replacement written through a temp keeps the old file's extended attributes and acl (tags, quarantine, forks)
+pub fn copy_xattrs(from: BorrowedFd<'_>, to: BorrowedFd<'_>) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: both fds are open for the call and a null state is allowed by fcopyfile.
+        let r = unsafe {
+            libc::fcopyfile(
+                from.as_raw_fd(),
+                to.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_XATTR | libc::COPYFILE_ACL,
+            )
+        };
+        if r != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // linux caps a name list and a value at 64 KiB each
+        const XATTR_MAX: usize = 1 << 16;
+        let mut names = vec![0u8; XATTR_MAX];
+        let got = rustix::fs::flistxattr(from, &mut names[..])?;
+        if got == 0 {
+            return Ok(());
+        }
+        let mut rest = &names[..got.min(XATTR_MAX)];
+        let mut val = vec![0u8; XATTR_MAX];
+        while let Ok(n) = std::ffi::CStr::from_bytes_until_nul(rest) {
+            rest = &rest[n.to_bytes_with_nul().len()..];
+            // security and trusted names may be refused to an unprivileged host; the rest still copy
+            if let Ok(l) = rustix::fs::fgetxattr(from, n, &mut val[..]) {
+                let v = &val[..l.min(XATTR_MAX)];
+                let _ = rustix::fs::fsetxattr(to, n, v, rustix::fs::XattrFlags::empty());
+            }
+        }
+        Ok(())
+    }
+}
+
+// whether an entry that resolves under `name` is stored under exactly that spelling (folding volumes resolve others too)
+pub fn spelled_at(dir: BorrowedFd<'_>, name: &str) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    if macos::dir::stored_name_at(dir, name)? == name.as_bytes() {
+        return Ok(true);
+    }
+    // the slow path also settles hard links, whose stored name may be another link's
+    let d = rustix::fs::openat(
+        dir,
+        ".",
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )?;
+    let mut ents = Vec::new();
+    read_dir_plus(std::os::fd::AsFd::as_fd(&d), &mut ents)?;
+    Ok(ents.iter().any(|e| e.name.as_str() == name))
 }
 
 pub fn read_dir_plus(dir: BorrowedFd<'_>, out: &mut Vec<DirEntryPlus>) -> io::Result<()> {

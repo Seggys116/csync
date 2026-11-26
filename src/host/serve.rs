@@ -12,13 +12,70 @@ use crossbeam_channel::Receiver;
 use rustix::fs::OFlags;
 use std::{
     os::fd::{AsFd, BorrowedFd, OwnedFd},
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::{Duration, Instant},
 };
 
 // beyond this a delta would need the whole file in memory; such files use range fetches anyway
 const DELTA_FILE_MAX: u64 = 64 << 20;
 const MANY_ITEM_MAX: u64 = 1 << 20;
 const MANY_SLACK: usize = 64 << 10;
+const KEEP_MAX: usize = 16;
+const KEEP_TTL: Duration = Duration::from_secs(60);
+
+struct KeptFd {
+    hash: Hash32,
+    meta: Meta,
+    stat: StatKey,
+    fd: Arc<OwnedFd>,
+    used: Instant,
+}
+
+// git keeps reading a pack it opened even after gc or repack deleted it; the last pack files served
+// stay open here by hash, so a guest still reading one gets what a local reader would
+#[derive(Default)]
+pub(crate) struct Kept(Mutex<Vec<KeptFd>>);
+
+impl Kept {
+    fn keep(&self, hash: Hash32, meta: &Meta, stat: StatKey, fd: &Arc<OwnedFd>) {
+        let now = Instant::now();
+        let mut v = super::lock(&self.0);
+        if let Some(k) = v.iter_mut().find(|k| k.hash == hash) {
+            k.used = now;
+            return;
+        }
+        v.retain(|k| now.duration_since(k.used) < KEEP_TTL);
+        if v.len() >= KEEP_MAX
+            && let Some(i) = (0..v.len()).min_by_key(|&i| v[i].used)
+        {
+            v.swap_remove(i);
+        }
+        v.push(KeptFd {
+            hash,
+            meta: meta.clone(),
+            stat,
+            fd: fd.clone(),
+            used: now,
+        });
+    }
+
+    fn find(&self, hash: &Hash32) -> Option<(Meta, StatKey, Arc<OwnedFd>)> {
+        let mut v = super::lock(&self.0);
+        let i = v.iter().position(|k| &k.hash == hash)?;
+        if !unchanged(v[i].fd.as_fd(), &v[i].stat) {
+            v.swap_remove(i);
+            return None;
+        }
+        let k = &mut v[i];
+        k.used = Instant::now();
+        Some((k.meta.clone(), k.stat, k.fd.clone()))
+    }
+
+    pub(crate) fn prune(&self) {
+        let now = Instant::now();
+        super::lock(&self.0).retain(|k| now.duration_since(k.used) < KEEP_TTL);
+    }
+}
 
 pub(crate) struct FetchJob {
     pub(crate) guest: Arc<Guest>,
@@ -170,6 +227,33 @@ fn stream_parts<'a>(
     }
 }
 
+// the indexed file, or for a version the index no longer has, a .git file kept from an earlier fetch
+fn source(
+    core: &Core,
+    path: &RelPath,
+    want: Option<Hash32>,
+) -> Result<(Meta, StatKey, Arc<OwnedFd>), WireErr> {
+    let live = readable(core, path).and_then(|(meta, stat)| {
+        if want.is_some_and(|h| meta.hash != Some(h)) {
+            return Err(WireErr::Gone);
+        }
+        Ok((meta, stat, Arc::new(open_verified(core, path, &stat)?)))
+    });
+    match live {
+        Ok((meta, stat, fd)) => {
+            let packed = path.as_str().contains("/objects/pack/");
+            if let Some(h) = meta.hash.filter(|_| meta.git_ro && packed) {
+                core.kept.keep(h, &meta, stat, &fd);
+            }
+            Ok((meta, stat, fd))
+        }
+        Err(e @ (WireErr::Gone | WireErr::NotFound)) => {
+            want.and_then(|h| core.kept.find(&h)).ok_or(e)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fetch(
     core: &Core,
@@ -180,12 +264,8 @@ fn fetch(
     have: Option<&[ChunkSig]>,
     range: Option<(u64, u32)>,
 ) -> Result<(), WireErr> {
-    let (meta, stat) = readable(core, path)?;
-    if want.is_some_and(|h| meta.hash != Some(h)) {
-        return Err(WireErr::Gone);
-    }
+    let (meta, stat, fd) = source(core, path, want)?;
     let hash = meta.hash.ok_or(WireErr::Invalid)?;
-    let fd = open_verified(core, path, &stat)?;
     let size = meta.size;
 
     if let Some((off, len)) = range {

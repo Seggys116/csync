@@ -77,7 +77,32 @@ fn same_user(c: &UnixStream) -> io::Result<()> {
     Ok(())
 }
 
+// the first candidate that takes a socket wins; vm shared folders (virtiofs, 9p) refuse unix sockets
+pub fn serve_first(paths: &[PathBuf], handler: Handler) -> io::Result<CtlServer> {
+    let mut last = io::Error::new(io::ErrorKind::InvalidInput, "no control socket path");
+    for path in paths {
+        match listen(path) {
+            Ok(l) => return spawn(path, l, handler),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists
+                ) =>
+            {
+                return Err(e);
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 pub fn serve(path: &Path, handler: Handler) -> io::Result<CtlServer> {
+    let l = listen(path)?;
+    spawn(path, l, handler)
+}
+
+fn listen(path: &Path) -> io::Result<UnixListener> {
     let dir = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -105,7 +130,14 @@ pub fn serve(path: &Path, handler: Handler) -> io::Result<CtlServer> {
         Err(e) => return Err(e),
     }
     let l = UnixListener::bind(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(l)
+}
+
+fn spawn(path: &Path, l: UnixListener, handler: Handler) -> io::Result<CtlServer> {
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let thread = thread::Builder::new()
@@ -168,4 +200,34 @@ pub fn request(path: &Path, req: &CtlReq) -> io::Result<String> {
     let mut out = String::new();
     (&c).take(RESP_MAX).read_to_string(&mut out)?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn serve_first_skips_a_dir_that_cannot_hold_the_socket() {
+        let base = std::env::temp_dir().join(format!("csync-ctl-{}", std::process::id()));
+        let good = base.join("run");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&good)
+            .unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let bad = base.join("missing").join("t.sock");
+        let ok = good.join("t.sock");
+        let srv = serve_first(&[bad.clone(), ok.clone()], Box::new(|_| "pong\n".into())).unwrap();
+        assert_eq!(request(&ok, &CtlReq::Status).unwrap(), "pong\n");
+        assert!(!bad.exists());
+        assert!(matches!(
+            serve_first(std::slice::from_ref(&ok), Box::new(|_| String::new())).map(|_| ()),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse
+        ));
+        drop(srv);
+        assert!(!ok.exists());
+        let _ = fs::remove_dir_all(&base);
+    }
 }

@@ -30,6 +30,7 @@ const RESCAN_QUIET: Duration = Duration::from_millis(200);
 const RESCAN_MAX: Duration = Duration::from_secs(5);
 const SAVE_EVERY: Duration = Duration::from_secs(60);
 const EXC_DEBOUNCE: Duration = Duration::from_millis(200);
+const RULE_SETTLE: Duration = Duration::from_millis(100);
 const PATHS_MAX: usize = 1 << 18;
 const COOKIES_MAX: usize = 4_096;
 // below this a batch of stats is cheaper serial than waking and spinning the rayon pool
@@ -302,8 +303,21 @@ fn unreadable(root: BorrowedFd<'_>, p: &RelPath) -> bool {
     }
 }
 
+fn rule_stat(root: BorrowedFd<'_>, p: &RelPath) -> Option<StatKey> {
+    let (d, n) = p.split_last()?;
+    let dp = RelPath::new(d).ok()?;
+    let fd = sys::open_beneath(root, &dp, OFlags::RDONLY | OFlags::DIRECTORY).ok()?;
+    sys::stat_key_at(fd.as_fd(), n).ok()
+}
+
 // probes arrive sorted, so siblings are adjacent: each parent directory is opened once per batch
-fn look_all(root: BorrowedFd<'_>, probes: &[Probe]) -> Vec<Seen> {
+#[derive(Clone, Copy)]
+struct Vol {
+    folds: bool,
+    dev: u64,
+}
+
+fn look_all(root: BorrowedFd<'_>, probes: &[Probe], vol: Vol) -> Vec<Seen> {
     let mut groups: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
     for i in 1..=probes.len() {
@@ -313,7 +327,7 @@ fn look_all(root: BorrowedFd<'_>, probes: &[Probe]) -> Vec<Seen> {
             start = i;
         }
     }
-    let run = |&(a, b): &(usize, usize)| look_dir(root, &probes[a..b]);
+    let run = |&(a, b): &(usize, usize)| look_dir(root, &probes[a..b], vol);
     if probes.len() >= PAR_MIN && groups.len() > 1 {
         groups
             .par_iter()
@@ -327,7 +341,7 @@ fn look_all(root: BorrowedFd<'_>, probes: &[Probe]) -> Vec<Seen> {
     }
 }
 
-fn look_dir(root: BorrowedFd<'_>, probes: &[Probe]) -> Vec<Seen> {
+fn look_dir(root: BorrowedFd<'_>, probes: &[Probe], vol: Vol) -> Vec<Seen> {
     let dir = probes
         .first()
         .and_then(|p| p.path.split_last())
@@ -338,7 +352,33 @@ fn look_dir(root: BorrowedFd<'_>, probes: &[Probe]) -> Vec<Seen> {
         Some(Err(e)) => return probes.iter().map(|_| skip(&e)).collect(),
         None => return probes.iter().map(|_| Seen::Skip).collect(),
     };
-    probes.iter().map(|p| look(dfd.as_fd(), p)).collect()
+    probes
+        .iter()
+        .map(|p| {
+            // a volume mounted inside the root is not synced; the watcher never sees into it
+            match look(dfd.as_fd(), p) {
+                // only directories: overlayfs reports files with the device of the layer holding them
+                Seen::Present {
+                    kind: Kind::Dir,
+                    stat,
+                    ..
+                } if stat.dev != vol.dev => Seen::Absent,
+                Seen::Present { .. } if vol.folds && respelled(dfd.as_fd(), p) => Seen::Absent,
+                s => s,
+            }
+        })
+        .collect()
+}
+
+// on folding volumes a name that changed only in case or normalisation still resolves; only a rename can cause that
+fn respelled(dfd: BorrowedFd<'_>, p: &Probe) -> bool {
+    if p.prior.is_some() && p.flags & (wflag::CREATED | wflag::RENAMED | wflag::REMOVED) == 0 {
+        return false;
+    }
+    let Some((_, name)) = p.path.split_last() else {
+        return false;
+    };
+    matches!(sys::spelled_at(dfd, name), Ok(false))
 }
 
 // fd or memory exhaustion and interrupted calls pass; anything else (permissions) leaves the path unsynced
@@ -452,7 +492,8 @@ pub(crate) struct Applier {
     exc: FxHashMap<RelPath, Vec<RelPath>>,
     exc_pending: FxHashSet<RelPath>,
     exc_due: Option<Instant>,
-    retry: Vec<RelPath>,
+    rule_seen: FxHashMap<RelPath, (Option<StatKey>, Instant)>,
+    retry: Vec<(RelPath, u32)>,
     retry_due: Option<Instant>,
     last_save: Instant,
 }
@@ -475,6 +516,7 @@ impl Applier {
             exc: FxHashMap::default(),
             exc_pending: FxHashSet::default(),
             exc_due: None,
+            rule_seen: FxHashMap::default(),
             retry: Vec::new(),
             retry_due: None,
             last_save: Instant::now(),
@@ -482,7 +524,7 @@ impl Applier {
     }
 
     pub(crate) fn run(mut self) {
-        self.recompute_excludes();
+        let _ = self.recompute_excludes();
         let mut co = Coalescer::default();
         loop {
             let save_due = self
@@ -579,7 +621,8 @@ impl Applier {
         if paths.is_empty() {
             return;
         }
-        self.retry.extend(paths);
+        self.retry
+            .extend(paths.into_iter().map(|p| (p, wflag::MODIFIED)));
         self.retry_due.get_or_insert(Instant::now() + RETRY_DELAY);
     }
 
@@ -587,48 +630,64 @@ impl Applier {
         self.retry_due = None;
         self.retry
             .drain(..)
-            .map(|path| WatchEvent {
+            .map(|(path, flags)| WatchEvent {
                 path,
-                flags: wflag::MODIFIED,
+                flags,
                 cookie: 0,
             })
             .collect()
     }
 
-    fn rescan_dirs(&self, dirs: Vec<RelPath>, watch: Option<&mut Vec<RelPath>>) {
-        let dirs = outermost(dirs);
+    fn rescan_dirs(&mut self, dirs: Vec<RelPath>) {
+        let mut dirs = outermost(dirs);
         if dirs.is_empty() {
             return;
         }
-        let core = &self.core;
+        // armed before the walk, as at startup, so a write the walk has passed still raises an event;
+        // outside the locks, since the watcher's dir filter reads the rules
+        for d in &dirs {
+            let _ = self.watcher.watch_dir(d);
+        }
+        let core = self.core.clone();
         let mut rules = core.rules_w();
         let mut tree = core.tree();
+        // a committer mid-rename has moved the disk but not the index yet; holds only begin under the tree lock
+        {
+            let held = super::lock(&core.inflight);
+            let before = self.retry.len();
+            dirs.retain(|d| {
+                let busy = held.iter().any(|h| h.starts_with(d) || d.starts_with(h));
+                if busy {
+                    self.retry.push((d.clone(), wflag::RESCAN));
+                }
+                !busy
+            });
+            if self.retry.len() > before {
+                self.retry_due.get_or_insert(Instant::now() + RETRY_DELAY);
+            }
+        }
         let mut out = Vec::new();
         for d in &dirs {
             let _ = scan::scan_subtree(&core.root_path, d, &mut rules, &mut tree, &mut out);
         }
         drop(rules);
-        if let Some(w) = watch {
-            for c in &out {
-                if let Change::Upsert { path, meta } = c
-                    && meta.kind == Kind::Dir
-                {
-                    w.push(path.clone());
-                }
-            }
-        }
         core.publish_locked(&tree, out, None);
     }
 
     pub(crate) fn process(&mut self, b: Batch) {
         let core = self.core.clone();
         if b.rescan_all {
-            self.rescan_dirs(vec![RelPath::root()], None);
-            self.recompute_excludes();
+            self.rescan_dirs(vec![RelPath::root()]);
+            // rules the walk changed may unhide excluded dirs, which the walk could not watch
+            let back = self.recompute_excludes();
+            self.rescan_dirs(back);
             return;
         }
-        let (scopes, mut notices) = self.rule_changes(&b.paths);
+        let (scopes, mut notices, unsettled) = self.rule_changes(&b.paths);
         let mut paths = b.paths;
+        if !unsettled.is_empty() {
+            paths.retain(|(p, _)| !unsettled.contains(p));
+        }
         let mut moved: FxHashSet<RelPath> = FxHashSet::default();
         for (from, to) in &b.pairs {
             if self.rename_pair(from, to) {
@@ -640,12 +699,15 @@ impl Applier {
             paths.retain(|(p, _)| !moved.contains(p));
         }
 
-        let mut unhidden = Vec::new();
-        let rule_changed = !scopes.is_empty();
         let mut dirs = scopes;
+        // the new rules decide which dirs a watch may cover before the rescan arms it
+        if !dirs.is_empty() {
+            let back = self.recompute_excludes();
+            dirs.extend(back);
+        }
         dirs.extend(b.rescans);
         if !dirs.is_empty() {
-            self.rescan_dirs(dirs, Some(&mut unhidden));
+            self.rescan_dirs(dirs);
         }
 
         let probes: Vec<Probe> = {
@@ -661,17 +723,27 @@ impl Applier {
                 })
                 .collect()
         };
-        let seen = look_all(core.root.as_fd(), &probes);
+        let seen = look_all(
+            core.root.as_fd(),
+            &probes,
+            Vol {
+                folds: core.fs.case_fold || core.fs.norm_fold,
+                dev: core.root_id.0,
+            },
+        );
 
         let mut retry = Vec::new();
         let mut points = Vec::new();
         {
-            let rules = core.rules_r();
+            let mut rules = core.rules_w();
             let mut tree = core.tree();
+            let held = super::lock(&core.inflight);
             let mut out = Vec::new();
             for (p, s) in probes.iter().zip(seen) {
-                // the committer touched this entry after we sampled it, so sample again
-                if p.prior.as_ref().map(|x| x.3) != tree.get(&p.path).map(|e| e.seq) {
+                // the committer touched this entry after we sampled it, or is still swapping it, so sample again
+                if p.prior.as_ref().map(|x| x.3) != tree.get(&p.path).map(|e| e.seq)
+                    || held.iter().any(|h| p.path.starts_with(h))
+                {
                     retry.push(p.path.clone());
                     continue;
                 }
@@ -715,32 +787,30 @@ impl Applier {
                     }
                 }
             }
+            drop(held);
+            // new directories go out in the same batch, so a guest never sees a ref before the object it names
+            for d in outermost(points) {
+                let _ = scan::scan_subtree(&core.root_path, &d, &mut rules, &mut tree, &mut out);
+            }
             drop(rules);
             core.publish_locked(&tree, out, None);
         }
-        if !points.is_empty() {
-            self.rescan_dirs(points, None);
-        }
         self.requeue(retry);
 
-        if !unhidden.is_empty() {
-            for d in outermost(unhidden) {
-                let _ = self.watcher.watch_dir(&d);
-            }
-        }
-        if rule_changed {
-            self.recompute_excludes();
-        }
         for n in notices.drain(..) {
             core.notice(n, true);
         }
     }
 
-    // rule files, repo markers and git index files; returns subtrees whose classification may have changed
-    fn rule_changes(&mut self, paths: &[(RelPath, u32)]) -> (Vec<RelPath>, Vec<Notice>) {
+    // rule files, repo markers and git index files; returns rescoped subtrees and rule files still being written
+    fn rule_changes(
+        &mut self,
+        paths: &[(RelPath, u32)],
+    ) -> (Vec<RelPath>, Vec<Notice>, Vec<RelPath>) {
         let core = self.core.clone();
         let mut scopes = Vec::new();
         let mut notices = Vec::new();
+        let mut unsettled = Vec::new();
         let repos = core.rules_r().repos();
         for (p, _) in paths {
             let Some((dir, name)) = p.split_last() else {
@@ -778,6 +848,10 @@ impl Applier {
             if !is_rule {
                 continue;
             }
+            if !self.rule_settled(p) {
+                unsettled.push(p.clone());
+                continue;
+            }
             let text = read_rule(core.root.as_fd(), p);
             if text.is_none() && unreadable(core.root.as_fd(), p) {
                 continue;
@@ -790,7 +864,28 @@ impl Applier {
                 scopes.push(scope);
             }
         }
-        (scopes, notices)
+        (scopes, notices, unsettled)
+    }
+
+    // a rule file written in place is briefly empty, so neither its rules nor its content go out until it is still
+    fn rule_settled(&mut self, p: &RelPath) -> bool {
+        let st = rule_stat(self.core.root.as_fd(), p);
+        let now = Instant::now();
+        let since = match self.rule_seen.get(p) {
+            Some(&(seen, since)) if seen == st => since,
+            _ => {
+                self.rule_seen.insert(p.clone(), (st, now));
+                now
+            }
+        };
+        if now >= since + RULE_SETTLE {
+            self.rule_seen.remove(p);
+            return true;
+        }
+        self.retry.push((p.clone(), wflag::MODIFIED));
+        let due = since + RULE_SETTLE;
+        self.retry_due = Some(self.retry_due.map_or(due, |d| d.min(due)));
+        false
     }
 
     // git rewrites its index on most commands; only a changed tracked-but-ignored set costs a rescan
@@ -824,12 +919,13 @@ impl Applier {
             self.core.rules_w().set_repo_exceptions(&wt, list);
             dirs.push(wt);
         }
-        self.rescan_dirs(dirs, None);
+        self.rescan_dirs(dirs);
     }
 
     fn rename_pair(&mut self, from: &RelPath, to: &RelPath) -> bool {
         let core = self.core.clone();
         let root = core.root.as_fd();
+        let folds = core.fs.case_fold || core.fs.norm_fold;
         let lstat = |p: &RelPath| -> Option<StatKey> {
             let (d, n) = p.split_last()?;
             let dfd = sys::open_beneath(
@@ -838,7 +934,8 @@ impl Applier {
                 OFlags::RDONLY | OFlags::DIRECTORY,
             )
             .ok()?;
-            sys::stat_key_at(dfd.as_fd(), n).ok()
+            let st = sys::stat_key_at(dfd.as_fd(), n).ok()?;
+            (!folds || sys::spelled_at(dfd.as_fd(), n).unwrap_or(true)).then_some(st)
         };
         if lstat(from).is_some() {
             return false;
@@ -846,6 +943,12 @@ impl Applier {
         let Some(st) = lstat(to) else { return false };
         let mut rules = core.rules_w();
         let mut tree = core.tree();
+        if super::lock(&core.inflight)
+            .iter()
+            .any(|h| from.starts_with(h) || to.starts_with(h))
+        {
+            return false;
+        }
         let Some(fe) = tree.get(from).cloned() else {
             return false;
         };
@@ -900,19 +1003,20 @@ impl Applier {
         true
     }
 
-    // the largest ignored top-level directories, which the watcher then skips entirely
-    fn recompute_excludes(&mut self) {
+    // the largest ignored top-level directories, which the watcher then skips entirely; returns the
+    // ones now synced, which no watch covers until a rescan arms one
+    fn recompute_excludes(&mut self) -> Vec<RelPath> {
         let core = self.core.clone();
         let Ok(rfd) = sys::open_beneath(
             core.root.as_fd(),
             &RelPath::root(),
             OFlags::RDONLY | OFlags::DIRECTORY,
         ) else {
-            return;
+            return Vec::new();
         };
         let mut ents = Vec::new();
         if sys::read_dir_plus(rfd.as_fd(), &mut ents).is_err() {
-            return;
+            return Vec::new();
         }
         let candidates: Vec<RelPath> = {
             let rules = core.rules_r();
@@ -948,9 +1052,14 @@ impl Applier {
             .map(|(_, p)| p)
             .collect();
         list.sort_unstable();
-        if list != self.excludes && self.watcher.set_excludes(&list).is_ok() {
-            self.excludes = list;
+        if list == self.excludes || self.watcher.set_excludes(&list).is_err() {
+            return Vec::new();
         }
+        let old = std::mem::replace(&mut self.excludes, list);
+        let rules = core.rules_r();
+        old.into_iter()
+            .filter(|p| !self.excludes.contains(p) && rules.classify(p, true) != Class::Ignored)
+            .collect()
     }
 }
 
@@ -1071,6 +1180,81 @@ mod tests {
         assert_eq!(top_missing(&t, &rp("z")), Some(rp("z")));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_case_only_renames_replace_the_old_spelling() {
+        use std::fs;
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-respell-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("Src")).unwrap();
+        fs::write(root.join("Src/main.c"), "m\n").unwrap();
+        fs::write(root.join("foo.txt"), "foo\n").unwrap();
+        fs::write(root.join("cafe\u{301}.txt"), "nfd\n").unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let _clean = Clean(root.clone());
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(1024);
+        let watcher = sys::start_watcher_filtered(&root, None, tx.clone(), None).unwrap();
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core =
+            Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        if !core.fs.case_fold {
+            return;
+        }
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let idx = root.with_extension("index");
+        let _clean_idx = Clean(idx.clone());
+        let app = Applier::new(core.clone(), watcher, rx, stop_rx, idx);
+        let h = std::thread::spawn(move || app.run());
+        fs::rename(root.join("foo.txt"), root.join("FOO.txt")).unwrap();
+        fs::rename(root.join("Src"), root.join("SRC")).unwrap();
+        fs::rename(root.join("cafe\u{301}.txt"), root.join("caf\u{e9}.txt")).unwrap();
+        fs::write(root.join(".DS_Store"), "finder").unwrap();
+        fs::write(root.join("SRC/._main.c"), "appledouble").unwrap();
+        let want = [
+            ("FOO.txt", true),
+            ("foo.txt", false),
+            ("SRC/main.c", true),
+            ("Src", false),
+            ("Src/main.c", false),
+            ("caf\u{e9}.txt", true),
+            ("cafe\u{301}.txt", false),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ok = {
+                let t = core.tree();
+                want.iter()
+                    .all(|&(p, there)| t.get(&rp(p)).is_some() == there)
+            };
+            if ok {
+                break;
+            }
+            assert!(Instant::now() < deadline, "index kept an old spelling");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let t = core.tree();
+        assert!(t.get(&rp(".DS_Store")).is_none());
+        assert!(t.get(&rp("SRC/._main.c")).is_none());
+        assert!(t.get(&rp("foo.txt")).is_none());
+        drop(t);
+        let _ = stop_tx.send(());
+        h.join().unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn host_writes_inside_a_dir_the_committer_moved_are_indexed() {
@@ -1124,7 +1308,7 @@ mod tests {
                 to_expect: Expect::Absent,
                 body: None,
             };
-            assert!(exec(&core, op, Payload::None, Some(7)).is_ok());
+            assert!(exec(&core, op, Payload::None, None).is_ok());
             if i % 2 == 1 {
                 std::thread::sleep(Duration::from_millis(30));
             }
@@ -1144,6 +1328,320 @@ mod tests {
         }
         let _ = stop_tx.send(());
         h.join().unwrap();
+    }
+
+    // a sample taken mid-swap must not reach a guest the committer then leaves out of its own record
+    #[test]
+    fn applier_retries_paths_the_committer_holds() {
+        use crate::host::commit::Hold;
+        use std::fs;
+        struct NoWatch;
+        impl Watcher for NoWatch {
+            fn set_excludes(&mut self, _: &[RelPath]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn watch_dir(&mut self, _: &RelPath) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn unwatch_dir(&mut self, _: &RelPath) {}
+            fn resume_token(&self) -> Option<sys::ResumeToken> {
+                None
+            }
+        }
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-hold-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("d")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let _clean = Clean(root.clone());
+        fs::write(root.join("d/f.txt"), "old body\n").unwrap();
+        fs::write(root.join("d/f.txt.tmp"), "new\n").unwrap();
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core =
+            Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut app = Applier::new(
+            core.clone(),
+            Box::new(NoWatch),
+            rx,
+            stop_rx,
+            root.join("index"),
+        );
+        let (f, tmp) = (rp("d/f.txt"), rp("d/f.txt.tmp"));
+        let hash = |p: &RelPath| core.tree().get(p).and_then(|e| e.meta.hash);
+        let batch = |paths: Vec<RelPath>| Batch {
+            paths: paths.into_iter().map(|p| (p, wflag::MODIFIED)).collect(),
+            pairs: Vec::new(),
+            rescans: Vec::new(),
+            rescan_all: false,
+        };
+        let (old, new) = (
+            Some(*blake3::hash(b"old body\n").as_bytes()),
+            Some(*blake3::hash(b"new\n").as_bytes()),
+        );
+        {
+            let _hold = Hold::new(&core, [Some(&tmp), Some(&f)]);
+            fs::write(root.join("d/f.txt.tmp"), "old body\n").unwrap();
+            fs::write(root.join("d/f.txt"), "new\n").unwrap();
+            app.process(batch(vec![tmp.clone(), f.clone()]));
+            assert_eq!(hash(&tmp), new, "a held temp was indexed mid-swap");
+            assert_eq!(hash(&f), old, "a held target was indexed mid-swap");
+        }
+        let again: Vec<RelPath> = app.take_retries().into_iter().map(|e| e.path).collect();
+        assert_eq!(again.len(), 2);
+        app.process(batch(again));
+        assert_eq!((hash(&tmp), hash(&f)), (old, new));
+
+        // cargo vendor: a rescan of a new subdirectory races the rename of its staging parent
+        let (sx, vx, tests) = (rp("d/s"), rp("d/v"), rp("d/s/tests"));
+        fs::create_dir_all(root.join("d/s/tests")).unwrap();
+        fs::write(root.join("d/s/tests/t.rs"), "t\n").unwrap();
+        app.process(Batch {
+            rescans: vec![sx.clone()],
+            ..batch(Vec::new())
+        });
+        assert!(core.tree().get(&rp("d/s/tests/t.rs")).is_some());
+        {
+            let _hold = Hold::new(&core, [Some(&sx), Some(&vx)]);
+            fs::rename(root.join("d/s"), root.join("d/v")).unwrap();
+            app.process(Batch {
+                rescans: vec![tests.clone()],
+                ..batch(Vec::new())
+            });
+            assert!(
+                core.tree().get(&tests).is_some(),
+                "a rescan dropped a subtree the committer is still moving"
+            );
+        }
+        let again = app.take_retries();
+        assert_eq!(
+            again.iter().map(|e| (&e.path, e.flags)).collect::<Vec<_>>(),
+            [(&tests, wflag::RESCAN)]
+        );
+    }
+
+    #[test]
+    fn a_dir_a_rule_stops_ignoring_is_watched_before_its_scan() {
+        use std::fs;
+        // a host write that lands as the watch on scratch/ arms is seen only by a scan that follows it
+        struct Arming {
+            root: PathBuf,
+            rules: Arc<std::sync::RwLock<Rules>>,
+            excludes: Vec<RelPath>,
+            fired: bool,
+        }
+        impl Watcher for Arming {
+            fn set_excludes(&mut self, dirs: &[RelPath]) -> std::io::Result<()> {
+                self.excludes = dirs.to_vec();
+                Ok(())
+            }
+            fn watch_dir(&mut self, dir: &RelPath) -> std::io::Result<()> {
+                // the inotify watcher's dir filter reads the rules
+                assert!(
+                    self.rules.try_read().is_ok(),
+                    "a watch armed under the rules lock"
+                );
+                let s = rp("scratch");
+                if !self.fired
+                    && s.starts_with(dir)
+                    && !self.excludes.iter().any(|e| s.starts_with(e))
+                {
+                    self.fired = true;
+                    fs::write(self.root.join("scratch/h.txt"), "new body\n")?;
+                }
+                Ok(())
+            }
+            fn unwatch_dir(&mut self, _: &RelPath) {}
+            fn resume_token(&self) -> Option<sys::ResumeToken> {
+                None
+            }
+        }
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-unhide-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("scratch")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let _clean = Clean(root.clone());
+        fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
+        fs::write(root.join("scratch/h.txt"), "old\n").unwrap();
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core = Arc::new(
+            Core::new(
+                root.clone(),
+                Name::new("t").unwrap(),
+                tree,
+                rules.clone(),
+                tx,
+            )
+            .unwrap(),
+        );
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let watcher = Arming {
+            root: root.clone(),
+            rules,
+            excludes: Vec::new(),
+            fired: false,
+        };
+        let mut app = Applier::new(
+            core.clone(),
+            Box::new(watcher),
+            rx,
+            stop_rx,
+            root.join("index"),
+        );
+        app.recompute_excludes();
+        assert_eq!(app.excludes, [rp("scratch")]);
+        assert!(core.tree().get(&rp("scratch/h.txt")).is_none());
+
+        fs::write(root.join(".gitignore"), "# none\n").unwrap();
+        app.process(Batch {
+            paths: vec![(rp(".gitignore"), wflag::MODIFIED)],
+            pairs: Vec::new(),
+            rescans: Vec::new(),
+            rescan_all: false,
+        });
+        std::thread::sleep(RULE_SETTLE);
+        let again = app.take_retries();
+        app.process(Batch {
+            paths: again.into_iter().map(|e| (e.path, e.flags)).collect(),
+            pairs: Vec::new(),
+            rescans: Vec::new(),
+            rescan_all: false,
+        });
+        assert!(app.excludes.is_empty());
+        assert_eq!(
+            core.tree()
+                .get(&rp("scratch/h.txt"))
+                .and_then(|e| e.meta.hash),
+            Some(*blake3::hash(b"new body\n").as_bytes()),
+            "a write made as the watch armed was never indexed"
+        );
+    }
+
+    #[test]
+    fn a_rule_file_caught_mid_write_unignores_nothing() {
+        use std::fs;
+        struct NoWatch;
+        impl Watcher for NoWatch {
+            fn set_excludes(&mut self, _: &[RelPath]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn watch_dir(&mut self, _: &RelPath) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn unwatch_dir(&mut self, _: &RelPath) {}
+            fn resume_token(&self) -> Option<sys::ResumeToken> {
+                None
+            }
+        }
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-midrule-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("target")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let _clean = Clean(root.clone());
+        let full = "target/\n*.log\n";
+        fs::write(root.join(".gitignore"), full).unwrap();
+        fs::write(root.join("build.log"), "secret\n").unwrap();
+        fs::write(root.join("target/out.o"), "obj\n").unwrap();
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core =
+            Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut app = Applier::new(
+            core.clone(),
+            Box::new(NoWatch),
+            rx,
+            stop_rx,
+            root.join("index"),
+        );
+        let batch = |paths: Vec<(RelPath, u32)>| Batch {
+            paths,
+            pairs: Vec::new(),
+            rescans: Vec::new(),
+            rescan_all: false,
+        };
+        let leaked = |core: &Core| {
+            let t = core.tree();
+            ["build.log", "target", "target/out.o"]
+                .into_iter()
+                .filter(|p| t.get(&rp(p)).is_some())
+                .collect::<Vec<_>>()
+        };
+        let hash = |core: &Core| core.tree().get(&rp(".gitignore")).and_then(|e| e.meta.hash);
+        let before = hash(&core);
+        // fs::write truncates before it writes, and the watcher can wake in between
+        fs::write(root.join(".gitignore"), "").unwrap();
+        app.process(batch(vec![(rp(".gitignore"), wflag::MODIFIED)]));
+        assert_eq!(
+            leaked(&core),
+            Vec::<&str>::new(),
+            "a half-written rule file was applied"
+        );
+        assert_eq!(
+            hash(&core),
+            before,
+            "a half-written rule file was published"
+        );
+        let edited = "target/\n*.log\n*.tmp\n";
+        fs::write(root.join(".gitignore"), edited).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while hash(&core) == before || !app.retry.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the settled rule file was never applied"
+            );
+            std::thread::sleep(RULE_SETTLE / 4);
+            let again = app.take_retries();
+            app.process(batch(
+                again.into_iter().map(|e| (e.path, e.flags)).collect(),
+            ));
+            assert_eq!(
+                leaked(&core),
+                Vec::<&str>::new(),
+                "a changing rule file was applied"
+            );
+        }
+        assert_eq!(
+            hash(&core),
+            Some(*blake3::hash(edited.as_bytes()).as_bytes())
+        );
     }
 
     #[cfg(target_os = "linux")]

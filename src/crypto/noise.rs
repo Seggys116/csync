@@ -4,6 +4,7 @@ use crate::proto::{
     frame::SEG_MAX,
     hs::{self, HS_MSG_MAX, HsHello, HsMode, PATTERN_PAIR, PATTERN_RESUME},
 };
+use rayon::prelude::*;
 use snow::{Builder, HandshakeState, StatelessTransportState, params::NoiseParams};
 use std::{
     io::{self, Read, Write},
@@ -14,6 +15,9 @@ use std::{
 pub const REKEY_BYTES: u64 = 1 << 30;
 pub const REKEY_AGE: Duration = Duration::from_secs(3600);
 const TAG: usize = 16;
+// below this a run is sealed or opened on the calling thread; waking the pool costs more than it saves
+const PAR_SEGS: usize = 2;
+const PAR_BYTES: usize = 128 << 10;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -199,6 +203,7 @@ impl Established {
         let o = Opener {
             t: self.transport,
             nonce: 0,
+            epoch: 0,
         };
         (s, o)
     }
@@ -252,6 +257,68 @@ impl Sealer {
         Ok(())
     }
 
+    // seals plain[a..a + n] for each span under consecutive nonces, on all cores when the run is large
+    pub fn seal_many(
+        &mut self,
+        plain: &[u8],
+        spans: &[(usize, usize)],
+        out: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        let total: usize = spans.iter().map(|s| s.1).sum();
+        if spans.len() < PAR_SEGS || total < PAR_BYTES {
+            for &(a, n) in spans {
+                let pt = a
+                    .checked_add(n)
+                    .and_then(|e| plain.get(a..e))
+                    .ok_or(CryptoError::TooLarge)?;
+                self.seal(pt, out)?;
+            }
+            return Ok(());
+        }
+        let mut pts = Vec::with_capacity(spans.len());
+        for &(a, n) in spans {
+            let pt = a
+                .checked_add(n)
+                .and_then(|e| plain.get(a..e))
+                .filter(|p| p.len() <= SEG_MAX)
+                .ok_or(CryptoError::TooLarge)?;
+            pts.push(pt);
+        }
+        let count = spans.len() as u64;
+        if self.nonce.checked_add(count).is_none() {
+            return Err(CryptoError::Exhausted);
+        }
+        let start = out.len();
+        out.resize(start + total + spans.len() * (2 + TAG), 0);
+        let mut jobs = Vec::with_capacity(pts.len());
+        let mut rest = &mut out[start..];
+        for (i, pt) in pts.into_iter().enumerate() {
+            let (dst, tail) = rest.split_at_mut(2 + pt.len() + TAG);
+            rest = tail;
+            jobs.push((self.nonce + i as u64, pt, dst));
+        }
+        let g = self.t.read();
+        let st: &StatelessTransportState = &g;
+        let ok = jobs.into_par_iter().all(|(nonce, pt, dst)| {
+            let (len, body) = dst.split_at_mut(2);
+            match st.write_message(nonce, pt, body) {
+                Ok(m) if m == body.len() => {
+                    len.copy_from_slice(&(m as u16).to_be_bytes());
+                    true
+                }
+                _ => false,
+            }
+        });
+        drop(g);
+        if !ok {
+            out.truncate(start);
+            return Err(CryptoError::Auth);
+        }
+        self.nonce += count;
+        self.bytes += (total + spans.len() * TAG) as u64;
+        Ok(())
+    }
+
     pub fn rekey_due(&self) -> bool {
         self.bytes >= REKEY_BYTES || self.since.elapsed() >= REKEY_AGE
     }
@@ -266,9 +333,54 @@ impl Sealer {
 pub struct Opener {
     t: Arc<Transport>,
     nonce: u64,
+    epoch: u64,
 }
 
 impl Opener {
+    // opens a run of segments under consecutive nonces, on all cores when the run is large; returns the first nonce
+    pub fn open_many(
+        &mut self,
+        cts: &[&[u8]],
+        outs: Vec<&mut [u8]>,
+        res: &mut Vec<Result<usize, CryptoError>>,
+    ) -> Result<u64, CryptoError> {
+        let count = cts.len() as u64;
+        let base = self.nonce;
+        if base.checked_add(count).is_none() || cts.len() != outs.len() {
+            return Err(CryptoError::Exhausted);
+        }
+        let total: usize = cts.iter().map(|c| c.len()).sum();
+        let g = self.t.read();
+        let st: &StatelessTransportState = &g;
+        res.clear();
+        if cts.len() < PAR_SEGS || total < PAR_BYTES {
+            res.extend(
+                cts.iter()
+                    .zip(outs)
+                    .enumerate()
+                    .map(|(i, (ct, out))| open_one(st, base + i as u64, ct, out)),
+            );
+        } else {
+            cts.par_iter()
+                .zip(outs)
+                .enumerate()
+                .map(|(i, (ct, out))| open_one(st, base + i as u64, ct, out))
+                .collect_into_vec(res);
+        }
+        drop(g);
+        self.nonce += count;
+        Ok(base)
+    }
+
+    // a segment of a run whose earlier part rekeyed, opened again under the new key
+    pub fn open_at(&self, nonce: u64, ct: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
+        open_one(&self.t.read(), nonce, ct, out)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub fn open(&mut self, ct: &[u8], out: &mut [u8]) -> Result<usize, CryptoError> {
         if ct.len() < TAG || ct.len() - TAG > out.len() {
             return Err(CryptoError::TooLarge);
@@ -276,18 +388,31 @@ impl Opener {
         if self.nonce == u64::MAX {
             return Err(CryptoError::Exhausted);
         }
-        let n = self
-            .t
-            .read()
-            .read_message(self.nonce, ct, out)
-            .map_err(|_| CryptoError::Auth)?;
+        let n = open_one(&self.t.read(), self.nonce, ct, out)?;
         self.nonce += 1;
         Ok(n)
     }
 
     pub fn rekey(&mut self) {
         self.t.write().rekey_incoming();
+        self.epoch += 1;
     }
+}
+
+fn open_one(
+    st: &StatelessTransportState,
+    nonce: u64,
+    ct: &[u8],
+    out: &mut [u8],
+) -> Result<usize, CryptoError> {
+    if ct.len() < TAG || ct.len() - TAG > out.len() {
+        return Err(CryptoError::TooLarge);
+    }
+    if nonce == u64::MAX {
+        return Err(CryptoError::Exhausted);
+    }
+    st.read_message(nonce, ct, out)
+        .map_err(|_| CryptoError::Auth)
 }
 
 pub trait Gate {

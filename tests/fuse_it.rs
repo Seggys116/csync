@@ -290,6 +290,118 @@ mod linux {
         r.err().and_then(|e| e.raw_os_error())
     }
 
+    // many guest atomic saves on shared names while the host rewrites them: nothing but ECANCELED may
+    // reach the guest, and once the host goes quiet saves land again instead of being refused against a stale view
+    fn contention(proj: &Path, mnt: &Path) {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
+        };
+        const NAMES: usize = 3;
+        let name = |i: usize| format!("storm/s{}.txt", i % NAMES);
+        fs::create_dir_all(proj.join("storm")).unwrap();
+        for n in 0..NAMES {
+            fs::write(proj.join(name(n)), "init\n").unwrap();
+        }
+        eventually("storm files on the guest", SYNC, || {
+            (0..NAMES).all(|n| mnt.join(name(n)).exists())
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let saved = Arc::new(AtomicU64::new(0));
+        let refused = Arc::new(AtomicU64::new(0));
+        let bad = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut workers = Vec::new();
+        for w in 0..12usize {
+            let (stop, saved, refused, bad) =
+                (stop.clone(), saved.clone(), refused.clone(), bad.clone());
+            let mnt = mnt.to_path_buf();
+            workers.push(thread::spawn(move || {
+                let mut i = w;
+                while !stop.load(Relaxed) {
+                    i += 1;
+                    let to = mnt.join(name(i));
+                    let tmp = mnt.join(format!("{}.tmp{w}", name(i)));
+                    if let Err(e) = fs::write(&tmp, format!("guest {w} save {i}\n")) {
+                        bad.lock()
+                            .unwrap()
+                            .push(format!("write {}: {e}", tmp.display()));
+                        continue;
+                    }
+                    match fs::rename(&tmp, &to) {
+                        Ok(()) => {
+                            saved.fetch_add(1, Relaxed);
+                        }
+                        Err(e) => {
+                            let _ = fs::remove_file(&tmp);
+                            if e.raw_os_error() == Some(libc::ECANCELED) {
+                                refused.fetch_add(1, Relaxed);
+                            } else {
+                                bad.lock()
+                                    .unwrap()
+                                    .push(format!("rename {}: {e}", tmp.display()));
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        {
+            let (stop, bad, mnt) = (stop.clone(), bad.clone(), mnt.to_path_buf());
+            workers.push(thread::spawn(move || {
+                let mut i = 0;
+                while !stop.load(Relaxed) {
+                    i += 1;
+                    match fs::read(mnt.join(name(i))) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                            bad.lock().unwrap().push(format!("read {}: {e}", name(i)));
+                        }
+                        _ => {}
+                    }
+                }
+            }));
+        }
+        let end = Instant::now() + Duration::from_millis(500);
+        let mut i = 0;
+        while Instant::now() < end {
+            i += 1;
+            let to = proj.join(name(i));
+            if i % 2 == 0 {
+                fs::write(&to, format!("host {i}\n")).unwrap();
+            } else {
+                let tmp = proj.join(format!("storm/.host{}.tmp", i % NAMES));
+                fs::write(&tmp, format!("host {i}\n")).unwrap();
+                fs::rename(&tmp, &to).unwrap();
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+        let (s0, r0) = (saved.load(Relaxed), refused.load(Relaxed));
+        thread::sleep(Duration::from_secs(1));
+        let (s1, r1) = (saved.load(Relaxed) - s0, refused.load(Relaxed) - r0);
+        stop.store(true, Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        let bad = bad.lock().unwrap();
+        assert!(
+            bad.is_empty(),
+            "errors other than ECANCELED under contention: {:?}",
+            &bad[..bad.len().min(10)]
+        );
+        assert!(
+            s1 > 0 && r1 * 2 < s1 + r1,
+            "saves kept being refused after the host went quiet: {s1} saved, {r1} refused"
+        );
+        eventually("storm files agree", SYNC, || {
+            (0..NAMES).all(|n| read(&proj.join(name(n))) == read(&mnt.join(name(n))))
+        });
+        fs::remove_dir_all(mnt.join("storm")).unwrap();
+        eventually("storm gone on the host", SYNC, || {
+            !proj.join("storm").exists()
+        });
+        assert_no_strays(proj);
+        assert_no_strays(mnt);
+    }
+
     fn write_project(proj: &Path) {
         fs::create_dir_all(proj.join("src")).unwrap();
         fs::create_dir_all(proj.join(".git/objects")).unwrap();
@@ -570,6 +682,8 @@ mod linux {
         eventually("guest reads the host edit", SYNC, || {
             read(&mnt.join("README.md")).as_deref() == Some("hello again\n")
         });
+
+        contention(&proj, &mnt);
 
         // host restart: cached reads keep working, then the guest reconnects and catches up
         host.quit(SYNC);
