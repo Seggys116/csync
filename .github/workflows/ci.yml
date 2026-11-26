@@ -1,0 +1,160 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# main runs are never cancelled: release.yml requires a finished green run for the tagged sha
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - if: runner.os == 'macOS'
+        run: rustup target add x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo clippy --locked --all-targets
+      - run: cargo test --locked
+      # the intel mac release target, checked on the arm runner that already has the deps built
+      - if: runner.os == 'macOS'
+        run: cargo check --locked --all-targets --target x86_64-apple-darwin
+
+  # the fat-lto release build happens once per arch and doubles as the musl target check
+  musl:
+    name: musl (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release --target "$TARGET"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: csync-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/csync
+          if-no-files-found: error
+          retention-days: 1
+
+  fuse:
+    name: fuse (${{ matrix.os }}, ${{ matrix.priv }})
+    needs: musl
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        priv: [user, root]
+        include:
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    env:
+      CSYNC_IT_PRIV: ${{ matrix.priv }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fuse3 inotify-tools
+          test -c /dev/fuse || sudo modprobe fuse
+          test -c /dev/fuse
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: fuse
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.priv == 'user' }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: csync-${{ matrix.target }}
+          path: ${{ runner.temp }}/csync-bin
+      # artifacts drop the executable bit
+      - run: chmod 755 "$RUNNER_TEMP/csync-bin/csync"
+      - name: fuse_it
+        shell: bash
+        env:
+          CSYNC_BIN: ${{ runner.temp }}/csync-bin/csync
+        run: |
+          if [ "$CSYNC_IT_PRIV" = root ]; then
+            # build as the runner user so target/ stays user-owned, then run only the test binary as root
+            bin="$(cargo test --locked --test fuse_it --no-run --message-format=json \
+              | jq -r 'select(.reason == "compiler-artifact" and .target.name == "fuse_it" and .executable != null) | .executable')"
+            test -x "$bin"
+            sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
+          else
+            cargo test --locked --test fuse_it -- --test-threads=1
+          fi
+
+  install-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sh -n install.sh
+      - run: |
+          command -v shellcheck >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
+          shellcheck --shell=sh install.sh
+
+  # the single required check for branch protection; always() because a skipped job would count as passing
+  ci-ok:
+    if: always()
+    needs: [fmt, test, musl, fuse, install-scripts]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: printf '%s' "$NEEDS" | jq -e 'all(.[]; .result == "success")'

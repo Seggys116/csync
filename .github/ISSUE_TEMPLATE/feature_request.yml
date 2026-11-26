@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that csync makes hard or slow?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Proposal
+      description: What would you like to happen? Say how it affects the guest's confinement to the project root, if at all.

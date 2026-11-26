@@ -1,0 +1,50 @@
+[package]
+name = "csync-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+csync = { path = ".." }
+
+# keeps this crate out of the main build
+[workspace]
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "msg_decode"
+path = "fuzz_targets/msg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relpath"
+path = "fuzz_targets/relpath.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "delta_apply"
+path = "fuzz_targets/delta_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "merge3"
+path = "fuzz_targets/merge3.rs"
+test = false
+doc = false
+bench = false

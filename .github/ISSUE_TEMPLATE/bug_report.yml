@@ -1,0 +1,31 @@
+name: Bug report
+description: Wrong file contents, a failed sync, a mount problem, or a crash
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran on which side (host or guest), what you expected, and what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps, ideally starting from a fresh project. Include the editor or tool that wrote the file if the problem is a save or merge.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `csync doctor` on both machines
+      description: Remove anything you consider private, such as project paths or peer names.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: csync version and platforms
+      placeholder: "csync 0.1.0, host macOS 15 arm64, guest Ubuntu 24.04 aarch64 (kernel 6.8)"
+    validations:
+      required: true
