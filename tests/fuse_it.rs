@@ -352,7 +352,10 @@ mod linux {
                 while !stop.load(Relaxed) {
                     i += 1;
                     match fs::read(mnt.join(name(i))) {
-                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                        Err(e)
+                            if e.kind() != io::ErrorKind::NotFound
+                                && e.raw_os_error() != Some(libc::ESTALE) =>
+                        {
                             bad.lock().unwrap().push(format!("read {}: {e}", name(i)));
                         }
                         _ => {}

@@ -1680,7 +1680,7 @@ impl GuestFs {
                 return reply.error(en(err));
             };
             if cur != Some(first) && swap.is_none() {
-                return reply.error(Errno::EIO);
+                return reply.error(Errno::ESTALE);
             }
             let Some(v) = cur else {
                 return reply.data(&[]);
