@@ -145,15 +145,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-26, variant: dir, fix: dir }
-          - { os: macos-26, variant: dir+replay, fix: 'dir,replay', nudge: 'stat,readdir' }
-          - { os: macos-15, variant: dir+replay, fix: 'dir,replay', nudge: 'stat,readdir' }
-          - { os: macos-26, variant: dir+replay+neg_ttl0, fix: 'dir,replay,neg_ttl0' }
-          - { os: macos-26, variant: dir+replay+nodircache, fix: 'dir,replay,nodircache' }
-          - { os: macos-15, variant: dir+replay+nodircache, fix: 'dir,replay,nodircache' }
-          - { os: macos-26, variant: pre+dir, probe: pre, fix: dir }
-          - { os: macos-26, variant: dir-window60, fix: dir, window: 60 }
-          - { os: macos-15, variant: dir-window60, fix: dir, window: 60 }
+          - { os: macos-26, variant: dir+replay, fix: 'dir,replay', nudge: 'stat' }
+          - { os: macos-15, variant: dir+replay, fix: 'dir,replay', nudge: 'stat' }
+          - { os: macos-26, variant: dir+replay+reroot, fix: 'dir,replay,reroot', nudge: 'stat' }
+          - { os: macos-15, variant: dir+replay+reroot, fix: 'dir,replay,reroot', nudge: 'stat' }
     env:
       CSYNC_BIN: ${{ github.workspace }}/target/release/csync
       FSKIT_ID: io.macfuse.app.fsmodule.macfuse

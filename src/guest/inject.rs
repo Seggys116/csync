@@ -204,6 +204,25 @@ fn mode(perm: u16) -> Mode {
     Mode::from_bits_truncate((u32::from(perm) & 0o7777) as _)
 }
 
+// TRACE: which filesystem a descriptor is on, against the mount path
+#[cfg(target_os = "macos")]
+fn trace_fs(label: &str, fd: Option<&OwnedFd>, mount: &Path) {
+    let name = |b: &[std::ffi::c_char]| {
+        let v: Vec<u8> = b.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        String::from_utf8_lossy(&v).into_owned()
+    };
+    let by_fd = fd.map(|f| {
+        let s = rustix::fs::fstatfs(f).map(|s| (name(&s.f_fstypename), name(&s.f_mntonname)));
+        let d = rustix::fs::fstat(f).map(|s| (s.st_dev, s.st_ino));
+        (s, d)
+    });
+    let by_path = rustix::fs::statfs(mount).map(|s| (name(&s.f_fstypename), name(&s.f_mntonname)));
+    let dev = rustix::fs::stat(mount).map(|s| (s.st_dev, s.st_ino));
+    super::coherence::trace(format_args!(
+        "{label}: fd={by_fd:?} path_statfs={by_path:?} path_stat={dev:?} mount={mount:?}"
+    ));
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn nocache(fd: &OwnedFd) -> i32 {
@@ -229,7 +248,11 @@ impl Worker {
         #[cfg(target_os = "macos")]
         let mut root = open_root(&self.mount);
         #[cfg(target_os = "macos")]
+        trace_fs("injector root at start", root.as_ref(), &self.mount);
+        #[cfg(target_os = "macos")]
         let replay = boot(root.as_ref());
+        #[cfg(target_os = "macos")]
+        trace_fs("injector root after the probe", root.as_ref(), &self.mount);
         #[cfg(target_os = "macos")]
         if !replay {
             self.sh.off.store(true, Ordering::Release);
@@ -249,6 +272,15 @@ impl Worker {
             }
             if root.is_none() {
                 root = open_root(&self.mount);
+            }
+            #[cfg(target_os = "macos")]
+            if super::coherence::fix("reroot") {
+                root = open_root(&self.mount);
+                if let Synth::Create { name, .. } = &s
+                    && super::coherence::watched(name.as_str())
+                {
+                    trace_fs("injector root reopened", root.as_ref(), &self.mount);
+                }
             }
             let begun = match &s {
                 Synth::Modify { node } => {
@@ -342,6 +374,9 @@ impl Worker {
             });
             trace(format_args!("nudge {label}: readdir of {pp:?} through the mount lists {name}: {res:?}"));
         };
+        if let Ok(fd) = rustix::fs::openat(root, full, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {
+            trace_fs("created file", Some(&fd), &self.mount);
+        }
         lists("before");
         for k in kinds.split(',') {
             let t0 = std::time::Instant::now();
