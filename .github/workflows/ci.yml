@@ -135,6 +135,99 @@ jobs:
             cargo test --locked --test fuse_it -- --test-threads=1
           fi
 
+  # experimental: whether macFUSE (FSKit backend) can run on a hosted macOS runner; never blocks merging, not in ci-ok
+  macfuse:
+    name: macfuse (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    env:
+      CSYNC_BIN: ${{ github.workspace }}/target/release/csync
+      FSKIT_ID: io.macfuse.app.fsmodule.macfuse
+      FSKIT_LOCAL_ID: io.macfuse.app.fsmodule.macfuse-local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: macfuse
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release
+      - name: diagnostics before install
+        if: always()
+        shell: bash
+        run: |
+          echo "::group::system"
+          sw_vers; uname -a; csrutil status || true; sysctl -n machdep.cpu.brand_string; sysctl -n kern.hv_vmm_present || true
+          echo "::endgroup::"
+          echo "::group::doctor"; "$CSYNC_BIN" doctor || true; echo "::endgroup::"
+      - name: install macfuse
+        shell: bash
+        run: |
+          set -x
+          brew install --cask macfuse
+          echo "install exit: $?"
+      - name: diagnostics after install
+        if: always()
+        shell: bash
+        run: |
+          echo "::group::macfuse version"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Library/Filesystems/macfuse.fs/Contents/Info.plist || true
+          ls -la /Library/Filesystems/macfuse.fs/Contents /Library/Filesystems/macfuse.fs/Contents/Extensions 2>&1 || true
+          find /Library/Filesystems/macfuse.fs -name '*.appex' 2>/dev/null || true
+          ls -la /usr/local/lib | grep -i fuse || true
+          echo "::endgroup::"
+          echo "::group::pluginkit"; pluginkit -m -A -vvv 2>&1 | grep -i -B1 -A8 fuse || true; echo "::endgroup::"
+          echo "::group::kmutil"; kmutil showloaded 2>&1 | grep -i fuse || echo "no fuse kext loaded"; echo "::endgroup::"
+          echo "::group::systemextensionsctl"; systemextensionsctl list 2>&1 || true; echo "::endgroup::"
+          echo "::group::doctor"; "$CSYNC_BIN" doctor || true; echo "::endgroup::"
+      - name: enable the FSKit module
+        if: always()
+        shell: bash
+        run: |
+          appex_dir=/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/Extensions
+          for id in "$FSKIT_ID" "$FSKIT_LOCAL_ID"; do
+            echo "::group::enable $id"
+            pluginkit -a "$appex_dir/$id.appex"; echo "pluginkit -a: $?"
+            pluginkit -e use -i "$id"; echo "pluginkit -e use: $?"
+            pluginkit -m -i "$id" -vvv || true
+            echo "::endgroup::"
+          done
+      - name: diagnostics after enable
+        if: always()
+        shell: bash
+        run: |
+          pluginkit -m -A -vvv -i "$FSKIT_ID" 2>&1 || true
+          "$CSYNC_BIN" doctor || true
+      - name: mount probe
+        shell: bash
+        run: |
+          set -x
+          w="$RUNNER_TEMP/probe"; mkdir -p "$w/proj" "$w/mnt"; echo hello > "$w/proj/a.txt"
+          hk="$(CSYNC_HOME=$w/hh "$CSYNC_BIN" key show)"; gk="$(CSYNC_HOME=$w/gh "$CSYNC_BIN" key show)"
+          CSYNC_HOME=$w/hh "$CSYNC_BIN" trust add "$gk" --role guest --name g
+          CSYNC_HOME=$w/gh "$CSYNC_BIN" trust add "$hk" --role host --name h
+          CSYNC_HOME=$w/hh "$CSYNC_BIN" --no-tui host "$w/proj" --listen 127.0.0.1:47831 --no-pair --no-mdns > "$w/host.log" 2>&1 &
+          hp=$!
+          sleep 5
+          (sleep 40; pkill -f 'csync.* join' || true) &
+          CSYNC_HOME=$w/gh "$CSYNC_BIN" --no-tui join "$w/mnt" --connect 127.0.0.1:47831 --host h < /dev/null > "$w/guest.log" 2>&1 || true
+          echo "== guest log"; cat "$w/guest.log"
+          echo "== host log"; head -20 "$w/host.log"
+          mount | grep -i -E 'fuse|csync' || true
+          kill "$hp" || true
+      - name: logs
+        if: always()
+        shell: bash
+        run: |
+          log show --predicate 'process CONTAINS "macfuse" OR process CONTAINS "csync" OR subsystem CONTAINS "fskit" OR process CONTAINS "fskit"' --last 10m --style compact 2>&1 | tail -150 || true
+
   install-scripts:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
