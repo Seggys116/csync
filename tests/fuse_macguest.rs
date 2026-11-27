@@ -447,6 +447,15 @@ mod mac {
         eprintln!("fsevents guest_write events: {guest_ev:?}");
         eprintln!("fsevents host_change events: {host_ev:?}");
 
+        // whether the host-created files ever show, long after the probes gave up
+        let late = entries(&mnt);
+        eprintln!(
+            "late listing of the mount root: {late:?} (host-created: listed.txt={} fromhost.txt={} third.txt={})",
+            late.iter().any(|n| n == "listed.txt"),
+            late.iter().any(|n| n == "fromhost.txt"),
+            late.iter().any(|n| n == "third.txt")
+        );
+
         // quit unmounts, ends the process and wipes the guest's local state for this host
         guest.say("quit");
         guest.stdin = None;

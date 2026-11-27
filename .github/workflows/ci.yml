@@ -261,7 +261,7 @@ jobs:
             else
               echo "passed: mounted, read, host to guest, guest to host, ignored path, unmount and wipe"
             fi
-            grep -a '^fsevents ' "$log" || true
+            grep -a -E '^(fsevents |host changes on the mount|late listing|mount table entry)' "$log" || true
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
       - name: mount state and logs
