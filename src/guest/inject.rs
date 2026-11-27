@@ -509,6 +509,34 @@ fn nocache(fd: &OwnedFd) -> i32 {
     unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }
 }
 
+// TRACE: map the file and ask the kernel to drop its cached pages
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn msync_invalidate(fd: &OwnedFd, len: usize) -> String {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return "empty".to_owned();
+    }
+    // SAFETY: a private read-only mapping of a descriptor this function borrows, unmapped before returning
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return format!("mmap {}", std::io::Error::last_os_error());
+        }
+        let r = libc::msync(p, len, libc::MS_INVALIDATE);
+        let e = std::io::Error::last_os_error();
+        libc::munmap(p, len);
+        format!("msync {r} {e}")
+    }
+}
+
 // TRACE: extra operations through the mount after the injected truncate, chosen by CSYNC_TRACE_NUDGE
 #[cfg(target_os = "macos")]
 fn nudges(root: &OwnedFd, fd: &OwnedFd, path: &str, size: u64, perm: u16, node: NodeId, w: &Worker) {
@@ -531,6 +559,23 @@ fn nudges(root: &OwnedFd, fd: &OwnedFd, path: &str, size: u64, perm: u16, node: 
                 format!("{:?}", rustix::fs::futimens(fd, &ts))
             }
             "nocache" => format!("{}", nocache(fd)),
+            "zero" => {
+                let a = rustix::fs::ftruncate(fd, 0);
+                let b = rustix::fs::ftruncate(fd, size);
+                format!("{a:?} {b:?}")
+            }
+            "msync" => {
+                let r = rustix::fs::openat(
+                    root,
+                    path,
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                match r {
+                    Ok(f) => msync_invalidate(&f, usize::try_from(size).unwrap_or(0)),
+                    Err(e) => format!("open {e:?}"),
+                }
+            }
             "fsync" => format!("{:?}", rustix::fs::fsync(fd)),
             "chmod" => format!(
                 "{:?}",

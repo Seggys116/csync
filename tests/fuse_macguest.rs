@@ -440,6 +440,7 @@ mod mac {
                 let seen = std::cell::RefCell::new(String::new());
                 let t = Instant::now();
                 mark(&format!("host edits {name}"));
+                let settle = std::env::var("CSYNC_MG_PROBE").is_ok_and(|v| v == "settle");
                 let probe: Box<dyn FnMut() -> bool> = match shape {
                     "size" => {
                         fs::write(&host, "alpha twelve\n").unwrap();
@@ -477,6 +478,9 @@ mod mac {
                     }
                 };
                 let mut probe = probe;
+                if settle {
+                    thread::sleep(Duration::from_secs(2));
+                }
                 let d = visible_after(t, &mut probe);
                 drop(probe);
                 let last = seen.borrow().clone();

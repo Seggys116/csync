@@ -4502,7 +4502,7 @@ impl Filesystem for GuestFs {
         if domain == GDomain::GitRo && (write || trunc) {
             return reply.error(Errno::EROFS);
         }
-        let (mut keep, mut direct) = (true, false);
+        let (mut keep, mut direct) = (true, coherence::fix("direct") && !write && !trunc);
         let src = if domain == GDomain::Local {
             match sys::open_beneath(self.core.overlay.as_fd(), &path, Self::local_flags(flags.0)) {
                 Ok(fd) => {

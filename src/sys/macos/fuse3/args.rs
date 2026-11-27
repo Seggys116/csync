@@ -43,6 +43,14 @@ pub(super) fn mount_args(opts: &MountOpts, backend: Backend) -> Vec<CString> {
     if opts.allow_other {
         options.push_str(",allow_other");
     }
+    // TRACE diagnostics, never to be merged
+    if let Ok(extra) = std::env::var("CSYNC_TRACE_MOUNT_OPTS")
+        && !extra.is_empty()
+    {
+        options.push(',');
+        options.push_str(&extra);
+        eprintln!("TRACE mount options: {options}");
+    }
     let mut args = vec![c_arg("csync")];
     if backend == Backend::FsKit {
         args.push(c_arg("-o"));
