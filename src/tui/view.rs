@@ -1786,7 +1786,11 @@ fn live_row(buf: &mut Buffer, area: Rect, row: Row, s: &UiSnapshot, vs: &ViewSta
             } else {
                 "served by csync"
             };
-            put(buf, x, y, v, r, t.dim);
+            let x = put(buf, x, y, v, r, t.dim);
+            if !g.backend.is_empty() {
+                let how = format!("   {} backend, inval {}", g.backend, g.inval);
+                put(buf, x, y, &how, r, t.dim);
+            }
         }
         Row::Warm => {
             let x = label(buf, "warm");

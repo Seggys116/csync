@@ -6,6 +6,10 @@
   or later and mounts with the FSKit backend first, falling back to the kernel extension. There is no kernel
   passthrough, writeback cache or `readdirplus` on macOS, and ignored paths live in a directory named
   `overlay.noindex` so that Spotlight skips it.
+* On the macOS guest, host changes now reach the FSKit mount quickly: the injector waits for the volume to appear before
+  it opens its root (it used to open the directory under the mount and replay nothing), recognises its own requests by
+  an exact armed window since FSKit sends pid 0, and a rewound directory read lists again. The session line reports
+  `backend=` and `inval=`.
 * csync loads macFUSE's `libfuse3` at run time through its own binding, so the binary needs nothing installed to build
   or to run `csync host`.
 * `csync join` on macOS removes a `.DS_Store` that is the only entry of the mount point instead of refusing it.

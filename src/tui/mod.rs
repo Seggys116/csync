@@ -153,6 +153,9 @@ pub struct GuestStats {
     pub prefetch_done: u64,
     pub prefetch_total: u64,
     pub passthrough: bool,
+    // the macfuse backend and how a host change reaches the kernel (native, injected, off, probing); empty elsewhere
+    pub backend: &'static str,
+    pub inval: &'static str,
 }
 
 pub fn now_ms() -> u64 {
@@ -654,6 +657,10 @@ fn session_fields(s: &UiSnapshot) -> Vec<(&'static str, String)> {
     if let Some(m) = &s.mount {
         f.push(("mount", path_str(m)));
         f.push(("mounted", s.mounted.to_string()));
+    }
+    if !s.guest.backend.is_empty() {
+        f.push(("backend", s.guest.backend.to_owned()));
+        f.push(("inval", s.guest.inval.to_owned()));
     }
     f
 }
@@ -1186,6 +1193,26 @@ mod tests {
         assert!(text.contains("name=vm%3D1%20%1B"));
         assert!(text.contains("path=a%20b/c%25d"));
         assert_eq!(unescape("a%20b/c%25d%zz%"), "a b/c%d%zz%");
+    }
+
+    #[test]
+    fn the_session_line_names_the_backend_and_how_changes_reach_the_kernel_last() {
+        let mut s = UiSnapshot::new(Role::Guest);
+        s.mount = Some(PathBuf::from("/m"));
+        s.mounted = true;
+        let bare = report(&s);
+        let first = bare.lines().next().unwrap();
+        assert!(first.starts_with("session role=guest") && !first.contains("backend="));
+        s.guest.backend = "fskit";
+        s.guest.inval = "injected";
+        let text = report(&s);
+        let line = text.lines().next().unwrap();
+        assert!(
+            line.ends_with(" mounted=true backend=fskit inval=injected"),
+            "{line}"
+        );
+        let j = report_json(&text);
+        assert!(j.contains("\"backend\":\"fskit\",\"inval\":\"injected\""));
     }
 
     #[test]

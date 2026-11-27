@@ -32,7 +32,7 @@ pub use live::run;
 mod live {
     use super::cache::{BlobCache, CacheConfig, Remote, RemoteSlot, lock};
     #[cfg(target_os = "macos")]
-    use super::coherence::{self, BackendKind, Env, Ident};
+    use super::coherence::{self, BackendKind, Env};
     use super::fs::{self, Core, Counters, Mounted};
     #[cfg(target_os = "macos")]
     use super::inject::Boot;
@@ -627,7 +627,8 @@ mod live {
         join: JoinHandle<()>,
     }
 
-    // the startup self-test, run by the injector thread: false keeps events from being replayed through the mount
+    // the startup self-test, run by the injector thread once the root is verified to be on the mounted volume: the
+    // identification it decides is how requests are told from injected ones, and Claim keeps events from being replayed
     #[cfg(target_os = "macos")]
     fn probe_boot(core: Arc<Core>, inval: fs::Inval, backend: BackendKind) -> Boot {
         Box::new(move |root| {
@@ -642,7 +643,7 @@ mod live {
                 }
                 None => coherence::run_unverified(backend),
             };
-            done.ident == Ident::Pid
+            done.ident
         })
     }
 
@@ -1207,6 +1208,7 @@ mod live {
             let (inj, thread, back) = Injector::start_probed(
                 &self.cfg.mount,
                 self.core.tree.clone(),
+                self.mount_dev,
                 probe_boot(self.core.clone(), m.inval(), backend),
             )?;
             let _ = self.core.inj.set(inj);
@@ -1280,7 +1282,19 @@ mod live {
             let pg = &self.core.prefetch.progress;
             let (pf_total, pf_done) = (pg.total.load(Relaxed), pg.done.load(Relaxed));
             let (mounted, skew, rtt) = (self.mounted.is_some(), self.skew_ms, self.rtt_us);
+            #[cfg(target_os = "macos")]
+            let (backend, inval) = coherence::status().unwrap_or_default();
+            #[cfg(target_os = "macos")]
+            let fault = self.core.inj.get().and_then(|i| i.fault());
             self.bus.update(|s| {
+                #[cfg(target_os = "macos")]
+                {
+                    s.guest.backend = backend;
+                    s.guest.inval = inval;
+                    if let Some(h) = fault {
+                        s.hint(h);
+                    }
+                }
                 s.stats.files = files;
                 s.stats.cached_bytes = cached;
                 s.stats.cache_cap = cap;

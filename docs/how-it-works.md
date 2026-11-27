@@ -35,7 +35,7 @@ When both sides change the same file, the later write is checked against the ver
 
 ### The macOS guest (experimental)
 
-`csync join` is also implemented for macOS. The code is written but it has not been run against a real macFUSE mount, so treat everything below as the design, not as measured behaviour.
+`csync join` is also implemented for macOS. It has only run against macFUSE on CI runners so far, so treat what is not marked as measured below as the design, not as measured behaviour.
 
 What is implemented:
 
@@ -46,10 +46,19 @@ What is implemented:
 - **Overlay.** Ignored paths live in `overlay.noindex` inside the host's state directory, a name that Spotlight does not index. Like the Linux overlay it is deleted when the session ends.
 - **Names.** Lookups are exact: `cat README.md` does not find `readme.md`, even though the default macOS volume folds case.
 
+- **Injector root.** The FSKit volume can appear in the mount table 1.4 to 5.5 s after the mount call returns (measured on GitHub Actions macOS 15.8 and 26.7 runners with macFUSE 5.5.0). A directory opened before that is the plain APFS directory under the mount point, and every injected operation on it lands on APFS, never reaching the handlers. The injector thread therefore polls every 20 ms, for at most 30 s, until the mount point shows a macFUSE or FSKit filesystem type (`statfs`) or a device other than the one that was under it before the mount, and only then opens its root. Before every injected event it checks that the root's device is the volume's and not the pre-mount one, and reopens it once if not. If the volume never shows, or the root cannot be verified for an event, nothing is injected on the underlying directory: the events settle without being replayed, and the status line says so (`inval=off` and a hint).
+- **Request identity.** FSKit delivers every request with pid, uid and gid 0, so the process id cannot recognise the injector's own requests. The startup self-test (run only after the root is verified) decides between recognising by process id (the request pid is csync's), by an armed window (pid not csync's and a uid or gid that is not csync's, as FSKit sends), or not replaying at all. See [event injection](#event-injection).
+- **Directory listings.** A directory handle's listing is made again each time the kernel rewinds to offset 0 on it, and later offsets continue that snapshot; the first read of a freshly opened handle uses the listing `opendir` made. Before this, a rewound read was served the snapshot taken at open, so a host change never showed through a handle the kernel kept.
+- **Status.** The session line of `csync status` and the status row of the terminal view name the backend and how a host change reaches the kernel: `backend=fskit` or `kext`, and `inval=native` (kernel notifications work), `injected` (replayed through the mount), `off` (not replayed) or `probing` (the self-test has not finished).
+
+Measured on the FSKit backend with a correctly opened root and replay forced on: a host-created file showed by listing in 43 ms, by lookup in 44 ms, and a host edit in 119 ms. A listing refreshed in 42 to 180 ms with only the directory fix, but a lookup of a name that had been looked up before it was created stayed `ENOENT` for 60 s; the injected create clears that negative entry.
+
 What is not known until it has been run:
 
+- the self-test's attribute, entry and data steps (whether FSKit honours kernel notifications) have never been observed on a correct root, so `inval=native` or `injected` is not yet measured;
 - whether FSEvents reports the operations the injector performs through the mount, which is what a watcher such as a dev server relies on;
 - whether the FSKit backend keeps its caches coherent with a host edit that arrives while a file is open;
+- whether FSKit passes the file handle in a truncate; a truncate with no handle is accepted as the injector's while its operation is armed;
 - throughput and latency, for either backend.
 
 Missing on macOS compared with Linux: no kernel passthrough, no writeback cache and no `readdirplus`, so every read of a synced file and every directory listing goes through csync.
@@ -190,6 +199,26 @@ The kernel raises inotify events only for operations that pass through the mount
 | Mode or mtime change | `chmod` to the same mode | `IN_ATTRIB` |
 | Deleted entry | The node is held until the injector unlinks it; a deleted directory's entries are unlinked first, bottom-up, in every directory the kernel has looked up (a watched directory always has been) | `IN_DELETE`, `IN_DELETE_SELF` for each watched entry |
 | Renamed entry (reported as a pair) | `rename`; an entry it replaces stays visible until then, so the kernel unlinks it | `IN_MOVED_FROM` and `IN_MOVED_TO` with one cookie, `IN_MOVE_SELF`; `IN_ATTRIB` and `IN_DELETE_SELF` on a replaced file |
+
+How the handlers recognise the injector's requests depends on the platform:
+
+- **Linux.** By thread id: the injector thread is the only one that touches the mount.
+- **macOS, request pid is csync's** (the kernel extension, if its requests carry it): by process id, the same way.
+- **macOS, request pid is not csync's** (FSKit sends pid 0): by an armed window. Before each syscall the injector arms an exact description of what it is about to ask the kernel for, and disarms when the syscall returns. A handler treats a request as injected only when its operation, inode or parent and name match an armed entry exactly, so a user's request that arrives while an injection is in flight is never taken for it: it would be applied locally and never sent to the host. One syscall can cause several requests (a lookup, then the create), and each matches while the window is armed.
+
+| Injected operation | Armed while it runs | Checked by |
+|---|---|---|
+| New directory | lookup and mkdir of (parent, name) | `lookup`, `mkdir` |
+| New symlink | lookup and symlink of (parent, name) | `lookup`, `symlink` |
+| New file | lookup and create of (parent, name), open of the new inode for writing; then a setattr of the inode for the truncate | `lookup`, `create`, `open`, `setattr` |
+| Modified file | open of the inode for writing; then a setattr of the inode for the truncate (or for the `chmod` fallback) | `open`, `setattr` |
+| Mode or mtime change | setattr of the inode | `setattr` |
+| Deleted entry | lookup and unlink or rmdir of (parent, name) | `lookup`, `unlink`, `rmdir` |
+| Renamed entry | lookup of the source and of the target, and the rename of both (parent, name) pairs | `lookup`, `rename` |
+
+A setattr counts as injected only if it carries no file handle or the injected one, and an open only if it is for writing. A `mknod`, `link` or `fallocate` is never armed on macOS and is always served as a user's. The names compared are the bytes the kernel sends, so a backend that rewrites a name (a normalisation) makes that request an ordinary one and the event is not seen by watchers.
+
+On macOS the injector thread first waits for the mount volume to show and opens its root only then; see [the macOS guest](#the-macos-guest-experimental).
 
 Events for one burst of host changes are injected in the order the host reported them, so a create comes before a modify of the same file. A host change only to ctime (a rename or a new hard link) raises no `IN_ATTRIB`, as on a native filesystem.
 

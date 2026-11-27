@@ -74,7 +74,10 @@ impl From<super::fuse::Backend> for BackendKind {
 pub enum Ident {
     // a request's process id is csync's own, and only the injector thread touches the mount
     Pid,
-    // the process id was not shown to be csync's, so no request can be told from an injected one and events are not replayed
+    // requests carry no usable process id (fskit sends 0), so the injector arms what it is about to do and a request is
+    // its own only while an exact description of it is armed
+    Window,
+    // the requests could not be told from an injected one at all, so events are not replayed
     Claim,
 }
 
@@ -117,6 +120,12 @@ impl Seen {
     fn is(self, own: Seen) -> bool {
         let agree = |a: Option<u32>, b: Option<u32>| a.zip(b).is_none_or(|(a, b)| a == b);
         self.pid == own.pid && agree(self.uid, own.uid) && agree(self.gid, own.gid)
+    }
+
+    // a reported uid or gid is known and differs from ours
+    fn foreign(self, own: Seen) -> bool {
+        let differs = |a: Option<u32>, b: Option<u32>| a.zip(b).is_some_and(|(a, b)| a != b);
+        differs(self.uid, own.uid) || differs(self.gid, own.gid)
     }
 }
 
@@ -178,8 +187,8 @@ impl Coherence {
     pub fn via(&self) -> Via {
         match (self.ident, self.native()) {
             (Ident::Claim, _) => Via::Off,
-            (Ident::Pid, true) => Via::Native,
-            (Ident::Pid, false) => Via::Injected,
+            (Ident::Pid | Ident::Window, true) => Via::Native,
+            (Ident::Pid | Ident::Window, false) => Via::Injected,
         }
     }
 }
@@ -190,6 +199,7 @@ pub fn decide(obs: &ProbeObs, backend: BackendKind) -> Coherence {
     let (attrs, entries, data) = (proven(obs.attrs), proven(obs.entries), proven(obs.data));
     let ident = match obs.req {
         Some(r) if r.is(obs.own) => Ident::Pid,
+        Some(r) if r.pid != obs.own.pid && r.foreign(obs.own) => Ident::Window,
         _ => Ident::Claim,
     };
     // fskit ignores the entry lifetime a reply carries, so only the kext is trusted with the long one
@@ -249,8 +259,8 @@ pub fn keep_cache() -> bool {
     LIVE.keep.load(Relaxed)
 }
 
-// the backend and how invalidation is done, for the status line; None before a mount
-pub fn summary() -> Option<String> {
+// the backend and how invalidation is done, as the status words; None before a mount
+pub fn status() -> Option<(&'static str, &'static str)> {
     let backend = match LIVE.backend.load(Relaxed) {
         1 => BackendKind::FsKit,
         2 => BackendKind::Kext,
@@ -262,7 +272,11 @@ pub fn summary() -> Option<String> {
         c if c == Via::Off.code() => Via::Off.name(),
         _ => "probing",
     };
-    Some(format!("{}, inval {via}", backend.name()))
+    Some((backend.name(), via))
+}
+
+pub fn summary() -> Option<String> {
+    status().map(|(backend, via)| format!("{backend}, inval {via}"))
 }
 
 // what the filesystem's own handlers saw of the probe, shared with them
@@ -656,6 +670,49 @@ mod tests {
     }
 
     #[test]
+    fn requests_from_pid_zero_and_a_foreign_uid_are_told_apart_by_the_window() {
+        let fskit = Seen {
+            pid: 0,
+            uid: Some(0),
+            gid: Some(0),
+        };
+        let o = ProbeObs {
+            req: Some(fskit),
+            ..obs()
+        };
+        let c = decide(&o, BackendKind::FsKit);
+        assert_eq!(c.ident, Ident::Window);
+        assert_eq!(c.via(), Via::Native);
+        let none = Step {
+            held: true,
+            fresh: false,
+        };
+        let o = ProbeObs {
+            attrs: none,
+            entries: none,
+            data: none,
+            req: Some(fskit),
+            ..obs()
+        };
+        assert_eq!(decide(&o, BackendKind::FsKit).via(), Via::Injected);
+    }
+
+    #[test]
+    fn another_pid_with_our_own_uid_and_gid_is_still_not_identified() {
+        let o = ProbeObs {
+            req: Some(Seen { pid: 0, ..OWN }),
+            ..obs()
+        };
+        assert_eq!(decide(&o, BackendKind::FsKit).ident, Ident::Claim);
+    }
+
+    #[test]
+    fn a_matching_pid_keeps_the_pid_identification() {
+        let c = decide(&obs(), BackendKind::FsKit);
+        assert_eq!(c.ident, Ident::Pid);
+    }
+
+    #[test]
     fn a_matching_pid_with_another_uid_is_not_ours() {
         let o = ProbeObs {
             req: Some(Seen {
@@ -724,6 +781,7 @@ mod tests {
         assert_eq!(summary(), None);
         begin(BackendKind::FsKit);
         assert_eq!(summary().as_deref(), Some("fskit, inval probing"));
+        assert_eq!(status(), Some(("fskit", "probing")));
         assert_eq!(synced_ttl(), SHORT_TTL);
         assert!(!keep_cache());
         apply(&decide(&obs(), BackendKind::Kext), BackendKind::Kext);

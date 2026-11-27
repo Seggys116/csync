@@ -2,6 +2,7 @@
 use super::{
     fs::{Core, GuestFs, IO_MAX},
     fuse::{Backend, BackgroundSession, MountOpts, mount},
+    wipe,
 };
 use std::{
     ffi::OsStr,
@@ -66,9 +67,36 @@ fn parse_line(l: &str) -> Option<Entry> {
     })
 }
 
+fn fuse_type(name: &str) -> bool {
+    let ty = name.to_ascii_lowercase();
+    FS_NAMES.iter().any(|n| ty.contains(n))
+}
+
 fn is_csync(e: &Entry, at: &Path) -> bool {
-    let ty = e.fstype.to_ascii_lowercase();
-    e.on == at && e.from.starts_with("csync") && FS_NAMES.iter().any(|n| ty.contains(n))
+    e.on == at && e.from.starts_with("csync") && fuse_type(&e.fstype)
+}
+
+fn fstype_of(st: &rustix::fs::StatFs) -> String {
+    let raw: Vec<u8> = st
+        .f_fstypename
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&b| b != 0)
+        .collect();
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+// the path shows the volume once its type is a fuse one or its device is no longer the one it had before the mount
+pub(super) fn shows_volume(fstype: &str, dev: u64, before: Option<u64>) -> bool {
+    fuse_type(fstype) || before.is_some_and(|b| b != dev)
+}
+
+// the device of the volume the mount point shows now, None while it still shows what was under it. statfs is
+// asked of the path itself, so this holds before the mount table lists the mount
+pub(super) fn volume_dev(at: &Path, before: Option<u64>) -> Option<u64> {
+    let dev = wipe::device_of(at)?;
+    let st = rustix::fs::statfs(at).ok()?;
+    shows_volume(&fstype_of(&st), dev, before).then_some(dev)
 }
 
 // the kernel resolves symlinks in a mount point, so the table names it by its real path; the leaf may be dead
@@ -200,6 +228,33 @@ mod tests {
             &line("csync on /private/tmp/proj (apfs, local)"),
             at
         ));
+    }
+
+    #[test]
+    fn a_path_shows_the_volume_by_its_type_or_by_a_new_device() {
+        assert!(shows_volume("macfuse", 7, Some(7)));
+        assert!(shows_volume("FSKit", 7, None));
+        assert!(shows_volume("apfs", 8, Some(7)));
+        assert!(!shows_volume("apfs", 7, Some(7)));
+        assert!(!shows_volume("apfs", 7, None));
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_mount_never_shows_a_volume() {
+        let tmp = std::env::temp_dir();
+        let dev = wipe::device_of(&tmp).unwrap();
+        assert_eq!(volume_dev(&tmp, Some(dev)), None);
+        assert_eq!(volume_dev(&tmp, Some(dev ^ 1)), Some(dev));
+        assert_eq!(
+            volume_dev(Path::new("/csync-no-such-mount-point"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn the_filesystem_type_is_read_up_to_its_terminator() {
+        let ty = fstype_of(&rustix::fs::statfs("/").unwrap());
+        assert!(!ty.is_empty() && ty.bytes().all(|b| b.is_ascii_alphanumeric()));
     }
 
     #[test]

@@ -12,7 +12,7 @@ use super::fuse::{
 #[cfg(target_os = "linux")]
 use super::fuse::{Config, MountOption, Session, SessionACL};
 use super::gitindex::{self, Shown};
-use super::inject::Injector;
+use super::inject::{Act, Injector};
 use super::prefetch::{Hint, Prefetch};
 use super::tree::{
     DETACHED, Effect, GDomain, GNode, GTree, NodeId, ROOT, Refuse, Special, Synth, Vis, dir_meta,
@@ -1553,10 +1553,26 @@ enum Io {
 
 type Listing = Arc<Vec<(NodeId, Option<Name>)>>;
 
+// the entries one pass over a directory handle serves; a pass restarts when the kernel rewinds to offset 0
+struct Snap {
+    list: Mutex<Listing>,
+    // set until the first read: the listing made by opendir is that read's snapshot, so open and read list once
+    fresh: AtomicBool,
+}
+
+impl Snap {
+    fn new(list: Listing) -> Self {
+        Snap {
+            list: Mutex::new(list),
+            fresh: AtomicBool::new(true),
+        }
+    }
+}
+
 type Swap = Mutex<Option<Box<(Version, RelPath)>>>;
 
 enum Src {
-    Dir(Listing),
+    Dir(Snap),
     Empty,
     Blob {
         path: RelPath,
@@ -1749,15 +1765,22 @@ impl GuestFs {
         }
     }
 
+    // the act says what the request asks for: only where the process id cannot tell requests apart is it looked at
     #[cfg(target_os = "linux")]
-    fn is_inj(&self, req: &Request) -> bool {
+    #[inline]
+    fn is_inj(&self, req: &Request, _act: Act<'_>) -> bool {
         self.core.inj.get().is_some_and(|i| i.is_self(req.pid()))
     }
 
     // the startup self-test drives the mount from the injector thread and must be served as a user
     #[cfg(target_os = "macos")]
-    fn is_inj(&self, req: &Request) -> bool {
-        !coherence::PROBE.active() && self.core.inj.get().is_some_and(|i| i.is_self(req.pid()))
+    fn is_inj(&self, req: &Request, act: Act<'_>) -> bool {
+        !coherence::PROBE.active()
+            && self
+                .core
+                .inj
+                .get()
+                .is_some_and(|i| i.recognises(req.pid(), &act))
     }
 
     fn add_handle(&self, h: Handle) -> u64 {
@@ -1863,15 +1886,26 @@ impl GuestFs {
         Ok(Arc::new(list))
     }
 
-    // fh 0 means the kernel skips opendir: offset 0 snapshots the directory, later offsets reuse it
+    // a handle's pass starts at offset 0 with a fresh listing, since the kernel reuses a handle for a rewound read, and
+    // later offsets continue that snapshot. fh 0 means the kernel skips opendir: offset 0 snapshots the directory,
+    // later offsets reuse it
     fn dir_list(&self, ino: NodeId, fh: u64, offset: u64) -> Result<Listing, Errno> {
         if fh != INJ_FH {
-            return match self.handle(fh).as_deref() {
-                Some(Handle {
-                    src: Src::Dir(l), ..
-                }) => Ok(l.clone()),
-                _ => Err(Errno::EBADF),
+            let h = self.handle(fh);
+            let Some(Handle {
+                src: Src::Dir(snap),
+                ..
+            }) = h.as_deref()
+            else {
+                return Err(Errno::EBADF);
             };
+            let first = snap.fresh.swap(false, Relaxed);
+            if offset != 0 || first {
+                return Ok(lock(&snap.list).clone());
+            }
+            let l = self.listing(ino)?;
+            *lock(&snap.list) = l.clone();
+            return Ok(l);
         }
         if offset != 0
             && let Some(l) = lock(&self.lists).get(&ino)
@@ -3975,7 +4009,7 @@ impl Filesystem for GuestFs {
         let Some(name) = name.to_str() else {
             return reply.error(Errno::ENOENT);
         };
-        let inj = self.is_inj(req);
+        let inj = self.is_inj(req, Act::Lookup(parent.0, name.as_bytes()));
         let mut gone = false;
         for pass in 0..2 {
             {
@@ -4084,11 +4118,12 @@ impl Filesystem for GuestFs {
         reply: ReplyAttr,
     ) {
         self.core.ctr.op(Op::Setattr);
+        let act = Act::Setattr(ino.0, fh.is_none_or(|f| f.0 == INJ_FH));
         #[cfg(target_os = "linux")]
-        let inj = self.is_inj(req);
+        let inj = self.is_inj(req, act);
         // the self-test's truncate is answered as an injected one: the reply, not a truncate, sets the size
         #[cfg(target_os = "macos")]
-        let inj = self.is_inj(req) || coherence::PROBE.setattr(ino.0);
+        let inj = self.is_inj(req, act) || coherence::PROBE.setattr(ino.0);
         if !inj && let Err(e) = self.do_setattr(ino.0, mode, uid, gid, size, atime, mtime, fh) {
             return reply.error(e);
         }
@@ -4139,7 +4174,7 @@ impl Filesystem for GuestFs {
         if mode & S_IFMT != S_IFREG && special == Special::None {
             return reply.error(Errno::EPERM);
         }
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Mknod(parent.0, name.as_encoded_bytes())) {
             return reply.error(Errno::EEXIST);
         }
         let name = match name_of(name) {
@@ -4195,7 +4230,7 @@ impl Filesystem for GuestFs {
             Ok(n) => n,
             Err(e) => return reply.error(e),
         };
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Mkdir(parent.0, name.as_str().as_bytes())) {
             let done = self.core.tw().complete_create(parent.0, name.as_str());
             return match done {
                 Some(id) => {
@@ -4214,7 +4249,7 @@ impl Filesystem for GuestFs {
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.core.ctr.op(Op::Mutate);
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Unlink(parent.0, name.as_encoded_bytes())) {
             let ok = name
                 .to_str()
                 .is_some_and(|n| self.core.tw().complete_delete(parent.0, n));
@@ -4232,7 +4267,7 @@ impl Filesystem for GuestFs {
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         self.core.ctr.op(Op::Mutate);
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Rmdir(parent.0, name.as_encoded_bytes())) {
             let ok = name
                 .to_str()
                 .is_some_and(|n| self.core.tw().complete_delete(parent.0, n));
@@ -4262,7 +4297,7 @@ impl Filesystem for GuestFs {
             Ok(n) => n,
             Err(e) => return reply.error(e),
         };
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Symlink(parent.0, name.as_str().as_bytes())) {
             let done = self.core.tw().complete_create(parent.0, name.as_str());
             return match done {
                 Some(id) => {
@@ -4294,7 +4329,13 @@ impl Filesystem for GuestFs {
         reply: ReplyEmpty,
     ) {
         self.core.ctr.op(Op::Mutate);
-        if self.is_inj(req) {
+        let act = Act::Rename(
+            parent.0,
+            name.as_encoded_bytes(),
+            newparent.0,
+            newname.as_encoded_bytes(),
+        );
+        if self.is_inj(req, act) {
             let ok = match (name.to_str(), newname.to_str()) {
                 (Some(a), Some(b)) => self.core.tw().complete_move(parent.0, a, newparent.0, b),
                 _ => false,
@@ -4320,7 +4361,8 @@ impl Filesystem for GuestFs {
         reply: ReplyOpen,
     ) {
         self.core.ctr.op(Op::Open);
-        if self.is_inj(req) {
+        let reading = flags.acc_mode() == OpenAccMode::O_RDONLY;
+        if self.is_inj(req, Act::Open(ino.0, !reading)) {
             let nf = self.noflush(&Src::Empty);
             let live = lock(&self.io).get(&ino.0).and_then(|e| e.backing.upgrade());
             return match live {
@@ -4828,7 +4870,7 @@ impl Filesystem for GuestFs {
         let fh = self.add_handle(Handle {
             node: ino.0,
             io: Io::None,
-            src: Src::Dir(list),
+            src: Src::Dir(Snap::new(list)),
         });
         reply.opened(
             FileHandle(fh),
@@ -5036,7 +5078,7 @@ impl Filesystem for GuestFs {
             Ok(n) => n,
             Err(e) => return reply.error(e),
         };
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Create(parent.0, name.as_str().as_bytes())) {
             let mut t = self.core.tw();
             let done = t.complete_create(parent.0, name.as_str());
             return match done.and_then(|id| {
@@ -5092,7 +5134,7 @@ impl Filesystem for GuestFs {
         reply: ReplyEntry,
     ) {
         self.core.ctr.op(Op::Mutate);
-        if self.is_inj(req) {
+        if self.is_inj(req, Act::Link(newparent.0, newname.as_encoded_bytes())) {
             return reply.error(Errno::EPERM);
         }
         match self.do_link(ino.0, newparent.0, newname) {
@@ -5105,7 +5147,7 @@ impl Filesystem for GuestFs {
     fn fallocate(
         &self,
         req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         length: u64,
@@ -5114,7 +5156,8 @@ impl Filesystem for GuestFs {
     ) {
         self.core.ctr.op(Op::Other);
         // the injector's modify event: nothing to allocate
-        if self.is_inj(req) && fh.0 == INJ_FH && mode == KEEP_SIZE {
+        let ours = fh.0 == INJ_FH;
+        if ours && mode == KEEP_SIZE && self.is_inj(req, Act::Fallocate(ino.0, ours)) {
             return reply.ok();
         }
         let Some(h) = self.handle(fh.0) else {
@@ -5909,6 +5952,55 @@ mod tests {
         Ok(Reply::Done {
             meta: dir_meta(perm),
         })
+    }
+
+    fn host_file(tree: &RwLock<GTree>, name: &str, ver: Seq) {
+        let up = Change::Upsert {
+            path: rp(name),
+            meta: pending_meta(1),
+            ver,
+        };
+        tree.write().unwrap().apply(&up, &mut Vec::new());
+    }
+
+    #[test]
+    fn a_rewound_read_of_an_open_directory_shows_what_the_host_added_since() {
+        let r = rig("dir-rewind");
+        r.core.tree.write().unwrap().set_version(INDEX, 1);
+        host_file(&r.core.tree, "a.rs", 1);
+        let gfs = GuestFs::new(r.core.clone());
+        let opened = Snap::new(gfs.listing(ROOT).unwrap());
+        let fh = gfs.add_handle(Handle {
+            node: ROOT,
+            io: Io::None,
+            src: Src::Dir(opened),
+        });
+        host_file(&r.core.tree, "b.rs", 2);
+        let first = gfs.dir_list(ROOT, fh, 0).unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "the first read serves the listing opendir made"
+        );
+        host_file(&r.core.tree, "c.rs", 3);
+        let rewound = gfs.dir_list(ROOT, fh, 0).unwrap();
+        assert_eq!(rewound.len(), 3, "a rewound pass lists the directory again");
+        host_file(&r.core.tree, "d.rs", 4);
+        let next = gfs.dir_list(ROOT, fh, 3).unwrap();
+        assert_eq!(
+            next.len(),
+            3,
+            "a later offset continues the pass's snapshot"
+        );
+        assert!(Arc::ptr_eq(&rewound, &next));
+        assert_eq!(gfs.dir_list(ROOT, fh, 0).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_read_of_a_handle_that_is_not_a_directory_is_refused() {
+        let r = rig("dir-badfh");
+        let gfs = GuestFs::new(r.core.clone());
+        assert_eq!(gfs.dir_list(ROOT, 77, 0).err(), Some(Errno::EBADF));
     }
 
     #[test]
