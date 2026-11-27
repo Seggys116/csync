@@ -1,5 +1,5 @@
 use super::cache::{Batch, BlobCache, lock};
-use super::tree::{GDomain, GTree, NodeId, ROOT, Vis};
+use super::tree::{GDomain, GNode, GTree, NodeId, ROOT, Vis};
 use crate::net::rpc::RpcError;
 use crate::proto::{
     BATCH_MAX, Hash32, Kind, Op, RANGE_FILE_MIN, RelPath, Reply, Seq, VerKey, Version,
@@ -103,6 +103,11 @@ pub struct Item {
 // the prefetcher's view of the guest tree; implemented for the usual lock wrappers of GTree
 pub trait TreeView: Send + Sync {
     fn list(&self, dir: NodeId, out: &mut Vec<Item>) -> bool;
+    // at least the children `eligible` could pass for a sibling fetch of `except`; the caller still filters
+    fn list_fetchable(&self, dir: NodeId, except: NodeId, max: u64, out: &mut Vec<Item>) -> bool {
+        let _ = (except, max);
+        self.list(dir, out)
+    }
     fn item(&self, node: NodeId) -> Option<Item>;
     fn files(&self) -> u64;
     // records the verified hash of a pending file fetched at host version `ver`; false when the node moved on
@@ -126,7 +131,13 @@ fn gtree_item(t: &GTree, id: NodeId, path: RelPath) -> Option<Item> {
     })
 }
 
-fn gtree_list(t: &GTree, dir: NodeId, out: &mut Vec<Item>) -> bool {
+// a path is built only for the children `keep` passes
+fn gtree_walk(
+    t: &GTree,
+    dir: NodeId,
+    out: &mut Vec<Item>,
+    keep: impl Fn(NodeId, &GNode) -> bool,
+) -> bool {
     let Some(children) = t.get(dir).and_then(|d| d.children.as_ref()) else {
         return false;
     };
@@ -138,12 +149,38 @@ fn gtree_list(t: &GTree, dir: NodeId, out: &mut Vec<Item>) -> bool {
         return false;
     };
     for (name, &id) in children {
+        if !t.get(id).is_some_and(|n| keep(id, n)) {
+            continue;
+        }
         let Ok(p) = base.join(name) else { continue };
         if let Some(i) = gtree_item(t, id, p) {
             out.push(i);
         }
     }
     true
+}
+
+fn gtree_list(t: &GTree, dir: NodeId, out: &mut Vec<Item>) -> bool {
+    gtree_walk(t, dir, out, |_, _| true)
+}
+
+// mirrors `eligible` for everything but the cache lookup, which needs no tree lock
+fn gtree_list_fetchable(
+    t: &GTree,
+    dir: NodeId,
+    except: NodeId,
+    max: u64,
+    out: &mut Vec<Item>,
+) -> bool {
+    let index = t.index_id();
+    gtree_walk(t, dir, out, |id, n| {
+        id != except
+            && n.meta.kind != Kind::Dir
+            && n.domain != GDomain::Local
+            && n.vis != Vis::PendingDelete
+            && n.meta.size <= max
+            && (n.meta.hash.is_some() || (n.is_pending() && n.ver_key(index).is_some()))
+    })
 }
 
 fn gtree_node(t: &GTree, node: NodeId) -> Option<Item> {
@@ -157,6 +194,15 @@ fn gtree_node(t: &GTree, node: NodeId) -> Option<Item> {
 impl TreeView for RwLock<GTree> {
     fn list(&self, dir: NodeId, out: &mut Vec<Item>) -> bool {
         gtree_list(&self.read().unwrap_or_else(|e| e.into_inner()), dir, out)
+    }
+    fn list_fetchable(&self, dir: NodeId, except: NodeId, max: u64, out: &mut Vec<Item>) -> bool {
+        gtree_list_fetchable(
+            &self.read().unwrap_or_else(|e| e.into_inner()),
+            dir,
+            except,
+            max,
+            out,
+        )
     }
     fn item(&self, node: NodeId) -> Option<Item> {
         gtree_node(&self.read().unwrap_or_else(|e| e.into_inner()), node)
@@ -174,6 +220,9 @@ impl TreeView for RwLock<GTree> {
 impl TreeView for Mutex<GTree> {
     fn list(&self, dir: NodeId, out: &mut Vec<Item>) -> bool {
         gtree_list(&lock(self), dir, out)
+    }
+    fn list_fetchable(&self, dir: NodeId, except: NodeId, max: u64, out: &mut Vec<Item>) -> bool {
+        gtree_list_fetchable(&lock(self), dir, except, max, out)
     }
     fn item(&self, node: NodeId) -> Option<Item> {
         gtree_node(&lock(self), node)
@@ -651,7 +700,7 @@ impl Worker {
             return;
         }
         items.clear();
-        if !self.tree.list(dir, items) {
+        if !self.tree.list_fetchable(dir, node, SIBLING_MAX, items) {
             return;
         }
         let mut batch = Vec::new();
@@ -1180,6 +1229,61 @@ mod tests {
         for (b, r) in landed {
             w.land(b, r);
         }
+    }
+
+    #[test]
+    fn a_sibling_listing_builds_paths_only_for_children_that_could_be_fetched() {
+        use super::super::tree::Effect;
+        use crate::proto::{Change, Meta};
+        let meta = |kind: Kind, size: u64, hash: Option<Hash32>| Meta {
+            kind,
+            perm: 0o644,
+            size,
+            mtime_ns: 1,
+            ctime_ns: 0,
+            hash,
+            link: None,
+            git_ro: false,
+        };
+        let mut t = GTree::new();
+        let mut fx: Vec<Effect> = Vec::new();
+        let kids = [
+            ("d", meta(Kind::Dir, 0, None)),
+            ("d/small", meta(Kind::File, 10, Some([1; 32]))),
+            ("d/big", meta(Kind::File, 1000, Some([2; 32]))),
+            ("d/sub", meta(Kind::Dir, 0, None)),
+            ("d/self", meta(Kind::File, 10, Some([3; 32]))),
+        ];
+        for (p, m) in kids {
+            let change = Change::Upsert {
+                path: RelPath::new(p).unwrap(),
+                meta: m,
+                ver: 0,
+            };
+            t.apply(&change, &mut fx);
+        }
+        let id = |p: &str| t.resolve(&RelPath::new(p).unwrap()).unwrap();
+        let mut all = Vec::new();
+        assert!(gtree_list(&t, id("d"), &mut all));
+        assert_eq!(all.len(), 4);
+        let mut some = Vec::new();
+        assert!(gtree_list_fetchable(
+            &t,
+            id("d"),
+            id("d/self"),
+            100,
+            &mut some
+        ));
+        let names: Vec<&str> = some.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(names, ["d/small"]);
+        let mut none = Vec::new();
+        assert!(!gtree_list_fetchable(
+            &t,
+            id("d/small"),
+            ROOT,
+            100,
+            &mut none
+        ));
     }
 
     #[test]

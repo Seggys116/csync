@@ -17,9 +17,9 @@ use crate::net::conn::{
 };
 use crate::net::discover;
 use crate::proto::{
-    BATCH_MAX, Body, Bye, Change, DeltaOp, ExcludeSrc, FRAME_MAX, FsTraits, Hash32, Hello, IndexId,
-    Kind, LinkTarget, Meta, Msg, Name, Notice, NoticeKind, Op, PROTO, Push, RelPath, Reply, ReqId,
-    Seq, SnapEntry, UNACKED_PUSH_MAX, Welcome, WireErr,
+    BATCH_MAX, Body, Bye, Change, DeltaOp, ExcludeSrc, FRAME_MAX, FsTraits, Hash32, Hello,
+    INLINE_MAX, IndexId, Kind, LinkTarget, Meta, Msg, Name, Notice, NoticeKind, Op, PROTO, Push,
+    RelPath, Reply, ReqId, Seq, SnapEntry, UNACKED_PUSH_MAX, Welcome, WireErr,
     hs::{HsHello, PAIR_TIMEOUT_S, PairStep, Role},
     path::TMP_PREFIX,
 };
@@ -53,12 +53,16 @@ const EVENT_QUEUE: usize = 4_096;
 const COMMIT_QUEUE: usize = 256;
 const FETCH_QUEUE: usize = 1_024;
 const FETCH_THREADS: usize = 4;
+const LIGHT_THREADS: usize = 2;
 const HASH_THREADS: usize = 2;
 const VERIFY_BLOCK: usize = 4 << 20;
+const PAR_VERIFY_MIN: u64 = 1 << 20;
 pub(crate) const FETCH_INFLIGHT_MAX: usize = 128;
 const UPLOADS_MAX: usize = 64;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(30);
+// the guest answers every ping, so this long without a single frame means the peer is gone
+const PEER_SILENT: Duration = PING_EVERY.saturating_mul(3);
 const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 const UPLOAD_REAP: Duration = Duration::from_secs(5);
 const UI_EVERY: Duration = Duration::from_millis(200);
@@ -243,7 +247,7 @@ thread_local! {
 
 // the hash of the open file's first k1.size bytes, or None when the file is not provably the version k1 describes
 pub(crate) fn hash_verified(fd: BorrowedFd<'_>, k1: &StatKey) -> io::Result<Option<Hash32>> {
-    hash_verified_paced(fd, k1, &mut || true)
+    hash_verified_with(fd, k1, &mut || true, k1.size >= PAR_VERIFY_MIN)
 }
 
 // as hash_verified; pace runs before every read and returns false to give up
@@ -251,6 +255,16 @@ pub(crate) fn hash_verified_paced(
     fd: BorrowedFd<'_>,
     k1: &StatKey,
     pace: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<Hash32>> {
+    hash_verified_with(fd, k1, pace, false)
+}
+
+// parallel spreads each block over the rayon pool; the digest is the same either way
+fn hash_verified_with(
+    fd: BorrowedFd<'_>,
+    k1: &StatKey,
+    pace: &mut dyn FnMut() -> bool,
+    parallel: bool,
 ) -> io::Result<Option<Hash32>> {
     let mut buf = VBUF.take();
     let first = k1.size.min(VERIFY_BLOCK as u64) as usize;
@@ -271,7 +285,11 @@ pub(crate) fn hash_verified_paced(
             // the file shrank under the read
             Ok(0) => break Ok(false),
             Ok(m) => {
-                h.update(&buf[..m]);
+                if parallel {
+                    h.update_rayon(&buf[..m]);
+                } else {
+                    h.update(&buf[..m]);
+                }
                 off += m as u64;
             }
             Err(rustix::io::Errno::INTR) => {}
@@ -1173,6 +1191,13 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         fetch_hs.push(spawn("csync-fetch", move || serve::run(&c, &rx))?);
     }
     drop(fetch_rx);
+    let (light_tx, light_rx) = bounded::<serve::FetchJob>(FETCH_QUEUE);
+    let mut light_hs = Vec::with_capacity(LIGHT_THREADS);
+    for _ in 0..LIGHT_THREADS {
+        let (c, rx) = (core.clone(), light_rx.clone());
+        light_hs.push(spawn("csync-light", move || serve::run(&c, &rx))?);
+    }
+    drop(light_rx);
     {
         let c = core.clone();
         spawn("csync-sweep", move || sweep_temps(&c, started))?;
@@ -1211,6 +1236,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         trust,
         jobs: job_tx,
         fetch: fetch_tx,
+        light: light_tx,
         next_id: 1,
         pending: None,
         sessions: Vec::new(),
@@ -1267,6 +1293,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     let Host {
         jobs,
         fetch,
+        light,
         sessions,
         ..
     } = host;
@@ -1276,7 +1303,8 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     drop(jobs);
     let _ = commit_h.join();
     drop(fetch);
-    for h in fetch_hs {
+    drop(light);
+    for h in fetch_hs.into_iter().chain(light_hs) {
         let _ = h.join();
     }
     hasher.stop();
@@ -1308,6 +1336,7 @@ struct Host {
     trust: Arc<Trust>,
     jobs: Sender<commit::Job>,
     fetch: Sender<serve::FetchJob>,
+    light: Sender<serve::FetchJob>,
     next_id: u64,
     pending: Option<Pairing>,
     sessions: Vec<JoinHandle<()>>,
@@ -1499,6 +1528,7 @@ impl Host {
             inbox,
             jobs: self.jobs.clone(),
             fetch: self.fetch.clone(),
+            light: self.light.clone(),
             uploads: FxHashMap::default(),
             order: VecDeque::new(),
             held: FxHashMap::default(),
@@ -1560,6 +1590,7 @@ struct SessionCtx {
     inbox: Receiver<In>,
     jobs: Sender<commit::Job>,
     fetch: Sender<serve::FetchJob>,
+    light: Sender<serve::FetchJob>,
     uploads: FxHashMap<ReqId, Upload>,
     // mutations not yet handed to the committer, in the order the guest sent them
     order: VecDeque<ReqId>,
@@ -1633,6 +1664,7 @@ impl SessionCtx {
     }
 
     fn serve(&mut self) {
+        let mut last_rx = Instant::now();
         loop {
             let wait = if self.uploads.is_empty() {
                 PING_EVERY
@@ -1641,8 +1673,15 @@ impl SessionCtx {
             };
             match self.inbox.recv_timeout(wait) {
                 Ok(In::Closed(_)) | Err(RecvTimeoutError::Disconnected) => return,
-                Err(RecvTimeoutError::Timeout) => self.reap(),
+                Err(RecvTimeoutError::Timeout) => {
+                    if last_rx.elapsed() >= PEER_SILENT {
+                        self.g.link.close(CloseReason::Io(io::ErrorKind::TimedOut));
+                        return;
+                    }
+                    self.reap();
+                }
                 Ok(In::Msg(m)) => {
+                    last_rx = Instant::now();
                     if !self.on_msg(m) {
                         return;
                     }
@@ -1652,7 +1691,10 @@ impl SessionCtx {
                     off,
                     last,
                     data,
-                }) => self.on_chunk(id, off, last, &data),
+                }) => {
+                    last_rx = Instant::now();
+                    self.on_chunk(id, off, last, &data);
+                }
             }
             if self.last_ping.elapsed() >= PING_EVERY {
                 self.ping();
@@ -1781,12 +1823,48 @@ impl SessionCtx {
         }
     }
 
+    // the indexed size and whether the entry already has a hash, as a request for it would find them
+    fn indexed(&self, path: &RelPath) -> Option<(u64, bool)> {
+        self.core
+            .tree()
+            .get(path)
+            .map(|e| (e.stat.size, e.meta.hash.is_some()))
+    }
+
+    // work that never streams a large file and never hashes one: it must not queue behind a long stream
+    fn is_light(&self, op: &Op) -> bool {
+        // a pending large file is hashed whole first, which is bulk work
+        let cheap = |path: &RelPath| match self.indexed(path) {
+            Some((size, hashed)) => hashed || size <= INLINE_MAX as u64,
+            None => true,
+        };
+        match op {
+            Op::Hashes { .. } | Op::FetchMany { .. } => true,
+            Op::Resolve { path, .. } => cheap(path),
+            Op::Fetch {
+                path,
+                range: Some(_),
+                ..
+            } => cheap(path),
+            Op::Fetch {
+                path, range: None, ..
+            } => self
+                .indexed(path)
+                .is_some_and(|(size, _)| size <= INLINE_MAX as u64),
+            _ => false,
+        }
+    }
+
     fn queue_fetch(&mut self, id: ReqId, op: Op) {
         if let Err(e) = self.g.begin_fetch(id) {
             return self.g.reply(id, Err(e));
         }
-        if self
-            .fetch
+        let lane = if self.is_light(&op) {
+            &self.light
+        } else {
+            &self.fetch
+        };
+        if lane
             .try_send(serve::FetchJob {
                 guest: self.g.clone(),
                 id,
@@ -1974,12 +2052,14 @@ mod tests {
         ));
         let (jobs, jrx) = crossbeam_channel::unbounded();
         let (fetch, _) = bounded(4);
+        let (light, _) = bounded(4);
         let ctx = SessionCtx {
             core: Arc::new(core),
             g,
             inbox: host_end.inbox,
             jobs,
             fetch,
+            light,
             uploads: FxHashMap::default(),
             order: VecDeque::new(),
             held: FxHashMap::default(),
@@ -2008,6 +2088,53 @@ mod tests {
 
     fn ids(rx: &Receiver<commit::Job>) -> Vec<ReqId> {
         rx.try_iter().map(|j| j.id).collect()
+    }
+
+    fn fetch_of(path: &str, range: Option<(u64, u32)>) -> Op {
+        Op::Fetch {
+            path: RelPath::new(path).unwrap(),
+            want: None,
+            have: None,
+            range,
+        }
+    }
+
+    #[test]
+    fn only_work_that_cannot_stream_or_hash_a_large_file_takes_the_light_lane() {
+        let (_t, mut s, _jobs, _peer) = session_with(|root| {
+            std::fs::write(root.join("small"), b"hi").unwrap();
+            std::fs::write(root.join("big"), vec![1u8; INLINE_MAX + 1]).unwrap();
+        });
+        let resolve = |p: &str| Op::Resolve {
+            path: RelPath::new(p).unwrap(),
+            at: crate::proto::VerKey {
+                index: 0,
+                ver: 0,
+                size: 0,
+            },
+            inline: false,
+        };
+        assert!(s.is_light(&Op::Hashes {
+            index: 0,
+            items: Vec::new()
+        }));
+        assert!(s.is_light(&Op::FetchMany { items: Vec::new() }));
+        assert!(s.is_light(&fetch_of("small", None)));
+        assert!(!s.is_light(&fetch_of("big", None)));
+        assert!(s.is_light(&fetch_of("small", Some((0, 1)))));
+        assert!(!s.is_light(&fetch_of("big", Some((0, 1)))));
+        assert!(s.is_light(&resolve("small")));
+        assert!(!s.is_light(&resolve("big")));
+        assert!(!s.is_light(&fetch_of("missing", None)));
+
+        let (ftx, frx) = bounded(8);
+        let (ltx, lrx) = bounded(8);
+        s.fetch = ftx;
+        s.light = ltx;
+        s.queue_fetch(1, fetch_of("small", None));
+        s.queue_fetch(2, fetch_of("big", None));
+        assert_eq!(lrx.try_iter().map(|j| j.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(frx.try_iter().map(|j| j.id).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -2157,6 +2284,8 @@ mod tests {
             0,
             1,
             4096,
+            PAR_VERIFY_MIN as usize - 1,
+            PAR_VERIFY_MIN as usize,
             VERIFY_BLOCK - 1,
             VERIFY_BLOCK,
             VERIFY_BLOCK + 1,
@@ -2171,6 +2300,22 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    #[test]
+    fn the_parallel_and_the_paced_hash_agree() {
+        let t = scratch();
+        let p = t.0.join("f");
+        let data = body(2 * VERIFY_BLOCK + 12_345);
+        std::fs::write(&p, &data).unwrap();
+        let f = File::open(&p).unwrap();
+        let k1 = sys::stat_key(f.as_fd()).unwrap();
+        let want = Some(*blake3::hash(&data).as_bytes());
+        assert_eq!(hash_verified(f.as_fd(), &k1).unwrap(), want);
+        assert_eq!(
+            hash_verified_paced(f.as_fd(), &k1, &mut || true).unwrap(),
+            want
+        );
     }
 
     #[test]

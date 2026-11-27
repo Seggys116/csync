@@ -83,6 +83,12 @@ mod live {
     const STOP_POLL: Duration = Duration::from_millis(100);
     const UI_EVERY: Duration = Duration::from_millis(250);
     const PING_EVERY: Duration = Duration::from_secs(30);
+    // a live host answers every ping, so this long without anything from it means the link is dead
+    const SILENT_AFTER: Duration = PING_EVERY.saturating_mul(3);
+    // a session must stay up this long after its first synced batch before it counts as healthy
+    const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+    // the cap on the wait before redialing after sessions that keep dying young
+    const SHORT_SESSION_BACKOFF_MAX: Duration = Duration::from_secs(30);
     const RULE_JOBS: usize = 1_024;
     const RULE_WAIT: Duration = Duration::from_secs(30);
     const HASH_WAIT: Duration = Duration::from_secs(5);
@@ -296,6 +302,30 @@ mod live {
                 }
                 Ok(_) => {}
             }
+        }
+    }
+
+    // the wait before the first dial after a lost session, and the backoff carried to the next loss; only a healthy
+    // session clears it, so one that dies right after its snapshot cannot loop at full speed
+    fn redial_policy(carried: Duration, healthy: bool) -> (Duration, Duration) {
+        if healthy {
+            return (Duration::ZERO, Duration::ZERO);
+        }
+        let next = if carried.is_zero() {
+            BACKOFF_MIN
+        } else {
+            (carried * 2).min(SHORT_SESSION_BACKOFF_MAX)
+        };
+        (carried, next)
+    }
+
+    fn link_silent(heard: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(heard) >= SILENT_AFTER
+    }
+
+    fn wait_or_stop(stop: &AtomicBool, until: Instant) {
+        while !stop.load(Relaxed) && Instant::now() < until {
+            thread::sleep(STOP_POLL.min(until.saturating_duration_since(Instant::now())));
         }
     }
 
@@ -560,6 +590,10 @@ mod live {
             last_ui: Instant::now(),
             ui_due: None,
             last_ping: Instant::now(),
+            heard: Instant::now(),
+            synced_at: None,
+            redial: Duration::ZERO,
+            redial_wait: Duration::ZERO,
             rtt_us: 0,
             skew_ms: 0,
             notify: None,
@@ -610,12 +644,40 @@ mod live {
         last_ui: Instant,
         ui_due: Option<Instant>,
         last_ping: Instant,
+        // when anything last came off the inbox
+        heard: Instant,
+        // when the current session applied its first batch
+        synced_at: Option<Instant>,
+        // the backoff carried across sessions that died young, and the wait the next dialer starts with
+        redial: Duration,
+        redial_wait: Duration,
         rtt_us: u32,
         skew_ms: i64,
         notify: Option<Notify>,
         rule_paths: Vec<RelPath>,
         // what the host is told when the link closes at shutdown
         bye: CloseReason,
+    }
+
+    // small sets are cheaper to scan than to probe once per ancestor
+    const SCOPE_SCAN_MAX: usize = 32;
+
+    // true when path is a scope or lies under one
+    fn under_scope(own: &FxHashSet<RelPath>, path: &RelPath) -> bool {
+        if own.len() <= SCOPE_SCAN_MAX {
+            return own.iter().any(|s| path.starts_with(s));
+        }
+        if own.contains(path) {
+            return true;
+        }
+        let mut up = path.parent();
+        while let Some(p) = up {
+            if own.contains(&p) {
+                return true;
+            }
+            up = p.parent();
+        }
+        false
     }
 
     fn earliest(a: Option<Instant>, b: Instant) -> Option<Instant> {
@@ -752,7 +814,10 @@ mod live {
                 );
                 select! {
                     recv(inbox) -> m => match m {
-                        Ok(i) => self.on_in(i)?,
+                        Ok(i) => {
+                            self.heard = Instant::now();
+                            self.on_in(i)?
+                        }
                         Err(_) => self.lost(CloseReason::Eof)?,
                     },
                     recv(back) -> fx => match fx {
@@ -787,6 +852,7 @@ mod live {
             let mut due = self.ui_due;
             if self.link.is_some() {
                 due = earliest(due, self.last_ping + PING_EVERY);
+                due = earliest(due, self.heard + SILENT_AFTER);
             }
             match due {
                 Some(d) => after(d.saturating_duration_since(Instant::now())),
@@ -801,6 +867,13 @@ mod live {
             }
             if self.link.is_some() && now >= self.last_ping + PING_EVERY {
                 self.ping();
+            }
+            // queued input still counts as heard: the loop may only be late in reading it
+            if self.link.is_some() && link_silent(self.heard, now) && self.inbox.is_empty() {
+                self.heard = now;
+                if let Some(l) = &self.link {
+                    l.close(CloseReason::Io(io::ErrorKind::TimedOut));
+                }
             }
         }
 
@@ -823,6 +896,8 @@ mod live {
             self.link = Some(link);
             self.rpc = Some(rpc);
             self.inbox = inbox;
+            self.heard = Instant::now();
+            self.synced_at = None;
             self.dialing = false;
             self.snap_next = None;
             self.synced_entries = 0;
@@ -856,6 +931,11 @@ mod live {
             self.rpc = None;
             self.inbox = never();
             self.abort_snapshot();
+            let healthy = self
+                .synced_at
+                .take()
+                .is_some_and(|t| t.elapsed() >= HEALTHY_AFTER);
+            (self.redial_wait, self.redial) = redial_policy(self.redial, healthy);
             self.set_peer(ConnState::Disconnected { since_ms: now_ms() });
             self.spawn_dialer();
             Ok(())
@@ -878,6 +958,7 @@ mod live {
         }
 
         fn spawn_dialer(&mut self) {
+            let first_wait = std::mem::take(&mut self.redial_wait);
             if self.dialing {
                 return;
             }
@@ -898,6 +979,7 @@ mod live {
                 .name("csync-dial".into())
                 .spawn(move || {
                     let mut backoff = BACKOFF_MIN;
+                    wait_or_stop(&stop, Instant::now() + first_wait);
                     while !stop.load(Relaxed) {
                         match dial(addr, &id, Dial::Resume(key), &hs, false)
                             .and_then(|s| hello(&s, &tree).map(|w| (s, w)))
@@ -916,12 +998,7 @@ mod live {
                                 };
                                 let until = Instant::now() + backoff;
                                 backoff = (backoff * 2).min(max);
-                                while !stop.load(Relaxed) && Instant::now() < until {
-                                    thread::sleep(
-                                        STOP_POLL
-                                            .min(until.saturating_duration_since(Instant::now())),
-                                    );
-                                }
+                                wait_or_stop(&stop, until);
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(e));
@@ -1032,9 +1109,7 @@ mod live {
                         changes
                             .iter()
                             .filter_map(|c| match c {
-                                Change::Remove { path }
-                                    if own.iter().any(|s| path.starts_with(s)) =>
-                                {
+                                Change::Remove { path } if under_scope(&own, path) => {
                                     let n = t.resolve(path).and_then(|id| t.get(id))?;
                                     (n.domain == GDomain::Synced
                                         && r.classify(path, n.is_dir()) == Class::Ignored)
@@ -1157,6 +1232,7 @@ mod live {
 
         // a batch is fully applied: ack it, refresh ignore rules, and mount on the first one
         fn synced(&mut self, seq: u64, snapshot: bool) -> io::Result<()> {
+            self.synced_at.get_or_insert_with(Instant::now);
             if let Some(l) = &self.link {
                 let _ = l.send(Msg::Ack { seq });
             }
@@ -1785,6 +1861,74 @@ mod live {
                     Fail::Fatal(_)
                 ));
             }
+        }
+
+        #[test]
+        fn sessions_dying_young_back_off_and_a_healthy_one_dials_at_once() {
+            let (wait, mut carried) = redial_policy(Duration::ZERO, false);
+            assert_eq!(wait, Duration::ZERO, "the first loss dials at once");
+            assert_eq!(carried, BACKOFF_MIN);
+            let mut waits = Vec::new();
+            for _ in 0..20 {
+                let (w, c) = redial_policy(carried, false);
+                waits.push(w);
+                carried = c;
+            }
+            assert_eq!(waits[0], BACKOFF_MIN);
+            assert!(waits.windows(2).all(|p| p[0] <= p[1]));
+            assert!(waits.iter().all(|&w| w <= SHORT_SESSION_BACKOFF_MAX));
+            assert_eq!(waits[19], SHORT_SESSION_BACKOFF_MAX);
+            assert_eq!(
+                redial_policy(carried, true),
+                (Duration::ZERO, Duration::ZERO)
+            );
+            assert_eq!(
+                redial_policy(Duration::ZERO, true),
+                (Duration::ZERO, Duration::ZERO)
+            );
+        }
+
+        #[test]
+        fn a_link_is_silent_after_three_missed_pings() {
+            let t0 = Instant::now();
+            assert_eq!(SILENT_AFTER, PING_EVERY * 3);
+            assert!(!link_silent(
+                t0,
+                t0 + SILENT_AFTER - Duration::from_millis(1)
+            ));
+            assert!(link_silent(t0, t0 + SILENT_AFTER));
+            assert!(!link_silent(t0 + SILENT_AFTER, t0));
+        }
+
+        #[test]
+        fn scopes_match_by_ancestor_the_same_as_by_scan() {
+            let rp = |s: &str| RelPath::new(s).unwrap();
+            let paths = ["a", "a/b", "a/b/c.txt", "ab/c", "x/y/z", "q"].map(rp);
+            let mut own: FxHashSet<RelPath> = FxHashSet::default();
+            for i in 0..SCOPE_SCAN_MAX + 8 {
+                own.insert(rp(&format!("pad{i}/inner")));
+            }
+            let check = |own: &FxHashSet<RelPath>| {
+                for p in &paths {
+                    assert_eq!(
+                        under_scope(own, p),
+                        own.iter().any(|s| p.starts_with(s)),
+                        "{}",
+                        p.as_str()
+                    );
+                }
+            };
+            check(&own);
+            assert!(!under_scope(&own, &rp("pad1")));
+            assert!(under_scope(&own, &rp("pad1/inner/deep/file")));
+            own.insert(rp("a/b"));
+            check(&own);
+            assert!(under_scope(&own, &rp("a/b")) && under_scope(&own, &rp("a/b/c.txt")));
+            assert!(!under_scope(&own, &rp("a")) && !under_scope(&own, &rp("ab/c")));
+            own.insert(RelPath::root());
+            check(&own);
+            assert!(under_scope(&own, &rp("q")));
+            assert!(!under_scope(&FxHashSet::default(), &rp("q")));
         }
 
         use crate::proto::Meta;

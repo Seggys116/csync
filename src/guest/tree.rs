@@ -830,6 +830,28 @@ impl GTree {
         }
     }
 
+    // true when this forget took a node nothing else holds to zero; reap() then frees it under the write lock
+    pub fn drop_lookups(&self, id: NodeId, n: u64) -> bool {
+        if id == ROOT {
+            return false;
+        }
+        let Some(node) = self.get(id) else {
+            return false;
+        };
+        // fetch_update is deprecated and try_update is past the msrv
+        let mut cur = node.nlookup.load(Relaxed);
+        loop {
+            match node
+                .nlookup
+                .compare_exchange_weak(cur, cur.saturating_sub(n), Relaxed, Relaxed)
+            {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+        cur.saturating_sub(n) == 0 && node.open.load(Relaxed) == 0 && !node.attached()
+    }
+
     pub fn add_lookup(&self, id: NodeId) {
         if let Some(n) = self.get(id) {
             n.nlookup.fetch_add(1, Relaxed);
@@ -2313,6 +2335,42 @@ mod tests {
         assert_eq!(h, f);
         assert!(t.get(h).unwrap().r#gen > g0);
         t.forget(ROOT, 10);
+        assert!(t.get(ROOT).is_some());
+    }
+
+    #[test]
+    fn a_shared_forget_asks_for_the_slot_only_at_zero_unattached_and_unopened() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        t.add_lookup(f);
+        t.add_lookup(f);
+        assert!(!t.drop_lookups(f, 1), "one lookup is still held");
+        assert!(!t.drop_lookups(f, 1), "an attached node stays");
+        assert!(t.get(f).is_some());
+        t.add_lookup(f);
+        t.add_open(f);
+        let mut fx = Vec::new();
+        t.apply(&Change::Remove { path: rp("f") }, &mut fx);
+        assert!(t.get(f).is_some_and(|n| !n.attached()));
+        assert!(!t.drop_lookups(f, 1), "an open handle keeps the slot");
+        assert!(t.drop_open(f), "the last close asks for the slot");
+        t.reap(f);
+        assert!(t.get(f).is_none());
+
+        up(&mut t, "g", file(2));
+        let g = t.resolve(&rp("g")).unwrap();
+        t.add_lookup(g);
+        t.apply(&Change::Remove { path: rp("g") }, &mut fx);
+        assert!(t.get(g).is_some());
+        assert!(
+            t.drop_lookups(g, 5),
+            "an oversized forget saturates at zero"
+        );
+        t.reap(g);
+        assert!(t.get(g).is_none());
+        assert!(!t.drop_lookups(g, 1), "a freed slot is not asked for twice");
+        assert!(!t.drop_lookups(ROOT, 10));
         assert!(t.get(ROOT).is_some());
     }
 

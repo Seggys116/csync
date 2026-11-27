@@ -109,8 +109,8 @@ use ratatui::{
     buffer::Buffer,
     crossterm::{
         event::{
-            self, DisableFocusChange, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
-            KeyModifiers,
+            self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
+            EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
         },
         execute, queue,
         terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
@@ -131,6 +131,7 @@ use theme::Depth;
 use view::ViewState;
 
 const FRAME_MIN: Duration = anim::FRAME;
+const UNFOCUSED_FRAME: Duration = Duration::from_secs(1);
 const CMD_TIMEOUT: Duration = Duration::from_secs(1);
 const INPUT_QUEUE: usize = 64;
 const LINE_MAX: u64 = 4096;
@@ -237,10 +238,6 @@ impl UiBus {
     }
 }
 
-pub fn color_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
-}
-
 enum Action {
     None,
     Redraw,
@@ -252,8 +249,12 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
     if k.kind == KeyEventKind::Release {
         return Action::None;
     }
+    let repeat = k.kind == KeyEventKind::Repeat;
     if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c' | 'C')) {
-        return Action::Quit;
+        return if repeat { Action::None } else { Action::Quit };
+    }
+    if repeat && vs.confirm_revoke.is_some() {
+        return Action::None;
     }
     if let Some(id) = vs.confirm_revoke.take() {
         return if matches!(k.code, KeyCode::Char('y' | 'Y')) {
@@ -268,7 +269,6 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
     };
     let prompt = view::guest_prompt(s).is_some();
     match (s.role, k.code) {
-        (_, KeyCode::Char('q' | 'Q')) => Action::Quit,
         (_, KeyCode::Up | KeyCode::Char('k')) => {
             vs.sel = vs.sel.saturating_sub(1);
             Action::Redraw
@@ -279,6 +279,8 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
             }
             Action::Redraw
         }
+        _ if repeat => Action::None,
+        (_, KeyCode::Char('q' | 'Q')) => Action::Quit,
         (Role::Host, KeyCode::Char('a' | 'A')) => s
             .pairing
             .as_ref()
@@ -304,11 +306,43 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
 }
 
 static FOCUS_REPORTING: AtomicBool = AtomicBool::new(false);
+static PASTE_REPORTING: AtomicBool = AtomicBool::new(false);
 
 fn focus_off() {
     if FOCUS_REPORTING.swap(false, Ordering::SeqCst) {
         let _ = execute!(io::stdout(), DisableFocusChange);
     }
+}
+
+fn paste_off() {
+    if PASTE_REPORTING.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+    }
+}
+
+// pasted text then arrives as one Paste event instead of keys that could answer a prompt
+fn paste_on() -> io::Result<()> {
+    execute!(io::stdout(), EnableBracketedPaste)?;
+    PASTE_REPORTING.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+fn bell() {
+    let mut out = io::stdout();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
+fn frame_gap(focused: bool, urgent: bool) -> Duration {
+    if focused || urgent {
+        FRAME_MIN
+    } else {
+        UNFOCUSED_FRAME
+    }
+}
+
+fn prompt_appeared(old: &UiSnapshot, new: &UiSnapshot) -> bool {
+    view::guest_prompt(old).is_none() && view::guest_prompt(new).is_some()
 }
 
 // asks the terminal to report focus; the panic hook and Restore both turn it off again
@@ -318,6 +352,7 @@ fn focus_on() -> io::Result<()> {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             focus_off();
+            paste_off();
             prev(info);
         }));
     });
@@ -331,6 +366,7 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         focus_off();
+        paste_off();
         ratatui::restore();
     }
 }
@@ -468,6 +504,7 @@ pub fn run_interactive(
     let _restore = Restore;
     let mut term = ratatui::try_init()?;
     focus_on()?;
+    paste_on()?;
     let (itx, irx) = bounded::<Event>(INPUT_QUEUE);
     thread::Builder::new()
         .name("csync-input".into())
@@ -482,25 +519,25 @@ pub fn run_interactive(
     let mut sig_open = true;
     let mut screen = Screen::new(bus.read(), Depth::detect(), Instant::now());
     let mut dirty = true;
+    let mut urgent = false;
     loop {
         let now = Instant::now();
+        let focused = screen.vs.focused;
+        let gap = frame_gap(focused, urgent);
         let ready = screen
             .last
-            .is_none_or(|t| now.saturating_duration_since(t) >= FRAME_MIN);
+            .is_none_or(|t| now.saturating_duration_since(t) >= gap);
         let due = screen.deadline().is_some_and(|d| d <= now);
-        let focused = screen.vs.focused;
-        if (dirty || due) && ready && focused {
+        if (dirty || due) && ready {
             frame(&mut term, &mut screen, now)?;
             dirty = false;
+            urgent = false;
         }
-        // unfocused, or with nothing dirty and nothing animating, there is no timer at all
-        let target = if dirty && focused {
-            Some(now)
-        } else {
-            screen.deadline()
-        };
+        // with nothing dirty and nothing animating there is no timer at all
+        let target = if dirty { Some(now) } else { screen.deadline() };
+        let gap = frame_gap(screen.vs.focused, urgent);
         let timer = match target {
-            Some(d) => at(screen.last.map_or(d, |t| d.max(t + FRAME_MIN))),
+            Some(d) => at(screen.last.map_or(d, |t| d.max(t + gap))),
             None => never(),
         };
         let input = if input_open { irx.clone() } else { never() };
@@ -510,6 +547,10 @@ pub fn run_interactive(
             recv(wake) -> _ => {
                 let fresh = bus.read();
                 if fresh != screen.snap {
+                    if !vs.focused && prompt_appeared(&screen.snap, &fresh) {
+                        urgent = true;
+                        bell();
+                    }
                     screen.snap = fresh;
                     vs.touch(Instant::now());
                     dirty = true;
@@ -1364,5 +1405,122 @@ mod tests {
         assert!(parse_line("revoke x", &s).is_err());
         assert!(parse_line("frobnicate", &s).is_err());
         assert!(matches!(parse_line("   ", &s), Ok(None)));
+    }
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+    }
+
+    fn pairing(peer: u64) -> PairPrompt {
+        PairPrompt {
+            peer,
+            name: Name::new("g").unwrap(),
+            sas: *b"ABCDEFGH",
+            expires_ms: 0,
+        }
+    }
+
+    #[test]
+    fn repeated_keys_never_answer_a_prompt_or_quit() {
+        let mut s = sample();
+        s.pairing = Some(pairing(7));
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let a = KeyCode::Char('a');
+        assert!(matches!(
+            on_key(key(a, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(matches!(
+            on_key(key(a, KeyEventKind::Press), &s, &mut vs),
+            Action::Cmd(UiCmd::Accept(7))
+        ));
+        let q = KeyCode::Char('q');
+        assert!(matches!(
+            on_key(key(q, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(matches!(
+            on_key(key(q, KeyEventKind::Press), &s, &mut vs),
+            Action::Quit
+        ));
+        let ctrl_c =
+            |kind| KeyEvent::new_with_kind(KeyCode::Char('c'), KeyModifiers::CONTROL, kind);
+        assert!(matches!(
+            on_key(ctrl_c(KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(matches!(
+            on_key(ctrl_c(KeyEventKind::Press), &s, &mut vs),
+            Action::Quit
+        ));
+        assert!(matches!(
+            on_key(key(KeyCode::Down, KeyEventKind::Repeat), &s, &mut vs),
+            Action::Redraw
+        ));
+    }
+
+    #[test]
+    fn a_repeated_key_leaves_a_pending_revoke_unanswered() {
+        let s = sample();
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        vs.confirm_revoke = Some(7);
+        let y = KeyCode::Char('y');
+        assert!(matches!(
+            on_key(key(y, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert_eq!(vs.confirm_revoke, Some(7));
+        assert!(matches!(
+            on_key(key(y, KeyEventKind::Press), &s, &mut vs),
+            Action::Cmd(UiCmd::Revoke(7))
+        ));
+        assert_eq!(vs.confirm_revoke, None);
+    }
+
+    #[test]
+    fn guest_confirmation_ignores_repeats() {
+        let mut s = UiSnapshot::new(Role::Guest);
+        s.pairing = Some(pairing(3));
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let y = KeyCode::Char('y');
+        assert!(matches!(
+            on_key(key(y, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(matches!(
+            on_key(key(y, KeyEventKind::Press), &s, &mut vs),
+            Action::Cmd(UiCmd::Confirm(true))
+        ));
+    }
+
+    #[test]
+    fn unfocused_redraws_are_slow_unless_a_prompt_is_waiting() {
+        assert_eq!(frame_gap(true, false), FRAME_MIN);
+        assert_eq!(frame_gap(false, false), UNFOCUSED_FRAME);
+        assert_eq!(frame_gap(false, true), FRAME_MIN);
+        assert!(UNFOCUSED_FRAME > FRAME_MIN);
+    }
+
+    #[test]
+    fn a_prompt_is_noticed_only_when_it_first_appears() {
+        let quiet = sample();
+        let mut asking = sample();
+        asking.pairing = Some(pairing(7));
+        assert!(prompt_appeared(&quiet, &asking));
+        assert!(!prompt_appeared(&asking, &asking));
+        assert!(!prompt_appeared(&asking, &quiet));
+        assert!(!prompt_appeared(&quiet, &quiet));
+        let mut guest = UiSnapshot::new(Role::Guest);
+        let mut waiting = guest.clone();
+        waiting.peers.push(PeerView {
+            id: 1,
+            name: Name::new("h").unwrap(),
+            fpr: [1; 8],
+            state: ConnState::Pairing { sas: *b"Z9Y8X7W6" },
+            rtt_us: 0,
+        });
+        assert!(prompt_appeared(&guest, &waiting));
+        guest.pairing = Some(pairing(1));
+        assert!(!prompt_appeared(&guest, &waiting));
     }
 }

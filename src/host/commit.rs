@@ -644,6 +644,17 @@ fn same_dir(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<(), WireErr> {
     }
 }
 
+// another spelling of name that lowercases to want; two ascii names are compared without allocating
+fn folds_onto(name: &str, want: &str, name_ascii: bool, other: &str) -> bool {
+    if other == name {
+        return false;
+    }
+    if name_ascii && other.is_ascii() {
+        return other.len() == name.len() && other.eq_ignore_ascii_case(name);
+    }
+    other.to_lowercase() == want
+}
+
 // case-folding volumes resolve a differently spelled name to an existing entry; that must not be written through
 fn collides(core: &Core, dir: BorrowedFd<'_>, path: &RelPath, name: &str, exists: bool) -> bool {
     if !core.fs.case_fold && !core.fs.norm_fold {
@@ -659,9 +670,10 @@ fn collides(core: &Core, dir: BorrowedFd<'_>, path: &RelPath, name: &str, exists
         }
         if core.fs.case_fold {
             let want = name.to_lowercase();
+            let ascii = name.is_ascii();
             let mut hit = false;
             tree.for_children(&parent, &mut |n, _| {
-                if !hit && n.as_str() != name && n.as_str().to_lowercase() == want {
+                if !hit && folds_onto(name, &want, ascii, n.as_str()) {
                     hit = true;
                 }
             });
@@ -1586,6 +1598,46 @@ mod tests {
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with(crate::proto::path::TMP_PREFIX))
             .collect()
+    }
+
+    #[test]
+    fn folds_onto_agrees_with_the_lowercase_comparison_for_ascii_and_other_names() {
+        let reference =
+            |name: &str, other: &str| other != name && other.to_lowercase() == name.to_lowercase();
+        let names = [
+            "a.txt",
+            "A.TXT",
+            "a.TxT",
+            "a.txu",
+            "a.tx",
+            "readme",
+            "README",
+            "Readme.md",
+            "k",
+            "K",
+            "\u{212a}",
+            "caf\u{e9}",
+            "CAF\u{c9}",
+            "cafe",
+            "\u{130}",
+            "i",
+            "stra\u{df}e",
+            "STRASSE",
+            "",
+        ];
+        for name in names {
+            let want = name.to_lowercase();
+            for other in names {
+                assert_eq!(
+                    folds_onto(name, &want, name.is_ascii(), other),
+                    reference(name, other),
+                    "{name:?} vs {other:?}"
+                );
+            }
+        }
+        assert!(folds_onto("a.txt", "a.txt", true, "A.TXT"));
+        assert!(!folds_onto("a.txt", "a.txt", true, "a.txt"));
+        assert!(folds_onto("k", "k", true, "\u{212a}"));
     }
 
     #[test]

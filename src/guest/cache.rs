@@ -1692,63 +1692,75 @@ impl Shared {
         }
     }
 
+    // victims move aside by rename under the lock and are unlinked after it, so a re-fetch of the hash cannot lose its new file
     fn evict(&self) -> u64 {
-        let mut guard = lock(&self.inner);
-        let g = &mut *guard;
-        if g.bytes <= self.cap {
-            return 0;
-        }
-        let target = self.cap - self.cap / 20;
-        let now = Instant::now();
-        let mut victims = Vec::new();
-        let mut left = g.bytes;
-        // recently opened blobs go only when nothing else gets the cache under its cap
-        for recent in [false, true] {
-            for h in g.lru.values().take(EVICT_SCAN) {
-                if left <= target {
-                    break;
+        let mut doomed: Vec<String> = Vec::new();
+        let mut dropped: Vec<Arc<Fill>> = Vec::new();
+        let freed = {
+            let mut guard = lock(&self.inner);
+            let g = &mut *guard;
+            if g.bytes <= self.cap {
+                return 0;
+            }
+            let target = self.cap - self.cap / 20;
+            let now = Instant::now();
+            let mut victims = Vec::new();
+            let mut left = g.bytes;
+            // recently opened blobs go only when nothing else gets the cache under its cap
+            for recent in [false, true] {
+                for h in g.lru.values().take(EVICT_SCAN) {
+                    if left <= target {
+                        break;
+                    }
+                    if g.pins.contains_key(h) {
+                        continue;
+                    }
+                    let Some(s) = g.slots.get(h) else { continue };
+                    let fresh = s
+                        .opened
+                        .is_some_and(|o| now.saturating_duration_since(o) < RECENT_PIN);
+                    if fresh != recent {
+                        continue;
+                    }
+                    left = left.saturating_sub(s.size);
+                    victims.push(*h);
                 }
-                if g.pins.contains_key(h) {
-                    continue;
+            }
+            let mut freed = 0;
+            for h in &victims {
+                let name = hex(h);
+                let Ok(dir) = self.shard(h) else { continue };
+                let aside = self.tmp_name();
+                match rustix::fs::renameat(dir, hex_str(&name), &*self.tmp, aside.as_str()) {
+                    Ok(()) => doomed.push(aside),
+                    Err(Errno::NOENT) => {}
+                    Err(_) => continue,
                 }
-                let Some(s) = g.slots.get(h) else { continue };
-                let fresh = s
-                    .opened
-                    .is_some_and(|o| now.saturating_duration_since(o) < RECENT_PIN);
-                if fresh != recent {
-                    continue;
+                if let Some(s) = g.remove(h) {
+                    freed += s.size;
                 }
-                left = left.saturating_sub(s.size);
-                victims.push(*h);
             }
-        }
-        let mut freed = 0;
-        for h in &victims {
-            let name = hex(h);
-            let Ok(dir) = self.shard(h) else { continue };
-            match rustix::fs::unlinkat(dir, hex_str(&name), AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => {}
-                Err(_) => continue,
+            // partial range fills hold disk too; idle ones go once slots alone cannot get under the cap
+            if g.bytes > target {
+                let idle: Vec<Hash32> = g
+                    .fills
+                    .iter()
+                    .filter(|(h, f)| {
+                        f.size >= RANGE_FILE_MIN
+                            && !g.pins.contains_key(*h)
+                            && Arc::strong_count(f) == 1
+                    })
+                    .map(|(h, _)| *h)
+                    .collect();
+                for h in idle {
+                    dropped.extend(g.fills.remove(&h));
+                }
             }
-            if let Some(s) = g.remove(h) {
-                freed += s.size;
-            }
-        }
-        // partial range fills hold disk too; idle ones go once slots alone cannot get under the cap
-        if g.bytes > target {
-            let idle: Vec<Hash32> = g
-                .fills
-                .iter()
-                .filter(|(h, f)| {
-                    f.size >= RANGE_FILE_MIN
-                        && !g.pins.contains_key(*h)
-                        && Arc::strong_count(f) == 1
-                })
-                .map(|(h, _)| *h)
-                .collect();
-            for h in idle {
-                g.fills.remove(&h);
-            }
+            freed
+        };
+        drop(dropped);
+        for name in &doomed {
+            let _ = rustix::fs::unlinkat(&*self.tmp, name.as_str(), AtFlags::empty());
         }
         freed
     }
@@ -2616,6 +2628,30 @@ mod tests {
         assert_eq!(held.read_all(4096).unwrap(), vec![4u8; 1000]);
         assert!(c.contains(&more[1]));
         assert!(c.usage().0 <= 3000);
+    }
+
+    #[test]
+    fn eviction_leaves_no_aside_files_and_an_evicted_blob_can_return() {
+        let d = tmpdir("evict-aside");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 3000, &fake);
+        let put = |i: u8| {
+            let b = vec![i; 1000];
+            let h = *blake3::hash(&b).as_bytes();
+            c.insert_bytes(&h, &b, None).unwrap();
+            h
+        };
+        let hs: Vec<Hash32> = (0..5).map(&put).collect();
+        assert!(c.evict() > 0);
+        assert!(!c.contains(&hs[0]) && !blob_path(&d.0, &hs[0]).exists());
+        assert_eq!(names(&d.0.join("tmp")), 0);
+        put(0);
+        assert!(c.contains(&hs[0]));
+        assert_eq!(
+            std::fs::read(blob_path(&d.0, &hs[0])).unwrap(),
+            vec![0u8; 1000]
+        );
+        assert_eq!(names(&d.0.join("tmp")), 0);
     }
 
     #[test]

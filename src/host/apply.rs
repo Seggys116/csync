@@ -642,8 +642,8 @@ impl Applier {
             return;
         }
         let token = self.watcher.resume_token();
-        let tree = self.core.tree();
-        if persist::save_index(&self.index_path, &tree, token).is_err() {
+        let snap = persist::snapshot_index(&self.core.tree(), token);
+        if persist::write_index(&self.index_path, &snap).is_err() {
             self.core.dirty.store(true, Ordering::Release);
         }
     }

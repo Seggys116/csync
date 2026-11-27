@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+* Small requests (version resolution, hash lookups, batches of small files, small files and ranges) get their own two
+  host threads, so a large transfer no longer makes a guest wait to open a file. Hashing a large pending file for a
+  guest uses all cores.
+* A host or guest that hears nothing from its peer for 90 s closes the link instead of trusting it for about 15
+  minutes, and a guest whose sessions keep dying right after connecting backs off (up to 30 s) instead of redialling
+  in a loop.
+* The host saves its index without holding the tree lock, the guest no longer takes its tree write lock for every
+  kernel forget (`rm -rf node_modules`), and cache eviction unlinks files outside the cache lock.
+* The terminal UI keeps errors visible when the activity panel is full, ignores pasted text and key repeats on the
+  accept, confirm, revoke and quit keys, keeps redrawing (and rings the bell for a pairing request) while the pane is
+  unfocused, keeps the most important status rows on short terminals, shows the filename of long paths, and uses fixed
+  accent colours on 16-colour terminals.
 * `csync join` can run on macOS (experimental, not yet verified against a real macFUSE mount). It needs macFUSE 5.5
   or later and mounts with the FSKit backend first, falling back to the kernel extension. There is no kernel
   passthrough, writeback cache or `readdirplus` on macOS, and ignored paths live in a directory named

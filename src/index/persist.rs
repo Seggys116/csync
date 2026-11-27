@@ -250,6 +250,11 @@ fn domain_byte(d: Domain) -> u8 {
 }
 
 pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::Result<()> {
+    write_index(path, &snapshot_index(tree, resume))
+}
+
+// everything that needs the tree, so the serialising and writing can happen after its lock is released
+pub fn snapshot_index(tree: &Tree, resume: Option<ResumeToken>) -> DiskIndex {
     let mut nodes = Vec::with_capacity(tree.len());
     tree.walk(&mut |parent, name, e| {
         let s = &e.stat;
@@ -269,7 +274,7 @@ pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::
             seq: e.seq,
         });
     });
-    let d = DiskIndex {
+    DiskIndex {
         index: tree.index_id().to_le_bytes(),
         seq: tree.seq(),
         resume: resume.map(|r| DiskResume {
@@ -277,8 +282,11 @@ pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::
             event_id: r.event_id,
         }),
         nodes,
-    };
-    save(path, FileKind::Index, &d)
+    }
+}
+
+pub fn write_index(path: &Path, d: &DiskIndex) -> io::Result<()> {
+    save(path, FileKind::Index, d)
 }
 
 fn clean_path(index: &Path) -> PathBuf {
@@ -552,6 +560,32 @@ mod tests {
         );
         assert_eq!(u.changes_since(u.seq()).map(|c| c.len()), Some(0));
         assert!(u.changes_since(0).is_none());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_snapshot_written_later_is_the_file_save_index_writes_and_ignores_later_edits() {
+        let d = tmp_dir();
+        let (direct, split) = (d.join("direct.rkyv"), d.join("split.rkyv"));
+        let mut t = sample();
+        let tok = ResumeToken {
+            volume: [3; 16],
+            event_id: 9,
+        };
+        save_index(&direct, &t, Some(tok)).unwrap();
+        let snap_before = snapshot_index(&t, Some(tok));
+        let before = by_path(&t);
+        let seq = t.seq();
+
+        t = with_pending(t);
+        assert_ne!(t.seq(), seq);
+        write_index(&split, &snap_before).unwrap();
+
+        assert_eq!(fs::read(&direct).unwrap(), fs::read(&split).unwrap());
+        let (u, r) = load_index(&split).unwrap();
+        assert_eq!(r, Some(tok));
+        assert_eq!(u.seq(), seq);
+        assert_eq!(by_path(&u), before);
         let _ = fs::remove_dir_all(&d);
     }
 

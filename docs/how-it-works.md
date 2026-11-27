@@ -19,7 +19,7 @@ When both sides change the same file, the later write is checked against the ver
 | Hasher | Two low-priority threads that fill in the hashes of pending files in the background and push them to guests. See [lazy hashing](#lazy-hashing). |
 | Applier | Merges watcher bursts, stats each path, reads and hashes a file at once only when its stat key changed, updates the index and pushes the resulting changes to guests. |
 | Committer | One thread that applies every guest write in order: commits, mkdir, symlink, remove, rename and attribute changes. |
-| Serve pool | Four threads that answer guest requests: whole files, byte ranges, batches of small files, deltas, version resolution and hash lookups. |
+| Serve pool | Four threads that answer guest requests for whole files, deltas and ranges of files that still need hashing, plus two light threads for version resolution, hash lookups, batches of small files, small files and ranges, so a large transfer never queues them. |
 
 ### Guest (`csync join`, Linux; macOS is experimental)
 
@@ -281,7 +281,7 @@ One TCP connection per guest, encrypted with Noise (see [pairing and trust](#pai
 - **Pushes and acks.** The host pushes snapshot parts, change batches, notices, hashes learned in the background and a marker that none are left pending (see [lazy hashing](#lazy-hashing)). Each change batch carries a sequence number and the guest acknowledges it; pushed hashes are not acknowledged.
 - **Version.** The protocol version is 2. The version travels in the handshake hello, and a hello with another version fails the handshake as a malformed hello, so a peer on version 1 (csync 0.1.0) never connects and the failure does not name the version. Host and guest must run the same release; `csync update` on both machines does that.
 - **Delta.** Content-defined chunk signatures (fastcdc) of the old version let the other side send only the new parts.
-- **Keepalive and clock.** Each side pings every 30 s. The pong carries the host's clock, from which the guest estimates the clock skew shown in the status.
+- **Keepalive and clock.** Each side pings every 30 s. The pong carries the host's clock, from which the guest estimates the clock skew shown in the status. A side that has heard nothing from its peer for 90 s closes the link and, on the guest, reconnects; without this a peer that vanished without a reset (a sleeping laptop, a dropped VPN) would be trusted for about 15 minutes.
 
 On connect the guest says which index and sequence number it already has. The host answers with the project name, its index identity, volume traits, repository list and global excludes, then either the journal entries since that sequence number or a full snapshot.
 
@@ -323,7 +323,7 @@ What it does not protect:
 
 **Threads.** csync uses a fixed set of blocking threads and no async runtime.
 
-- Host: the terminal or line-protocol thread and its input reader, the main session loop, the accept thread plus one short-lived thread per handshake (at most 16), the watcher, the applier, the committer, four fetch threads, two background hasher threads, the control socket, mDNS, and a reader and a writer per guest (at most 16 guests). A scan starts up to 8 walker threads for its duration. The applier and committer use a rayon pool.
+- Host: the terminal or line-protocol thread and its input reader, the main session loop, the accept thread plus one short-lived thread per handshake (at most 16), the watcher, the applier, the committer, four fetch threads, two light fetch threads, two background hasher threads, the control socket, mDNS, and a reader and a writer per guest (at most 16 guests). A scan starts up to 8 walker threads for its duration. The applier and committer use a rayon pool.
 - Guest: the terminal or line-protocol thread and its input reader, the session loop (the only thread that sends kernel notifications), 8 FUSE workers, a network reader and writer, the injector, the prefetcher, a rule-file worker, the control socket, and a reconnect thread while the link is down. mDNS browsing stops once a host is chosen.
 
 **Idle.** Threads block in kernel reads or on channels. With nothing changing, the only timers are the 30 s ping on each link and, on the host, the periodic index save, which runs only when there is something to save. A guest never saves its tree. The TUI redraws only when the state changes, an animation is running or a deadline is due, and not at all while the terminal is unfocused.

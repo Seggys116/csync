@@ -637,6 +637,14 @@ impl Core {
         }
     }
 
+    // a forget storm only counts down under the read lock; the write lock is for the slot that reaches zero
+    fn forget(&self, id: NodeId, n: u64) {
+        let last = self.t().drop_lookups(id, n);
+        if last {
+            self.tw().reap(id);
+        }
+    }
+
     pub fn kick(&self, mut fx: Vec<Effect>) {
         if !fx.is_empty() {
             lock(&self.kicked).append(&mut fx);
@@ -4120,7 +4128,7 @@ impl Filesystem for GuestFs {
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         self.core.ctr.op(Op::Forget);
-        self.core.tw().forget(ino.0, nlookup);
+        self.core.forget(ino.0, nlookup);
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
