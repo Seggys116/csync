@@ -205,28 +205,36 @@ jobs:
         run: |
           pluginkit -m -A -vvv -i "$FSKIT_ID" 2>&1 || true
           "$CSYNC_BIN" doctor || true
-      - name: mount probe
+      - name: macguest test
         shell: bash
         run: |
-          set -x
-          w="$RUNNER_TEMP/probe"; mkdir -p "$w/proj" "$w/mnt"; echo hello > "$w/proj/a.txt"
-          hk="$(CSYNC_HOME=$w/hh "$CSYNC_BIN" key show)"; gk="$(CSYNC_HOME=$w/gh "$CSYNC_BIN" key show)"
-          CSYNC_HOME=$w/hh "$CSYNC_BIN" trust add "$gk" --role guest --name g
-          CSYNC_HOME=$w/gh "$CSYNC_BIN" trust add "$hk" --role host --name h
-          CSYNC_HOME=$w/hh "$CSYNC_BIN" --no-tui host "$w/proj" --listen 127.0.0.1:47831 --no-pair --no-mdns > "$w/host.log" 2>&1 &
-          hp=$!
-          sleep 5
-          (sleep 40; pkill -f 'csync.* join' || true) &
-          CSYNC_HOME=$w/gh "$CSYNC_BIN" --no-tui join "$w/mnt" --connect 127.0.0.1:47831 --host h < /dev/null > "$w/guest.log" 2>&1 || true
-          echo "== guest log"; cat "$w/guest.log"
-          echo "== host log"; head -20 "$w/host.log"
-          mount | grep -i -E 'fuse|csync' || true
-          kill "$hp" || true
-      - name: logs
+          set +e
+          log="$RUNNER_TEMP/macguest.log"
+          cargo test --locked --release --test fuse_macguest -- --nocapture 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          {
+            echo "### macfuse (${{ matrix.os }}, macOS $(sw_vers -productVersion))"
+            if grep -q '^skip:' "$log"; then
+              echo "DID NOT RUN: $(grep -m1 '^skip:' "$log")"
+              rc=1
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAILED (exit $rc)"
+            elif ! grep -q 'test result: ok. 1 passed' "$log"; then
+              echo "FAILED: no passing test was reported"
+              rc=1
+            else
+              echo "passed: mounted, read, host to guest, guest to host, ignored path, unmount and wipe"
+            fi
+            grep -a '^fsevents ' "$log" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: mount state and logs
         if: always()
         shell: bash
         run: |
-          log show --predicate 'process CONTAINS "macfuse" OR process CONTAINS "csync" OR subsystem CONTAINS "fskit" OR process CONTAINS "fskit"' --last 10m --style compact 2>&1 | tail -150 || true
+          mount | grep -i -E 'fuse|csync|fskit' || echo "nothing fuse-like in the mount table"
+          log show --predicate 'process CONTAINS "macfuse" OR process CONTAINS "csync" OR subsystem CONTAINS "fskit" OR process CONTAINS "fskit"' --last 15m --style compact 2>&1 \
+            | grep -i -E 'macfuse|csync|error|fail|denied|not enabled' | tail -120 || true
 
   install-scripts:
     runs-on: ubuntu-24.04
