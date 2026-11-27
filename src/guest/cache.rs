@@ -1158,7 +1158,6 @@ impl Shared {
         whole: bool,
         deadline: Instant,
     ) -> Result<BlobRef, i32> {
-        let mut retried = false;
         loop {
             if let Some(r) = self.get(h) {
                 return Ok(r);
@@ -1195,8 +1194,7 @@ impl Shared {
                 Err(e) => {
                     self.unpin(h);
                     // a failed prefetch batch is not this reader's failure: fetch on its own
-                    if fill.batch && !retried {
-                        retried = true;
+                    if fill.batch && Instant::now() < deadline {
                         continue;
                     }
                     Err(e)
@@ -2706,6 +2704,38 @@ mod tests {
         assert_eq!(reader.join().unwrap().unwrap(), x);
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
         assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn a_reader_outlives_two_failed_batches_in_a_row() {
+        let d = tmpdir("batch-twice");
+        let fake = Arc::new(Fake::default());
+        let c = Arc::new(open(&d, 1 << 30, &fake));
+        let x = b"xray!".to_vec();
+        let items = [(RelPath::new("x").unwrap(), hash_of(&x), 5)];
+        let hx = items[0].1;
+        *lock(&fake.inline) = Some(x.clone());
+        let first = c.begin_batch(&items);
+        let (cr, px) = (c.clone(), items[0].0.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let reader = std::thread::spawn(move || {
+            cr.fetch_at(&hx, &px, 5, 0, 5, deadline)
+                .map(|r| r.read_all(64).unwrap())
+        });
+        wait_for(|| c.waiting(&hx) == 1);
+
+        // the next prefetch round registers its batch after the first failed and before the reader looks again
+        let gate = lock(&c.s.gate.st);
+        drop(first);
+        let second = c.begin_batch(&items);
+        assert_eq!(second.len(), 1);
+        drop(gate);
+        wait_for(|| c.waiting(&hx) == 1);
+        drop(second);
+
+        assert_eq!(reader.join().unwrap(), Ok(x));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+        assert!(c.contains(&hx));
     }
 
     #[test]

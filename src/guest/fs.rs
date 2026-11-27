@@ -561,6 +561,45 @@ impl Core {
         self.version_of(id, deadline).map(Some)
     }
 
+    // a failed page cache read reaches the reader as EIO, so a small cold file is fetched before its open answers
+    pub fn fetch_for_open(
+        &self,
+        id: NodeId,
+        ver: Version,
+        path: &RelPath,
+    ) -> Result<(Version, RelPath), Errno> {
+        let start = Instant::now();
+        let (mut v, mut at) = (ver, path.clone());
+        while v.size > 0 && v.size <= INLINE_MAX as u64 {
+            let deadline = start + WAIT + Duration::from_millis(v.size >> 12);
+            match self.cache.fetch_whole(&v.hash, &at, v.size, deadline) {
+                Ok(_) => break,
+                Err(libc::ESTALE) if Instant::now() < deadline => {
+                    (v, at) = self.replaced(id, v, deadline).ok_or(Errno::ESTALE)?;
+                }
+                Err(e) => return Err(en(e)),
+            }
+        }
+        Ok((v, at))
+    }
+
+    // the host's change that made a fetch of old gone is on its way: the version that replaced it
+    fn replaced(&self, id: NodeId, old: Version, deadline: Instant) -> Option<(Version, RelPath)> {
+        for _ in 0..STALE_TRIES {
+            let (held, path) = {
+                let t = self.t();
+                let n = t.get(id).filter(|n| n.meta.kind == Kind::File)?;
+                (n.meta.version(), t.rel_path(id)?)
+            };
+            match held {
+                Some(v) if v == old => std::thread::sleep(STALE_STEP),
+                Some(v) => return Some((v, path)),
+                None => return self.version_or_new(id, deadline).ok()?.map(|v| (v, path)),
+            }
+        }
+        None
+    }
+
     // waits for any other step on this node's staged copy, so each one sees the state the last left
     pub fn stage_turn(&self, id: NodeId) -> StageTurn<'_> {
         let mut busy = lock(&self.staging_busy);
@@ -4523,6 +4562,16 @@ impl Filesystem for GuestFs {
                 }
                 _ => (ver, None),
             };
+            // a file read here before gets a direct handle below, which can still move to a replacement
+            let first = domain == GDomain::Synced && !settled && !seen && !cached(Some(ver));
+            let (ver, path) = if first {
+                match self.core.fetch_for_open(id, ver, &path) {
+                    Ok(r) => r,
+                    Err(e) => return reply.error(e),
+                }
+            } else {
+                (ver, path)
+            };
             let view = match domain {
                 GDomain::GitRo => self.git_view(ver, &path),
                 _ => None,
@@ -4541,7 +4590,7 @@ impl Filesystem for GuestFs {
             if !hit {
                 self.core.cache.note(&ver.hash, &path, ver.size);
             }
-            let cold = !hit && ver.size > 0;
+            let cold = (first || !hit) && ver.size > 0;
             let c = if cold {
                 &self.core.ctr.misses
             } else {
@@ -5539,7 +5588,7 @@ mod tests {
     use crate::guest::pipe::Pipe;
     use crate::guest::prefetch::TreeView;
     use crate::net::rpc::{ChunkSink, RpcError};
-    use crate::proto::{Op as WireOp, Reply, ReqId, WireErr};
+    use crate::proto::{Body, Bytes, Op as WireOp, Reply, ReqId, Want, WireErr};
 
     const INDEX: u128 = 9;
 
@@ -5725,6 +5774,8 @@ mod tests {
         held: Mutex<VecDeque<Done>>,
         gate: Mutex<bool>,
         open: Condvar,
+        // content the host serves by hash; None for a version it no longer has
+        blobs: Mutex<FxHashMap<Hash32, Option<Vec<u8>>>>,
     }
 
     fn verb(op: &WireOp) -> String {
@@ -5745,6 +5796,7 @@ mod tests {
                 held: Mutex::new(VecDeque::new()),
                 gate: Mutex::new(false),
                 open: Condvar::new(),
+                blobs: Mutex::new(FxHashMap::default()),
             })
         }
 
@@ -5802,11 +5854,30 @@ mod tests {
         }
         fn submit_stream(
             &self,
-            _op: WireOp,
+            op: WireOp,
             _s: Box<dyn ChunkSink>,
-            _done: Done,
+            done: Done,
         ) -> Result<ReqId, RpcError> {
-            Err(RpcError::Closed)
+            let WireOp::Fetch {
+                path,
+                want: Some(Want::Hash(h)),
+                ..
+            } = op
+            else {
+                return Err(RpcError::Closed);
+            };
+            let Some(b) = lock(&self.blobs).get(&h).cloned() else {
+                return Err(RpcError::Closed);
+            };
+            lock(&self.log).push(format!("fetch {}", path.as_str()));
+            match b {
+                Some(b) => done(Ok(Reply::Blob {
+                    meta: pending_meta(b.len() as u64),
+                    body: Body::Inline(Bytes(b)),
+                })),
+                None => done(Err(RpcError::Wire(WireErr::Gone))),
+            }
+            Ok(1)
         }
         fn send_chunk(
             &self,
@@ -5961,6 +6032,38 @@ mod tests {
             ver,
         };
         tree.write().unwrap().apply(&up, &mut Vec::new());
+    }
+
+    #[test]
+    fn a_cold_open_of_a_version_the_host_replaced_opens_the_replacement() {
+        let r = rig("open-replaced");
+        r.core.tree.write().unwrap().set_version(INDEX, 1);
+        let (old, new) = (b"fn f0() {}\n".to_vec(), b"fn edited0() {}\n".to_vec());
+        let ver = |b: &[u8]| Version {
+            hash: *blake3::hash(b).as_bytes(),
+            size: b.len() as u64,
+        };
+        let (v1, v2) = (ver(&old), ver(&new));
+        let hashed = |v: Version| Meta {
+            hash: Some(v.hash),
+            ..pending_meta(v.size)
+        };
+        host_entry(&r.core.tree, hashed(v1), 5);
+        let id = r.core.t().resolve(&path()).unwrap();
+        lock(&r.fake.blobs).insert(v1.hash, None);
+        lock(&r.fake.blobs).insert(v2.hash, Some(new.clone()));
+        let opener = {
+            let core = r.core.clone();
+            std::thread::spawn(move || core.fetch_for_open(id, v1, &path()))
+        };
+        wait_for("the fetch of the old version", || {
+            r.fake.sent().contains(&"fetch a.rs".to_owned())
+        });
+        host_entry(&r.core.tree, hashed(v2), 6);
+        assert_eq!(opener.join().unwrap(), Ok((v2, path())));
+        let b = r.core.cache.get(&v2.hash).unwrap();
+        assert!(b.is_complete());
+        assert_eq!(b.read_all(64).unwrap(), new);
     }
 
     #[test]

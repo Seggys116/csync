@@ -400,6 +400,10 @@ mod mac {
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
         let edited = visible_after(t, || reads("src/lib.rs", "pub fn g() {}\n"));
         let t = Instant::now();
+        fs::write(proj.join("src/lib.rs"), "pub fn grown() { 1 }\n").unwrap();
+        let grown = visible_after(t, || reads("src/lib.rs", "pub fn grown() { 1 }\n"));
+        eprintln!("host edit that changes the size: {grown:?}");
+        let t = Instant::now();
         fs::write(proj.join("third.txt"), "three\n").unwrap();
         let after_listing = visible_after(t, || reads("third.txt", "three\n"));
         eprintln!(
@@ -410,6 +414,7 @@ mod mac {
             ("new file by listing", by_listing),
             ("new file by lookup", by_lookup),
             ("edit of a synced file", edited),
+            ("edit that changes the size", grown),
             ("new file by lookup after a listing", after_listing),
         ];
 

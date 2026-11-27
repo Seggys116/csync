@@ -700,7 +700,14 @@ impl Worker {
                         }
                         Ok(fd) => {
                             let _w = self.arm(&[Act::Setattr(*node, true)]);
-                            return Ok(rustix::fs::ftruncate(&fd, size)?);
+                            rustix::fs::ftruncate(&fd, size)?;
+                            // fskit keeps its cached pages across a same-size truncate: zero and back drops them
+                            #[cfg(target_os = "macos")]
+                            if size > 0 {
+                                rustix::fs::ftruncate(&fd, 0)?;
+                                rustix::fs::ftruncate(&fd, size)?;
+                            }
+                            return Ok(());
                         }
                         Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::TXTBSY) => {}
                         Err(e) => return Err(e.into()),
