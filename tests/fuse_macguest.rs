@@ -196,9 +196,9 @@ mod mac {
         panic!("timed out after {limit:?}: {what}");
     }
 
-    // how long after `from` the check first held, polling up to 30s
+    // how long after `from` the check first held, polling up to 15s
     fn visible_after(from: Instant, mut f: impl FnMut() -> bool) -> Option<Duration> {
-        while from.elapsed() < Duration::from_secs(30) {
+        while from.elapsed() < Duration::from_secs(15) {
             if f() {
                 return Some(from.elapsed());
             }
@@ -383,28 +383,38 @@ mod mac {
             "pub fn f() {}\n"
         );
 
-        // a host change shows on the mount inside the attribute lifetime plus slack; all three are measured before asserting
+        // host changes show on the mount inside the attribute lifetime plus slack; each shape is timed on its own
+        // and all are asserted after the last, so a failure reports every shape
         let mw = Watch::start(&mnt);
         mw.drain();
-        let t0 = Instant::now();
-        fs::write(proj.join("fromhost.txt"), "written on the host\n").unwrap();
-        let listed = visible_after(t0, || entries(&mnt).iter().any(|n| n == "fromhost.txt"));
-        let read = visible_after(t0, || {
-            fs::read_to_string(mnt.join("fromhost.txt")).is_ok_and(|s| s == "written on the host\n")
-        });
-        let t1 = Instant::now();
+        let listed = |name: &str| entries(&mnt).iter().any(|n| n == name);
+        let reads =
+            |rel: &str, want: &str| fs::read_to_string(mnt.join(rel)).is_ok_and(|s| s == want);
+        let t = Instant::now();
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
-        let edited = visible_after(t1, || {
-            fs::read_to_string(mnt.join("src/lib.rs")).is_ok_and(|s| s == "pub fn g() {}\n")
-        });
+        let edited = visible_after(t, || reads("src/lib.rs", "pub fn g() {}\n"));
+        let t = Instant::now();
+        fs::write(proj.join("fromhost.txt"), "written on the host\n").unwrap();
+        let by_lookup = visible_after(t, || reads("fromhost.txt", "written on the host\n"));
+        let t = Instant::now();
+        fs::write(proj.join("second.txt"), "two\n").unwrap();
+        let by_listing = visible_after(t, || listed("second.txt"));
+        let t = Instant::now();
+        fs::write(proj.join("third.txt"), "three\n").unwrap();
+        let after_listing = visible_after(t, || reads("third.txt", "three\n"));
         eprintln!(
-            "host changes on the mount: new file listed after {listed:?}, new file readable after {read:?}, edit of a synced file after {edited:?}"
+            "host changes on the mount: edit of a synced file {edited:?}, new file by lookup {by_lookup:?}, new file by listing {by_listing:?}, new file by lookup after a listing {after_listing:?}"
         );
         let (host_change, host_ev) = mw.seen("fromhost.txt", Duration::from_secs(1));
-        for (what, t) in [("listed", listed), ("readable", read), ("edited", edited)] {
+        for (what, t) in [
+            ("edit of a synced file", edited),
+            ("new file by lookup", by_lookup),
+            ("new file by listing", by_listing),
+            ("new file by lookup after a listing", after_listing),
+        ] {
             assert!(
                 t.is_some_and(|d| d <= HOST_VISIBLE),
-                "the host change was not {what} on the mount within {HOST_VISIBLE:?}: {t:?}"
+                "{what} did not show on the mount within {HOST_VISIBLE:?}: {t:?}"
             );
         }
 
