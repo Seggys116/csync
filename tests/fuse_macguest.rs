@@ -164,14 +164,6 @@ mod mac {
             .any(|l| l.contains(&needle))
     }
 
-    fn sample(pid: u32) -> String {
-        Command::new("/usr/bin/sample")
-            .args([&pid.to_string(), "2"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_else(|e| format!("sample failed: {e}"))
-    }
-
     fn mount_table() -> String {
         Command::new("/sbin/mount")
             .output()
@@ -392,12 +384,15 @@ mod mac {
         );
 
         // host changes show on the mount inside the attribute lifetime plus slack; each shape is timed on its own
-        // and all are asserted after the last, so a failure reports every shape
+        // and all are asserted at the end of the test
         let mw = Watch::start(&mnt);
         mw.drain();
         let listed = |name: &str| entries(&mnt).iter().any(|n| n == name);
         let reads =
             |rel: &str, want: &str| fs::read_to_string(mnt.join(rel)).is_ok_and(|s| s == want);
+        let t = Instant::now();
+        fs::write(proj.join("listed.txt"), "one\n").unwrap();
+        let by_listing = visible_after(t, || listed("listed.txt"));
         let t = Instant::now();
         fs::write(proj.join("fromhost.txt"), "written on the host\n").unwrap();
         let by_lookup = visible_after(t, || reads("fromhost.txt", "written on the host\n"));
@@ -405,36 +400,18 @@ mod mac {
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
         let edited = visible_after(t, || reads("src/lib.rs", "pub fn g() {}\n"));
         let t = Instant::now();
-        fs::write(proj.join("second.txt"), "two\n").unwrap();
-        let by_listing = visible_after(t, || listed("second.txt"));
-        let t = Instant::now();
         fs::write(proj.join("third.txt"), "three\n").unwrap();
         let after_listing = visible_after(t, || reads("third.txt", "three\n"));
         eprintln!(
-            "host changes on the mount: edit of a synced file {edited:?}, new file by lookup {by_lookup:?}, new file by listing {by_listing:?}, new file by lookup after a listing {after_listing:?}"
+            "host changes on the mount: new file by listing {by_listing:?}, new file by lookup {by_lookup:?}, edit of a synced file {edited:?}, new file by lookup after a listing {after_listing:?}"
         );
         let (host_change, host_ev) = mw.seen("fromhost.txt", Duration::from_secs(1));
         let shapes = [
+            ("new file by listing", by_listing),
             ("new file by lookup", by_lookup),
             ("edit of a synced file", edited),
-            ("new file by listing", by_listing),
             ("new file by lookup after a listing", after_listing),
         ];
-        if shapes
-            .iter()
-            .any(|(_, t)| t.is_none_or(|d| d > HOST_VISIBLE))
-        {
-            eprintln!(
-                "guest stacks while a host change is not showing:\n{}",
-                sample(guest.child.id())
-            );
-        }
-        for (what, t) in shapes {
-            assert!(
-                t.is_some_and(|d| d <= HOST_VISIBLE),
-                "{what} did not show on the mount within {HOST_VISIBLE:?}: {t:?}"
-            );
-        }
 
         // a guest create, write and close reaches the host byte for byte
         mw.drain();
@@ -494,5 +471,13 @@ mod mac {
             "the host project changed on unmount"
         );
         host.say("quit");
+
+        // asserted last so a host change that never shows does not hide the other results
+        for (what, t) in shapes {
+            assert!(
+                t.is_some_and(|d| d <= HOST_VISIBLE),
+                "{what} did not show on the mount within {HOST_VISIBLE:?}: {t:?}"
+            );
+        }
     }
 }
