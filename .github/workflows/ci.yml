@@ -199,12 +199,35 @@ jobs:
             pluginkit -m -i "$id" -vvv || true
             echo "::endgroup::"
           done
-      - name: diagnostics after enable
+      - name: fskit enablement state
         if: always()
+        continue-on-error: true
         shell: bash
         run: |
-          pluginkit -m -A -vvv -i "$FSKIT_ID" 2>&1 || true
-          "$CSYNC_BIN" doctor || true
+          cat > "$RUNNER_TEMP/fsext.swift" <<'EOF'
+          import FSKit
+          import Foundation
+          let sem = DispatchSemaphore(value: 0)
+          FSClient.shared.fetchInstalledExtensions { exts, err in
+              for e in exts ?? [] { print("\(e.bundleIdentifier) enabled=\(e.isEnabled)") }
+              if let err { print("error: \(err)") }
+              sem.signal()
+          }
+          if sem.wait(timeout: .now() + 20) == .timedOut { print("timed out") }
+          EOF
+          swiftc -o "$RUNNER_TEMP/fsext" "$RUNNER_TEMP/fsext.swift"
+          echo "::group::FSClient view before restarting the daemons"; "$RUNNER_TEMP/fsext"; echo "::endgroup::"
+          echo "::group::fskit settings container"
+          g="$HOME/Library/Group Containers/group.com.apple.fskit.settings"
+          ls -laR "$g" 2>&1 | head -30
+          for f in "$g"/*.plist "$g"/Library/Preferences/*.plist; do [ -f "$f" ] && { echo "-- $f"; plutil -p "$f"; }; done
+          echo "::endgroup::"
+          echo "::group::restart fskitd and fskit_agent"
+          sudo killall fskitd fskit_agent 2>&1 || true
+          sleep 3
+          "$RUNNER_TEMP/fsext"
+          echo "::endgroup::"
+          "$CSYNC_BIN" doctor | grep -i fskit || true
       - name: macguest test
         shell: bash
         run: |
@@ -233,8 +256,11 @@ jobs:
         shell: bash
         run: |
           mount | grep -i -E 'fuse|csync|fskit' || echo "nothing fuse-like in the mount table"
-          log show --predicate 'process CONTAINS "macfuse" OR process CONTAINS "csync" OR subsystem CONTAINS "fskit" OR process CONTAINS "fskit"' --last 15m --style compact 2>&1 \
-            | grep -a -i -E 'io.macfuse|fskitd|fskit_agent|mount|not enabled|denied' | grep -a -v -E 'Security|CoreAnalytics|libsqlite3|xpc:connection' | tail -80 || true
+          log show --predicate 'process BEGINSWITH "io.macfuse" OR process == "macfuse" OR process == "fskitd" OR process == "fskit_agent" OR process == "csync"' --last 15m --style compact > "$RUNNER_TEMP/unified.log" 2>&1 || true
+          echo "== macfuse and fskit error lines"
+          grep -a -E ' (E|F) +(io\.macfuse|fskitd|fskit_agent|csync)' "$RUNNER_TEMP/unified.log" | grep -a -v -E 'libsqlite3|DetachedSignatures' | tail -40 || true
+          echo "== macfuse daemon lines"
+          grep -a 'io.macfuse:' "$RUNNER_TEMP/unified.log" | tail -40 || true
 
   install-scripts:
     runs-on: ubuntu-24.04
