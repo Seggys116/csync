@@ -780,6 +780,10 @@ impl Pipe {
         self.sh.cancel(t);
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.sh.is_closed()
+    }
+
     // fails everything not yet answered with Closed and joins the sender; requests already sent are left to land
     pub fn close(&self) {
         let mut fires = Vec::new();

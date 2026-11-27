@@ -67,7 +67,7 @@ mod live {
         net::SocketAddr,
         sync::{
             Arc, Condvar, Mutex, OnceLock, RwLock,
-            atomic::{AtomicBool, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
         },
         thread::{self, JoinHandle},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -86,6 +86,8 @@ mod live {
     const RULE_JOBS: usize = 1_024;
     const RULE_WAIT: Duration = Duration::from_secs(30);
     const HASH_WAIT: Duration = Duration::from_secs(5);
+    // how long shutdown lets closed new files finish their commits before the write pipe stops
+    const SETTLE_WAIT: Duration = Duration::from_secs(10);
     // a FetchMany reply is one frame, so rule-file batches stay under FRAME_MAX
     const RULE_BATCH_BYTES: u64 = 3 << 20;
     #[cfg(target_os = "linux")]
@@ -498,6 +500,7 @@ mod live {
             norm_fold: AtomicBool::new(false),
             passthrough: AtomicBool::new(false),
             notice,
+            werrs: AtomicU32::new(0),
             staging_busy: Mutex::new(FxHashSet::default()),
             staging_done: Condvar::new(),
             promote_later: Mutex::new(FxHashSet::default()),
@@ -512,6 +515,13 @@ mod live {
             thread::Builder::new()
                 .name("csync-rules".into())
                 .spawn(move || rules_worker(&c, &st, &rules_rx))?
+        };
+        // last: a failed spawn here drops rules_tx, which ends the rules worker
+        let settle_join = {
+            let (c, jobs) = (core.clone(), core.writer.jobs());
+            thread::Builder::new()
+                .name("csync-settle".into())
+                .spawn(move || fs::settle_loop(&c, &jobs))?
         };
         let (dial_tx, dial_rx) = bounded(1);
         Ok(Guest {
@@ -539,6 +549,7 @@ mod live {
             rules,
             rules_tx: Some(rules_tx),
             rules_join: Some(rules_join),
+            settle_join: Some(settle_join),
             dial_tx,
             dial_rx,
             dial_stop: Arc::new(AtomicBool::new(false)),
@@ -583,6 +594,8 @@ mod live {
         rules: Arc<RuleState>,
         rules_tx: Option<Sender<RuleJob>>,
         rules_join: Option<JoinHandle<()>>,
+        // finishes the closes that did not wait for the host, as its answers arrive
+        settle_join: Option<JoinHandle<()>>,
         // the short-lived thread pulling the hashes of pending files once the host has hashed them all
         hash_run: Arc<AtomicBool>,
         hash_stop: Arc<AtomicBool>,
@@ -1290,7 +1303,8 @@ mod live {
             });
         }
 
-        // the injector stops before the unmount; the write pipe and the link close after it so final commits can land.
+        // the injector stops before the unmount; closes still waiting on the host settle next, then the write pipe and
+        // the link close so final commits can land, and the settler stops once the pipe has failed what it never sent.
         // nothing is saved: the caller wipes the local state unless the returned reason says it is still in use
         fn shutdown(mut self) -> Option<&'static str> {
             self.dial_stop.store(true, Relaxed);
@@ -1308,7 +1322,12 @@ mod live {
             let had_mount = self.mounted.is_some();
             let unmounted = self.mounted.take().is_none_or(|m| m.unmount().is_ok());
             self.bus.update(|s| s.mounted = false);
+            self.core.writer.drain(Instant::now() + SETTLE_WAIT);
             self.pipe.close();
+            self.core.writer.stop_settler();
+            if let Some(j) = self.settle_join.take() {
+                let _ = j.join();
+            }
             if let Some(l) = self.link.take() {
                 l.close(self.bye.clone());
             }

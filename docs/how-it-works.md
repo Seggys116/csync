@@ -106,6 +106,8 @@ The host serves only files that are in its index as synced or `.git` content, an
 1. Opening a synced file for writing creates a staging copy in the cache filesystem: an anonymous temporary file, cloned from the base blob with a reflink where the filesystem supports it, copied otherwise. The version the file was opened at is remembered as the base.
 2. Writes go to the staging copy.
 3. On `close` (FUSE flush) or `fsync`, if the content changed, the guest hashes it and sends a commit carrying the base version. The body is inline up to 48 KiB, a delta for files between 1 MiB and 32 MiB when the base is cached, and streamed in chunks otherwise.
+4. An edit to a file the host already has waits for the host's answer at close, so a refused commit fails the `close` with `ECANCELED`. A new file (made by this guest, not yet on the host) does not: its commit is queued in the ordered stream when the file is flushed or released, which is before any later operation on it, and the close returns without waiting for the host. The guest keeps the staging copy until the answer arrives, and a background thread then records the host's version or runs the merge, as a close that waited would have. `fsync` always waits for the host's answer.
+5. A refusal after a new file's close (a conflict that cannot be merged, a refused commit, retries that ran out) posts the `refused` notice and rolls the file back as described under Refusal. If a handle of the file is open then, its next `flush`, `fsync` or `write` fails once, with `ECANCELED` for a refused merge and the commit's own error otherwise.
 
 Every close of any copy of a file descriptor counts, so a shell redirection (`exec 3<>f; printf A >&3` closes a duplicate of the descriptor when it restores stdout) or a child process that inherits the descriptor and exits commits the write at that moment, not when the original descriptor is closed. A host program that read the file before that commit and then saves its older copy overwrites the guest write, and csync cannot detect it, because host writes are plain filesystem writes with no compare-and-swap.
 
@@ -129,7 +131,7 @@ On a conflict the guest runs a three-way merge of base, its own content and the 
 If the merge has conflicting regions, a side is binary or too large, or the retries run out, the guest refuses its own write:
 
 - the staging copy is replaced with the host's current content (or emptied when that is not available),
-- the `close` or `fsync` that triggered the commit fails with `ECANCELED`,
+- the `close` or `fsync` that triggered the commit fails with `ECANCELED` (for a new file, whose close does not wait, see Close and fsync),
 - a `refused` notice appears on both sides.
 
 No backup, conflict copy or marker file is written on either side. The host's temporary file is removed whenever a commit does not complete.

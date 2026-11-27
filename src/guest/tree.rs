@@ -61,6 +61,8 @@ pub struct GNode {
     pub size_gen: u32,
     pub size_pending: bool,
     pub staging: Option<u32>,
+    // errno of a commit that failed after its last handle closed, for the next flush, fsync or write; 0 when none
+    pub werr: i32,
     pub special: Special,
     pub children: Option<Children>,
 }
@@ -275,6 +277,7 @@ impl GTree {
             size_gen: 0,
             size_pending: false,
             staging: None,
+            werr: 0,
             special: Special::None,
             children: Some(Children::default()),
         };
@@ -582,6 +585,7 @@ impl GTree {
             size_gen: 0,
             size_pending: false,
             staging: None,
+            werr: 0,
             special: Special::None,
             children,
         };
@@ -1378,6 +1382,23 @@ impl GTree {
             }
         }
         out
+    }
+
+    // only a node with an open handle has someone to tell; true when it had no error waiting before
+    pub fn set_werr(&mut self, id: NodeId, errno: i32) -> bool {
+        match self.get_mut(id) {
+            Some(n) if n.open.load(std::sync::atomic::Ordering::Relaxed) > 0 => {
+                let fresh = n.werr == 0;
+                n.werr = errno;
+                fresh
+            }
+            _ => false,
+        }
+    }
+
+    // handed out once
+    pub fn take_werr(&mut self, id: NodeId) -> i32 {
+        self.get_mut(id).map_or(0, |n| std::mem::take(&mut n.werr))
     }
 
     pub fn was_acked(&self, id: NodeId) -> bool {
@@ -2180,6 +2201,37 @@ mod tests {
             .unwrap();
         assert_eq!(t.get(a).map(|n| n.meta.hash), Some(file(1).hash));
         assert!(t.resolve(&rp("b")).is_none());
+    }
+
+    // a commit that failed after the last close is told to the next flush, fsync or write, once
+    #[test]
+    fn a_late_write_error_is_handed_out_once() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        t.add_open(f);
+        assert!(t.set_werr(f, libc::ECANCELED));
+        assert_eq!(t.take_werr(f), libc::ECANCELED);
+        assert_eq!(t.take_werr(f), 0);
+        assert!(
+            t.set_werr(f, libc::EIO),
+            "a taken error leaves room for the next"
+        );
+        assert!(
+            !t.set_werr(f, libc::ECANCELED),
+            "one still waiting is replaced"
+        );
+        assert_eq!(t.take_werr(f), libc::ECANCELED);
+    }
+
+    #[test]
+    fn a_late_write_error_needs_a_handle_to_tell() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        assert!(!t.set_werr(f, libc::ECANCELED));
+        assert_eq!(t.take_werr(f), 0);
+        assert!(!t.set_werr(DETACHED + 4096, libc::EIO));
     }
 
     #[test]

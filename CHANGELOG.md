@@ -29,6 +29,9 @@
   the status line says so. A guest that was killed or lost power is cleaned up by the next join to that host before it
   loads anything, and refuses to start if it cannot. The identity, trust file and host key are kept, so no join pairs
   again. Dropping and restoring the link inside one session still resumes by sequence number.
+* Closing a new file no longer waits for the host: the commit is queued in order and finished in the background. A
+  refusal after the close shows as a notice and as an error at the next flush, fsync or write of a handle still open
+  on the file. Edits to existing files still wait at close, and `fsync` always waits for the host.
 
 ## 0.1.0
 

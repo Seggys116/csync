@@ -19,7 +19,7 @@ use super::tree::{
     domain_for_new, domain_of,
 };
 use super::write::{
-    Flushed, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect, node_expect,
+    Flushed, Job, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect, node_expect,
 };
 use crate::ignore::rules::{Class, Rules};
 use crate::index::tree::StatKey;
@@ -119,6 +119,13 @@ fn hold_loop(core: &Core, rx: &Receiver<Held>) {
     }
 }
 
+// the thread behind closes that did not wait for the host: runs until stopped, one answer at a time
+pub fn settle_loop(core: &Core, rx: &Receiver<Job>) {
+    while let Ok(Job::Settle(sid)) = rx.recv() {
+        core.settle_parked(sid);
+    }
+}
+
 #[derive(Default)]
 pub struct Counters {
     pub hits: AtomicU64,
@@ -198,6 +205,8 @@ pub struct Core {
     pub norm_fold: AtomicBool,
     pub passthrough: AtomicBool,
     pub notice: NoticeFn,
+    // nodes holding an error from a commit that failed after their last close; lets write skip the tree when none do
+    pub werrs: AtomicU32,
     // nodes whose staged copy is being opened, committed, truncated or dropped; one step at a time each
     pub staging_busy: Mutex<FxHashSet<NodeId>>,
     pub staging_done: Condvar,
@@ -729,6 +738,45 @@ impl Core {
                 }
                 Err(en(e.errno))
             }
+        }
+    }
+
+    // the error of a commit that failed after the node's last close, given out once
+    pub fn take_werr(&self, node: NodeId) -> Result<(), Errno> {
+        if self.werrs.load(Relaxed) == 0 {
+            return Ok(());
+        }
+        let e = self.tw().take_werr(node);
+        if e == 0 {
+            return Ok(());
+        }
+        self.werrs.fetch_sub(1, Relaxed);
+        Err(en(e))
+    }
+
+    // the rest of a close that left a new file's commit to the host's answer, off the fuse workers
+    pub fn settle_parked(&self, sid: u32) {
+        let Some(node) = self.writer.parked_node(sid) else {
+            return;
+        };
+        let _turn = self.stage_turn(node);
+        if let Some(r) = self.writer.settle_parked(sid) {
+            let errno = r.as_ref().err().map_or(0, |e| e.errno);
+            if self.finish(node, r).is_err() {
+                if let Some(n) = self.tw().get_mut(node) {
+                    n.page = None;
+                }
+                self.kick(vec![Effect::InvalInode(node)]);
+                if errno != 0 && self.tw().set_werr(node, errno) {
+                    self.werrs.fetch_add(1, Relaxed);
+                }
+            }
+        }
+        if self.writer.staging_fd(sid).is_none()
+            && let Some(n) = self.tw().get_mut(node)
+            && n.staging == Some(sid)
+        {
+            n.staging = None;
         }
     }
 
@@ -4415,6 +4463,10 @@ impl Filesystem for GuestFs {
         let Some(h) = self.handle(fh.0) else {
             return reply.error(Errno::EBADF);
         };
+        // a commit that failed after the last close leaves its error for the next write on the node
+        if let Err(e) = self.core.take_werr(h.node) {
+            return reply.error(e);
+        }
         let r = match &h.src {
             Src::Staged { fd, .. } => pwrite_all(fd.as_fd(), data, offset),
             Src::Local { fd } => pwrite_all(fd.as_fd(), data, offset),
@@ -4449,7 +4501,7 @@ impl Filesystem for GuestFs {
             }
             _ => Ok(()),
         };
-        match r {
+        match r.and(self.core.take_werr(h.node)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -4471,8 +4523,9 @@ impl Filesystem for GuestFs {
         };
         if let Src::Staged { id, .. } = &h.src {
             let _turn = self.core.stage_turn(h.node);
-            // an edit that failed on the last close is gone: drop pages that still show it
-            if let Some(r) = self.core.writer.release(*id)
+            // an edit that failed on the last close is gone: drop pages that still show it. a new file's
+            // commit is left to the settler, which keeps the staging copy and the node until the host answers
+            if let Some(r) = self.core.writer.release_async(*id, h.node)
                 && self.core.finish(h.node, r).is_err()
             {
                 if let Some(n) = self.core.tw().get_mut(h.node) {
@@ -4516,7 +4569,7 @@ impl Filesystem for GuestFs {
             Src::Local { fd } => sys::fsync(fd.as_fd()).map_err(|e| eio(&e)),
             _ => Ok(()),
         };
-        match r {
+        match r.and(self.core.take_werr(h.node)) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }

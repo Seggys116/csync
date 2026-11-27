@@ -3,7 +3,7 @@ use super::cache::{
     pwrite_all, read_len, rpc_errno, wire_errno,
 };
 use super::pipe::{Payload, Pipe, Tag, Ticket};
-use super::tree::{GNode, Vis};
+use super::tree::{GNode, NodeId, Vis};
 use crate::delta;
 use crate::index::tree::StatKey;
 use crate::merge::merge3;
@@ -13,6 +13,7 @@ use crate::proto::{
     Notice, NoticeKind, Op, RelPath, Reply, Version, WireErr,
 };
 use crate::sys;
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex};
@@ -29,9 +30,25 @@ pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Flushed {
     Clean,
-    // pipelined create: the host has not answered yet, release() settles it
+    // pipelined create: the host has not answered yet; a close that waits settles it, one that parks it leaves
+    // it to the settler
     Sent(Version),
     Committed { meta: Meta, merged: bool },
+}
+
+// work for the settler thread
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Job {
+    // the host answered the commit of a new file whose last handle closed without waiting for it
+    Settle(u32),
+    Stop,
+}
+
+// closes that left their commit to the settler and are not settled yet
+#[derive(Default)]
+struct Parked {
+    n: Mutex<usize>,
+    cv: Condvar,
 }
 
 // refused: the edit lost a CAS race and was discarded; restore the node to `current` and invalidate it
@@ -143,15 +160,30 @@ struct Cell {
     cv: Condvar,
     // answered, even after a waiter took the answer: a release waiting only for the reply must not miss it
     fired: std::sync::atomic::AtomicBool,
+    // a close left this answer to the settler; set only before the answer arrives, taken by put
+    parked: std::sync::atomic::AtomicBool,
 }
 
 impl Cell {
-    fn put(&self, r: Result<Reply, RpcError>) {
+    // true when a parked close is waiting on this answer, so the caller must wake the settler
+    fn put(&self, r: Result<Reply, RpcError>) -> bool {
         let mut g = lock(&self.r);
         *g = Some(r);
         self.fired.store(true, std::sync::atomic::Ordering::Release);
         drop(g);
         self.cv.notify_all();
+        self.parked.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    // false when the answer is already in: the closer has it at hand and settles it itself
+    fn park(&self) -> bool {
+        let _g = lock(&self.r);
+        if self.fired.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        self.parked
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
     }
 
     fn wait(&self, deadline: Instant) -> Option<Result<Reply, RpcError>> {
@@ -195,6 +227,7 @@ struct Pending {
 }
 
 struct Staged {
+    id: u32,
     path: RelPath,
     fd: Arc<OwnedFd>,
     base: Option<Version>,
@@ -212,6 +245,8 @@ struct Staged {
     closed: bool,
     // its name was unlinked: open handles keep a private copy that is never committed
     unlinked: bool,
+    // the last handle closed with the first commit unanswered: the settler finishes the close, for this node
+    orphan: Option<NodeId>,
 }
 
 #[derive(Default)]
@@ -283,18 +318,57 @@ pub struct Writer {
     pipe: Arc<Pipe>,
     notice: NoticeFn,
     table: Mutex<Table>,
+    jobs: Sender<Job>,
+    jobs_rx: Receiver<Job>,
+    parked: Parked,
 }
 
 impl Writer {
     pub fn new(cache: Arc<BlobCache>, pipe: Arc<Pipe>, notice: NoticeFn) -> Self {
         let remote = cache.remote().clone();
+        let (jobs, jobs_rx) = unbounded();
         Self {
             cache,
             remote,
             pipe,
             notice,
             table: Mutex::new(Table::default()),
+            jobs,
+            jobs_rx,
+            parked: Parked::default(),
         }
+    }
+
+    // what the settler thread reads; a parked close is settled when the host's answer to its commit arrives
+    pub fn jobs(&self) -> Receiver<Job> {
+        self.jobs_rx.clone()
+    }
+
+    pub fn stop_settler(&self) {
+        let _ = self.jobs.send(Job::Stop);
+    }
+
+    // waits until no close is left to the settler; false when the deadline came first
+    pub fn drain(&self, deadline: Instant) -> bool {
+        let mut n = lock(&self.parked.n);
+        while *n > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            n = match self.parked.cv.wait_timeout(n, deadline - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+        true
+    }
+
+    fn parked_done(&self) {
+        let mut n = lock(&self.parked.n);
+        *n = n.saturating_sub(1);
+        drop(n);
+        self.parked.cv.notify_all();
     }
 
     // no other handle can change the staging file, so it is hashed and sent in place, not copied
@@ -343,6 +417,10 @@ impl Writer {
         {
             let mut st = lock(&e);
             if !st.refused && !st.closed {
+                // a handle holds the entry again, so the close that parked it has nothing left to settle
+                if st.orphan.take().is_some() {
+                    self.parked_done();
+                }
                 if o.trunc {
                     rustix::fs::ftruncate(&*st.fd, 0).map_err(|e| e.raw_os_error())?;
                     st.synced = None;
@@ -378,7 +456,8 @@ impl Writer {
         {
             synced = Some(mark(sys::stat_key(fd.as_fd()).map_err(|e| io_errno(&e))?));
         }
-        let st = Staged {
+        let mut st = Staged {
+            id: 0,
             path: o.path.clone(),
             fd: fd.clone(),
             base: o.base,
@@ -392,6 +471,7 @@ impl Writer {
             closed: false,
             unlinked: false,
             unpublished: None,
+            orphan: None,
         };
         let mut t = lock(&self.table);
         let id = loop {
@@ -400,6 +480,7 @@ impl Writer {
                 break t.next;
             }
         };
+        st.id = id;
         t.map.insert(id, Arc::new(Mutex::new(st)));
         Ok((id, fd))
     }
@@ -430,11 +511,26 @@ impl Writer {
 
     // on the last handle: commits anything still dirty, settles a pipelined create, drops the staging
     pub fn release(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
+        self.release_with(id, None)
+    }
+
+    // like release, but a new file's commit is left to the settler instead of waited for: the entry and its staging
+    // copy stay until the host answers. an edit of a file the host has still waits, so it can fail the close
+    pub fn release_async(&self, id: u32, node: NodeId) -> Option<Result<Flushed, Refusal>> {
+        self.release_with(id, Some(node))
+    }
+
+    fn release_with(&self, id: u32, park: Option<NodeId>) -> Option<Result<Flushed, Refusal>> {
         let e = self.entry(id)?;
         let cell = {
             let mut st = lock(&e);
             st.handles = st.handles.saturating_sub(1);
             if st.handles > 0 {
+                return None;
+            }
+            if let Some(node) = park
+                && self.park(&mut st, node, false)
+            {
                 return None;
             }
             st.pending.as_ref().map(|p| (p.cell.clone(), p.ver.size))
@@ -443,13 +539,75 @@ impl Writer {
         if let Some((c, size)) = cell {
             c.ready(commit_deadline(size));
         }
-        let mut st = lock(&e);
+        self.release_tail(id, &e, park)
+    }
+
+    // a new file's commit is in the pipe and carries what the staging copy holds: the close need not wait for the
+    // host. fresh: the commit was pushed just now, so the copy cannot have changed since
+    fn park(&self, st: &mut Staged, node: NodeId, fresh: bool) -> bool {
+        if st.base.is_some() || st.refused || st.unlinked {
+            return false;
+        }
+        let Some(p) = &st.pending else { return false };
+        if !(fresh || self.unchanged(st, p)) || !p.cell.park() {
+            return false;
+        }
+        st.orphan = Some(node);
+        *lock(&self.parked.n) += 1;
+        true
+    }
+
+    // the staging copy still holds the content the pending commit carries
+    fn unchanged(&self, st: &Staged, p: &Pending) -> bool {
+        let Ok(stat) = sys::stat_key(st.fd.as_fd()) else {
+            return false;
+        };
+        trusted(Some(&p.stat), &stat)
+            || (stat.size == p.ver.size
+                && hash_fd(st.fd.as_fd(), stat.size).is_ok_and(|h| h == p.ver.hash))
+    }
+
+    pub fn parked_node(&self, id: u32) -> Option<NodeId> {
+        let e = self.entry(id)?;
+        lock(&e).orphan
+    }
+
+    // the host answered the commit of a parked close: runs what release runs once the reply is in, off the
+    // fuse workers. None when the entry was reopened meanwhile or there is nothing to report
+    pub fn settle_parked(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
+        let e = self.entry(id)?;
+        lock(&e).orphan.take()?;
+        // shutdown fails the commits still queued; nothing further can reach the host
+        let out = if self.pipe.is_closed() {
+            None
+        } else {
+            self.release_tail(id, &e, None)
+        };
+        self.parked_done();
+        out
+    }
+
+    // what a last close does once the host's answer is in hand
+    fn release_tail(
+        &self,
+        id: u32,
+        e: &Arc<Mutex<Staged>>,
+        park: Option<NodeId>,
+    ) -> Option<Result<Flushed, Refusal>> {
+        let mut st = lock(e);
         let mut settled = false;
         let out = if st.refused || st.handles > 0 {
             None
         } else {
             let r = match self.flush_locked(&mut st, false) {
-                Ok(Flushed::Sent(_)) => self.settle(&mut st).map(|o| o.unwrap_or(Flushed::Clean)),
+                Ok(Flushed::Sent(v)) => {
+                    if let Some(node) = park
+                        && self.park(&mut st, node, true)
+                    {
+                        return Some(Ok(Flushed::Sent(v)));
+                    }
+                    self.settle(&mut st).map(|o| o.unwrap_or(Flushed::Clean))
+                }
                 r => r,
             };
             // nobody is left to retry a new file the host never took: the guest copy follows the host
@@ -578,10 +736,15 @@ impl Writer {
             mtime_ns: None,
         };
         let cell = Arc::new(Cell::default());
-        let c = cell.clone();
+        let (c, jobs, id) = (cell.clone(), self.jobs.clone(), st.id);
+        let wake = move |r| {
+            if c.put(r) {
+                let _ = jobs.send(Job::Settle(id));
+            }
+        };
         let ticket = self
             .pipe
-            .push_with(op, payload, deadline, Box::new(move |r| c.put(r)))
+            .push_with(op, payload, deadline, Box::new(wake))
             .map_err(Refusal::err)?;
         st.pending = Some(Pending {
             ticket,
@@ -1224,7 +1387,7 @@ mod tests {
     use crate::proto::{Change, ReqId, Seq, VerKey};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     struct Dir(PathBuf);
     impl Drop for Dir {
@@ -1237,6 +1400,9 @@ mod tests {
     struct Script {
         replies: Mutex<VecDeque<Result<Reply, RpcError>>>,
         ops: Mutex<Vec<Op>>,
+        // while set, a request is logged and its answer withheld until answer() gives it
+        hold: AtomicBool,
+        held: Mutex<VecDeque<Done>>,
     }
 
     impl Script {
@@ -1245,6 +1411,11 @@ mod tests {
             lock(&self.replies)
                 .pop_front()
                 .unwrap_or(Err(RpcError::Closed))
+        }
+
+        fn answer(&self, r: Result<Reply, RpcError>) {
+            let d = lock(&self.held).pop_front().expect("nothing held");
+            d(r);
         }
     }
 
@@ -1261,6 +1432,12 @@ mod tests {
             self.next(op)
         }
         fn submit(&self, op: Op, done: Done) -> Result<ReqId, RpcError> {
+            if self.hold.load(Ordering::SeqCst) {
+                // logged last, so a counted request is already held
+                lock(&self.held).push_back(done);
+                lock(&self.ops).push(op);
+                return Ok(1);
+            }
             done(self.next(op));
             Ok(1)
         }
@@ -1853,5 +2030,245 @@ mod tests {
             [Op::Mk { .. }, Op::Mk { .. }, Op::Remove { .. }] => {}
             o => panic!("unexpected {o:?}"),
         }
+    }
+
+    fn until(what: &str, f: impl Fn() -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn sent(r: &Rig) -> usize {
+        lock(&r.script.ops).len()
+    }
+
+    fn held_rig(tag: &str) -> Rig {
+        let r = rig(tag);
+        r.script.hold.store(true, Ordering::SeqCst);
+        r
+    }
+
+    // a new file the guest made: no host version, content written through the staging copy
+    fn open_new(r: &Rig, p: &RelPath, body: &[u8]) -> (u32, Arc<OwnedFd>) {
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: None,
+            })
+            .unwrap();
+        overwrite(fd.as_fd(), body).unwrap();
+        (id, fd)
+    }
+
+    fn done_for(v: Version) -> Result<Reply, RpcError> {
+        Ok(Reply::Done { meta: meta(v) })
+    }
+
+    fn committed(v: Version) -> Option<Result<Flushed, Refusal>> {
+        Some(Ok(Flushed::Committed {
+            meta: meta(v),
+            merged: false,
+        }))
+    }
+
+    const JOB_WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn closing_a_new_file_does_not_wait_for_the_host() {
+        let r = held_rig("park");
+        let p = RelPath::new("new.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+
+        assert_eq!(r.w.release_async(id, 7), None);
+        assert_eq!(lock(&r.script.held).len(), 1, "the host has not answered");
+        assert!(
+            r.w.staging_fd(id).is_some(),
+            "the settler still needs the entry"
+        );
+        assert_eq!(r.w.parked_node(id), Some(7));
+        assert!(!r.w.drain(Instant::now() + Duration::from_millis(20)));
+        let jobs = r.w.jobs();
+        assert!(jobs.try_recv().is_err());
+
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert!(r.cache.contains(&v.hash));
+        assert!(r.w.drain(Instant::now()));
+        assert_eq!(sent(&r), 1);
+        assert!(lock(&r.notes).is_empty());
+    }
+
+    #[test]
+    fn closing_an_empty_new_file_sends_its_commit_and_returns() {
+        let r = held_rig("park-empty");
+        let p = RelPath::new("touched").unwrap();
+        let (id, _fd) = open_new(&r, &p, b"");
+        let v = ver(b"");
+        assert_eq!(r.w.release_async(id, 3), Some(Ok(Flushed::Sent(v))));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.parked_node(id), Some(3));
+        assert!(r.w.staging_fd(id).is_some());
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert_eq!(sent(&r), 1);
+    }
+
+    #[test]
+    fn a_late_conflict_that_cannot_merge_rolls_back_with_one_notice() {
+        let r = held_rig("park-refuse");
+        let p = RelPath::new("clash.txt").unwrap();
+        let ours = b"mine\n";
+        let theirs = b"th\0eirs";
+        let (id, _fd) = open_new(&r, &p, ours);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(ver(ours))));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        let (jobs, vt) = (r.w.jobs(), ver(theirs));
+        r.script.answer(Ok(Reply::Conflict {
+            current: Some(meta(vt)),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(
+            r.w.settle_parked(id),
+            Some(Err(Refusal {
+                errno: libc::ECANCELED,
+                refused: true,
+                current: Some(meta(vt)),
+            }))
+        );
+        assert_eq!(
+            *lock(&r.notes),
+            vec![Notice {
+                kind: NoticeKind::Refused,
+                path: p
+            }]
+        );
+        assert!(r.w.staging_fd(id).is_none());
+        assert!(!r.cache.contains(&ver(ours).hash));
+        assert!(r.cache.contains(&vt.hash));
+        assert!(r.w.drain(Instant::now()));
+        assert_eq!(sent(&r), 1, "a refused create is not sent again");
+        assert_eq!(r.w.settle_parked(id), None);
+    }
+
+    #[test]
+    fn fsync_waits_for_the_host_after_a_new_file_closes() {
+        let r = held_rig("park-fsync");
+        let p = RelPath::new("synced.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.flush(id, true));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!h.is_finished(), "fsync returned before the host answered");
+            r.script.answer(done_for(v));
+            assert_eq!(
+                h.join().unwrap(),
+                Ok(Flushed::Committed {
+                    meta: meta(v),
+                    merged: false
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn an_edit_of_an_existing_file_still_waits_at_close() {
+        let r = held_rig("park-edit");
+        let p = RelPath::new("lib.rs").unwrap();
+        let (base, ours) = (b"one\ntwo\n", b"ONE\ntwo\n");
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let vo = ver(ours);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.release_async(id, 5));
+            until("the commit in the pipe", || sent(&r) == 1);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !h.is_finished(),
+                "the close returned before the host answered"
+            );
+            r.script.answer(done_for(vo));
+            assert_eq!(h.join().unwrap(), committed(vo));
+        });
+        assert_eq!(r.w.parked_node(id), None);
+        assert!(r.w.staging_fd(id).is_none());
+    }
+
+    #[test]
+    fn a_new_file_changed_after_its_commit_was_sent_still_waits_at_close() {
+        let r = held_rig("park-changed");
+        let p = RelPath::new("grows.txt").unwrap();
+        let (first, second) = (b"fresh\n", b"other\n");
+        let (id, fd) = open_new(&r, &p, first);
+        let (v1, v2) = (ver(first), ver(second));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v1)));
+        until("the first commit", || sent(&r) == 1);
+        overwrite(fd.as_fd(), second).unwrap();
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.release_async(id, 9));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!h.is_finished());
+            r.script.answer(done_for(v1));
+            until("the second commit", || sent(&r) == 2);
+            r.script.answer(done_for(v2));
+            assert_eq!(h.join().unwrap(), committed(v2));
+        });
+        assert_eq!(r.w.parked_node(id), None);
+    }
+
+    #[test]
+    fn a_reopen_after_a_parked_close_reuses_the_staging_copy() {
+        let r = held_rig("park-reopen");
+        let p = RelPath::new("again.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        let (again, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: Some(id),
+            })
+            .unwrap();
+        assert_eq!(again, id);
+        assert_eq!(staged(&fd), body);
+        assert_eq!(r.w.parked_node(id), None);
+        assert!(r.w.drain(Instant::now()), "the reopen took the close back");
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), None);
+        assert!(r.w.staging_fd(id).is_some(), "the reopened handle keeps it");
+
+        assert_eq!(r.w.release(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert_eq!(sent(&r), 1);
     }
 }
