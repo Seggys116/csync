@@ -253,6 +253,15 @@ fn on_reply(g: &mut State, b: Back, now: Instant, fires: &mut Vec<Fire>) -> Opti
     None
 }
 
+// an op the host already answered busy surfaces busy when its deadline passes, not a timeout
+fn expiry_error(it: &Item) -> RpcError {
+    if it.not_before.is_some() {
+        RpcError::Wire(WireErr::Busy)
+    } else {
+        RpcError::Timeout
+    }
+}
+
 fn expire(
     g: &mut State,
     now: Instant,
@@ -271,7 +280,8 @@ fn expire(
             if let Some(id) = f.id {
                 cancels.push((f.remote, id));
             }
-            complete(g, fires, t, f.item.sink, Err(RpcError::Timeout));
+            let err = expiry_error(&f.item);
+            complete(g, fires, t, f.item.sink, Err(err));
             any = true;
         }
     }
@@ -280,7 +290,8 @@ fn expire(
         if g.queue[i].deadline <= now
             && let Some(it) = g.queue.remove(i)
         {
-            complete(g, fires, it.ticket, it.sink, Err(RpcError::Timeout));
+            let err = expiry_error(&it);
+            complete(g, fires, it.ticket, it.sink, Err(err));
             any = true;
         } else {
             i += 1;

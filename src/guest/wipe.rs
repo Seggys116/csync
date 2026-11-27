@@ -1,18 +1,22 @@
 // removal of one host's local guest state: nothing is followed, locked directories are opened up on the way down
 // and anything on another device is left alone
+use super::fsops;
 use crate::config::{Dirs, write_private};
 use crate::crypto::trust::{PeerKey, now_unix};
 use rustix::{
     fs::{
-        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat, chmodat, fchmod, flock, fstat,
-        openat, statat, unlinkat,
+        AtFlags, Dir, FileType, FlockOperation, Mode, OFlags, Stat, fchmod, flock, fstat, openat,
+        statat, unlinkat,
     },
     io::Errno,
 };
 use std::{
     ffi::{CStr, CString, OsStr},
     io,
-    os::{fd::OwnedFd, unix::ffi::OsStrExt},
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Component, Path, PathBuf},
 };
 
@@ -113,6 +117,12 @@ pub fn marker_present(state: &Path) -> bool {
 #[allow(clippy::unnecessary_cast)]
 fn dev_of(st: &Stat) -> u64 {
     st.st_dev as u64
+}
+
+// the directory's own permission bits with the owner's rwx added
+#[allow(clippy::unnecessary_cast)]
+fn perm_of(st: &Stat) -> u32 {
+    (st.st_mode as u32 & 0o7777) | 0o700
 }
 
 fn same_node(a: &Stat, b: &Stat) -> bool {
@@ -226,13 +236,14 @@ impl Walker {
     fn open_dir(&mut self, parent: &OwnedFd, name: &CStr, st: &Stat) -> Option<OwnedFd> {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let opened = match openat(parent, name, flags, Mode::empty()) {
-            Err(Errno::ACCESS) => chmodat(
-                parent,
-                name,
-                Mode::from_raw_mode(st.st_mode) | Mode::RWXU,
-                AtFlags::SYMLINK_NOFOLLOW,
-            )
-            .and_then(|()| openat(parent, name, flags, Mode::empty())),
+            Err(Errno::ACCESS) => name
+                .to_str()
+                .map_err(|_| Errno::INVAL)
+                .and_then(|n| {
+                    fsops::chmod_at(parent.as_fd(), n, perm_of(st))
+                        .map_err(Errno::from_raw_os_error)
+                })
+                .and_then(|()| openat(parent, name, flags, Mode::empty())),
             r => r,
         };
         let fd = match opened {
