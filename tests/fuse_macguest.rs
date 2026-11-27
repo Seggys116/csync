@@ -196,6 +196,17 @@ mod mac {
         panic!("timed out after {limit:?}: {what}");
     }
 
+    // how long after `from` the check first held, polling up to 30s
+    fn visible_after(from: Instant, mut f: impl FnMut() -> bool) -> Option<Duration> {
+        while from.elapsed() < Duration::from_secs(30) {
+            if f() {
+                return Some(from.elapsed());
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        None
+    }
+
     fn files_reported(l: &str) -> bool {
         l.starts_with("stats ")
             && l.split(' ')
@@ -372,16 +383,30 @@ mod mac {
             "pub fn f() {}\n"
         );
 
-        // a host write shows on the mount inside the attribute lifetime plus slack
+        // a host change shows on the mount inside the attribute lifetime plus slack; all three are measured before asserting
         let mw = Watch::start(&mnt);
         mw.drain();
         let t0 = Instant::now();
         fs::write(proj.join("fromhost.txt"), "written on the host\n").unwrap();
-        eventually("the host write on the mount", HOST_VISIBLE, || {
+        let listed = visible_after(t0, || entries(&mnt).iter().any(|n| n == "fromhost.txt"));
+        let read = visible_after(t0, || {
             fs::read_to_string(mnt.join("fromhost.txt")).is_ok_and(|s| s == "written on the host\n")
         });
-        eprintln!("host write visible on the mount after {:?}", t0.elapsed());
-        let (host_change, host_ev) = mw.seen("fromhost.txt", Duration::from_secs(3));
+        let t1 = Instant::now();
+        fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
+        let edited = visible_after(t1, || {
+            fs::read_to_string(mnt.join("src/lib.rs")).is_ok_and(|s| s == "pub fn g() {}\n")
+        });
+        eprintln!(
+            "host changes on the mount: new file listed after {listed:?}, new file readable after {read:?}, edit of a synced file after {edited:?}"
+        );
+        let (host_change, host_ev) = mw.seen("fromhost.txt", Duration::from_secs(1));
+        for (what, t) in [("listed", listed), ("readable", read), ("edited", edited)] {
+            assert!(
+                t.is_some_and(|d| d <= HOST_VISIBLE),
+                "the host change was not {what} on the mount within {HOST_VISIBLE:?}: {t:?}"
+            );
+        }
 
         // a guest create, write and close reaches the host byte for byte
         mw.drain();
