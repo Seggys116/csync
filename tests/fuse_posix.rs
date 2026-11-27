@@ -22,6 +22,7 @@ linux_test!(
     path_truncate_right_after_write,
     unlink_open_file_overlay,
     unlink_open_file_synced,
+    replaced_read_only_open_synced,
     overlay_create_mode_ignores_csync_umask,
     overlay_file_over_2gib_keeps_size,
     symlink_times_nofollow_synced,
@@ -448,6 +449,37 @@ mod posix {
         eventually("host drops the unlinked file", SYNC, || {
             !e.h("src/uo").exists()
         });
+    }
+
+    // a save over a file a reader holds: the kernel flushes the old inode's times as it unlinks it, and a
+    // refusal is kept as a writeback error that fails the reader's fsync, close and direct reads with EIO
+    pub fn replaced_read_only_open_synced() {
+        let Some(e) = Env::up("posix-replace-ro") else {
+            return;
+        };
+        fs::write(e.m("src/ro"), b"old bytes").unwrap();
+        e.host_has("src/ro", b"old bytes");
+        let mut f = File::open(e.m("src/ro")).unwrap();
+        fs::write(e.m("src/ro.tmp"), b"new bytes").unwrap();
+        fs::rename(e.m("src/ro.tmp"), e.m("src/ro")).unwrap();
+        let mut bad = Vec::new();
+        let mut got = Vec::new();
+        match f.read_to_end(&mut got) {
+            Ok(_) if got == b"old bytes" => {}
+            Ok(_) => bad.push(format!("read {:?}", String::from_utf8_lossy(&got))),
+            Err(err) => bad.push(format!("read {}", eno(&err))),
+        }
+        if let Err(err) = f.sync_all() {
+            bad.push(format!("fsync {}", eno(&err)));
+        }
+        if let Err(err) = close_checked(f) {
+            bad.push(format!("close {}", eno(&err)));
+        }
+        assert!(
+            bad.is_empty(),
+            "read-only fd of a replaced synced file: {bad:?}"
+        );
+        e.host_has("src/ro", b"new bytes");
     }
 
     // the overlay creates its backing file under csync's own umask, so umask 002 users lose group write

@@ -3160,6 +3160,21 @@ impl GuestFs {
         let fd = match (&staged, open.as_deref().map(|h| &h.src)) {
             (Some(fd), _) => fd.as_fd(),
             (None, Some(Src::Local { fd })) => fd.as_fd(),
+            // the kernel flushes its times to an inode it unlinks and keeps a refusal as a writeback error
+            _ if size.is_none() && mode.is_none() => {
+                let mut t = self.core.tw();
+                let n = t
+                    .get_mut(id)
+                    .filter(|n| !n.attached())
+                    .ok_or(Errno::ENOENT)?;
+                if let Some(m) = mtime {
+                    n.meta.mtime_ns = match m {
+                        TimeOrNow::SpecificTime(s) => ns_of(s),
+                        TimeOrNow::Now => now_ns(),
+                    };
+                }
+                return Ok(());
+            }
             _ => return Err(Errno::ENOENT),
         };
         if let Some(sz) = size {
@@ -3366,6 +3381,10 @@ impl GuestFs {
                                 };
                                 rustix::fs::futimens(&*fd, &ts).map_err(erx)?;
                             }
+                        }
+                        // a newer host save supersedes a time-only change; a refusal would stick to the inode as a writeback error
+                        Err(e) if e.refused && size.is_none() && mode.is_none() => {
+                            let _ = self.core.finish(id, Err(e));
                         }
                         Err(e) => return self.core.finish(id, Err(e)),
                     }
