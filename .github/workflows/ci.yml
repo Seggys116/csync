@@ -137,14 +137,19 @@ jobs:
 
   # experimental: whether macFUSE (FSKit backend) can run on a hosted macOS runner; never blocks merging, not in ci-ok
   macfuse:
-    name: macfuse (${{ matrix.os }})
+    name: macfuse (${{ matrix.os }}, ${{ matrix.variant }})
     runs-on: ${{ matrix.os }}
     continue-on-error: true
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26]
+        include:
+          - { os: macos-15, variant: base }
+          - { os: macos-26, variant: base }
+          - { os: macos-15, variant: pre, probe: pre }
+          - { os: macos-15, variant: settle, probe: settle }
+          - { os: macos-26, variant: settle, probe: settle }
     env:
       CSYNC_BIN: ${{ github.workspace }}/target/release/csync
       FSKIT_ID: io.macfuse.app.fsmodule.macfuse
@@ -243,6 +248,10 @@ jobs:
           "$RUNNER_TEMP/fsext"
       - name: macguest test
         shell: bash
+        env:
+          CSYNC_MG_PROBE: ${{ matrix.probe }}
+          CSYNC_TRACE_NUDGE: ${{ matrix.nudge }}
+          CSYNC_TRACE_MOUNT_OPTS: ${{ matrix.opts }}
         run: |
           set +e
           log="$RUNNER_TEMP/macguest.log"

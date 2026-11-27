@@ -201,6 +201,14 @@ fn mode(perm: u16) -> Mode {
     Mode::from_bits_truncate((u32::from(perm) & 0o7777) as _)
 }
 
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn nocache(fd: &OwnedFd) -> i32 {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a descriptor this function borrows, with an integer argument
+    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }
+}
+
 fn open_root(mount: &Path) -> Option<OwnedFd> {
     rustix::fs::open(mount, ROOT_FLAGS, Mode::empty()).ok()
 }
@@ -251,8 +259,25 @@ impl Worker {
             // events that cannot be told from a user's requests are settled without touching the mount
             #[cfg(target_os = "macos")]
             let target = root.as_ref().filter(|_| replay);
+            let watch = match &s {
+                Synth::Create { name, .. } => super::coherence::watched(name.as_str()),
+                _ => false,
+            };
+            if watch {
+                super::coherence::trace(format_args!(
+                    "injector got {s:?} target_present={}",
+                    target.is_some()
+                ));
+            }
             if let Some(r) = target {
-                let _ = self.inject(r, &s, &mut a, &mut b);
+                let t0 = std::time::Instant::now();
+                let res = self.inject(r, &s, &mut a, &mut b);
+                if watch {
+                    super::coherence::trace(format_args!(
+                        "injector done {s:?} path={a:?} result={res:?} took={:?}",
+                        t0.elapsed()
+                    ));
+                }
             }
             let mut fx = Vec::new();
             let mut t = self.tree.write().unwrap_or_else(|e| e.into_inner());
@@ -272,6 +297,83 @@ impl Worker {
         }
         self.sh.tid.store(0, Ordering::Release);
     }
+
+    // TRACE diagnostics, never to be merged: extra operations through the mount after a create, chosen by env
+    #[cfg(target_os = "macos")]
+    fn trace_nudge(&self, root: &OwnedFd, parent: NodeId, name: &str, full: &str) {
+        use super::coherence::{trace, watched};
+        use rustix::fs::{Dir, Timespec, Timestamps, UTIME_NOW};
+        if !watched(name) {
+            return;
+        }
+        let Ok(kinds) = std::env::var("CSYNC_TRACE_NUDGE") else {
+            return;
+        };
+        if kinds.is_empty() {
+            return;
+        }
+        let mut p = String::new();
+        {
+            let t = self.tree.read().unwrap_or_else(|e| e.into_inner());
+            t.visible_path_of(parent, &mut p);
+        }
+        let pp = if p.is_empty() { ".".to_owned() } else { p };
+        let lists = |label: &str| {
+            let r = rustix::fs::openat(
+                root,
+                pp.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            );
+            let res = r.map_err(io::Error::from).and_then(|fd| {
+                let mut d = Dir::read_from(&fd)?;
+                let mut found = false;
+                while let Some(e) = d.read() {
+                    if e?.file_name().to_bytes() == name.as_bytes() {
+                        found = true;
+                    }
+                }
+                Ok(found)
+            });
+            trace(format_args!("nudge {label}: readdir of {pp:?} through the mount lists {name}: {res:?}"));
+        };
+        lists("before");
+        for k in kinds.split(',') {
+            let t0 = std::time::Instant::now();
+            match k {
+                "utimes" => {
+                    let now = Timespec { tv_sec: 0, tv_nsec: UTIME_NOW as _ };
+                    let ts = Timestamps { last_access: now, last_modification: now };
+                    let r = rustix::fs::utimensat(root, pp.as_str(), &ts, AtFlags::empty());
+                    trace(format_args!("nudge utimes parent: {r:?} {:?}", t0.elapsed()));
+                }
+                "rename" => {
+                    let r = rustix::fs::renameat(root, full, root, full);
+                    trace(format_args!("nudge rename self: {r:?} {:?}", t0.elapsed()));
+                }
+                "stat" => {
+                    let a = rustix::fs::statat(root, full, AtFlags::SYMLINK_NOFOLLOW).map(|s| s.st_ino);
+                    let b = rustix::fs::statat(root, pp.as_str(), AtFlags::empty()).map(|s| s.st_mtime);
+                    trace(format_args!("nudge stat: new {a:?} parent mtime {b:?} {:?}", t0.elapsed()));
+                }
+                "nocache" => {
+                    let r = rustix::fs::openat(
+                        root,
+                        pp.as_str(),
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    );
+                    let res = r.map(|fd| nocache(&fd));
+                    trace(format_args!("nudge nocache parent dir: {res:?} {:?}", t0.elapsed()));
+                }
+                _ => {}
+            }
+            lists(k);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn trace_nudge(&self, _root: &OwnedFd, _parent: NodeId, _name: &str, _full: &str) {}
 
     // paths are computed under the read lock, the syscalls run with no lock held
     fn inject(&self, root: &OwnedFd, s: &Synth, a: &mut String, b: &mut String) -> io::Result<()> {
@@ -307,6 +409,7 @@ impl Worker {
                         }
                     }
                 }
+                self.trace_nudge(root, *parent, name.as_str(), a.as_str());
             }
             Synth::Modify { node } | Synth::Attrib { node } => {
                 let (kind, perm, size) = {

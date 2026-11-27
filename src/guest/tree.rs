@@ -999,6 +999,12 @@ impl GTree {
                 let dir = meta.kind == Kind::Dir;
                 let domain = domain_of(&meta);
                 let vis = if show { Vis::PendingCreate } else { Vis::Live };
+                if super::coherence::watched(name) {
+                    super::coherence::trace(format_args!(
+                        "upsert new entry parent={parent} name={name} mounted={} show={show} vis={vis:?}",
+                        self.mounted
+                    ));
+                }
                 let id = self.insert(parent, nm.clone(), meta, domain, vis);
                 if id == DETACHED {
                     return None;
@@ -1274,6 +1280,9 @@ impl GTree {
                     && let Some(n) = self.get_mut(id)
                     && n.vis == Vis::PendingCreate
                 {
+                    if super::coherence::watched(name.as_str()) {
+                        super::coherence::trace(format_args!("settle create {} -> Live", name.as_str()));
+                    }
                     n.vis = Vis::Live;
                     fx.push(Effect::InvalEntry(*parent, name.clone()));
                     fx.push(Effect::InvalInode(*parent));

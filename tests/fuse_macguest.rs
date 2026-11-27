@@ -196,15 +196,27 @@ mod mac {
         panic!("timed out after {limit:?}: {what}");
     }
 
-    // how long after `from` the check first held, polling up to 8s
-    fn visible_after(from: Instant, mut f: impl FnMut() -> bool) -> Option<Duration> {
-        while from.elapsed() < Duration::from_secs(8) {
+    // how long after `from` the check first held, polling up to `limit`
+    fn visible_after(
+        from: Instant,
+        limit: Duration,
+        mut f: impl FnMut() -> bool,
+    ) -> Option<Duration> {
+        while from.elapsed() < limit {
             if f() {
                 return Some(from.elapsed());
             }
             thread::sleep(Duration::from_millis(25));
         }
         None
+    }
+
+    // TRACE timeline marks, on the same clock as the guest's TRACE lines
+    fn mark(what: &str) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() % 1_000_000);
+        eprintln!("TRACE {ms:06} test: {what}");
     }
 
     fn files_reported(l: &str) -> bool {
@@ -390,18 +402,40 @@ mod mac {
         let listed = |name: &str| entries(&mnt).iter().any(|n| n == name);
         let reads =
             |rel: &str, want: &str| fs::read_to_string(mnt.join(rel)).is_ok_and(|s| s == want);
-        let t = Instant::now();
-        fs::write(proj.join("listed.txt"), "one\n").unwrap();
-        let by_listing = visible_after(t, || listed("listed.txt"));
-        let t = Instant::now();
-        fs::write(proj.join("fromhost.txt"), "written on the host\n").unwrap();
-        let by_lookup = visible_after(t, || reads("fromhost.txt", "written on the host\n"));
+        // CSYNC_MG_PROBE: `pre` looks the name up and lists the directory before the host creates it,
+        // `settle` leaves the new name alone for 2s before the first look
+        let variant = std::env::var("CSYNC_MG_PROBE").unwrap_or_default();
+        let new_window = Duration::from_secs(30);
+        let edit_window = Duration::from_secs(8);
+        let create = |name: &str, body: &str| {
+            if variant == "pre" {
+                let _ = fs::symlink_metadata(mnt.join(name));
+                let _ = entries(&mnt);
+                mark(&format!("pre-probed {name}"));
+            }
+            let t = Instant::now();
+            mark(&format!("host writes {name}"));
+            fs::write(proj.join(name), body).unwrap();
+            mark(&format!("host wrote {name}"));
+            if variant == "settle" {
+                thread::sleep(Duration::from_secs(2));
+            }
+            t
+        };
+        let t = create("listed.txt", "one\n");
+        let by_listing = visible_after(t, new_window, || listed("listed.txt"));
+        mark(&format!("listed.txt by listing: {by_listing:?}"));
+        let t = create("fromhost.txt", "written on the host\n");
+        let by_lookup = visible_after(t, new_window, || {
+            reads("fromhost.txt", "written on the host\n")
+        });
+        mark(&format!("fromhost.txt by lookup: {by_lookup:?}"));
         let t = Instant::now();
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
-        let edited = visible_after(t, || reads("src/lib.rs", "pub fn g() {}\n"));
-        let t = Instant::now();
-        fs::write(proj.join("third.txt"), "three\n").unwrap();
-        let after_listing = visible_after(t, || reads("third.txt", "three\n"));
+        let edited = visible_after(t, edit_window, || reads("src/lib.rs", "pub fn g() {}\n"));
+        let t = create("third.txt", "three\n");
+        let after_listing = visible_after(t, new_window, || reads("third.txt", "three\n"));
+        mark(&format!("third.txt by lookup: {after_listing:?}"));
         eprintln!(
             "host changes on the mount: new file by listing {by_listing:?}, new file by lookup {by_lookup:?}, edit of a synced file {edited:?}, new file by lookup after a listing {after_listing:?}"
         );
