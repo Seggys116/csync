@@ -400,12 +400,27 @@ mod mac {
         let mw = Watch::start(&mnt);
         mw.drain();
         let listed = |name: &str| entries(&mnt).iter().any(|n| n == name);
-        let reads =
-            |rel: &str, want: &str| fs::read_to_string(mnt.join(rel)).is_ok_and(|s| s == want);
+        let why = std::cell::RefCell::new(String::new());
+        let reads = |rel: &str, want: &str| match fs::read_to_string(mnt.join(rel)) {
+            Ok(s) if s == want => true,
+            Ok(s) => {
+                *why.borrow_mut() = format!("{rel}: content {s:?}");
+                false
+            }
+            Err(e) => {
+                *why.borrow_mut() = format!("{rel}: {e}");
+                false
+            }
+        };
         // CSYNC_MG_PROBE: `pre` looks the name up and lists the directory before the host creates it,
         // `settle` leaves the new name alone for 2s before the first look
         let variant = std::env::var("CSYNC_MG_PROBE").unwrap_or_default();
-        let new_window = Duration::from_secs(10);
+        let new_window = Duration::from_secs(
+            std::env::var("CSYNC_MG_WINDOW")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+        );
         let edit_window = Duration::from_secs(8);
         let create = |name: &str, body: &str| {
             if variant == "pre" {
@@ -429,13 +444,19 @@ mod mac {
         let by_lookup = visible_after(t, new_window, || {
             reads("fromhost.txt", "written on the host\n")
         });
-        mark(&format!("fromhost.txt by lookup: {by_lookup:?}"));
+        mark(&format!(
+            "fromhost.txt by lookup: {by_lookup:?} (last failure: {})",
+            why.borrow()
+        ));
         let t = Instant::now();
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
         let edited = visible_after(t, edit_window, || reads("src/lib.rs", "pub fn g() {}\n"));
         let t = create("third.txt", "three\n");
         let after_listing = visible_after(t, new_window, || reads("third.txt", "three\n"));
-        mark(&format!("third.txt by lookup: {after_listing:?}"));
+        mark(&format!(
+            "third.txt by lookup: {after_listing:?} (last failure: {})",
+            why.borrow()
+        ));
         eprintln!(
             "host changes on the mount: new file by listing {by_listing:?}, new file by lookup {by_lookup:?}, edit of a synced file {edited:?}, new file by lookup after a listing {after_listing:?}"
         );

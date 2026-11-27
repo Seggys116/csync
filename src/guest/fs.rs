@@ -3871,6 +3871,19 @@ impl Filesystem for GuestFs {
         reply: ReplyEntry,
     ) {
         self.core.ctr.op(Op::Mutate);
+        if let Some(nm) = name.to_str()
+            && (coherence::watched(nm) || !coherence::PROBE.active())
+        {
+            coherence::trace(format_args!(
+                "mknod parent={} name={nm} mode={mode:o} is_inj={} pid={} uid={:?} gid={:?} own_pid={}",
+                parent.0,
+                self.is_inj(req),
+                req.pid(),
+                req.uid(),
+                req.gid(),
+                std::process::id()
+            ));
+        }
         let special = fsops::special_of_mode(mode);
         if mode & S_IFMT != S_IFREG && special == Special::None {
             return reply.error(Errno::EPERM);
@@ -4097,6 +4110,21 @@ impl Filesystem for GuestFs {
         reply: ReplyOpen,
     ) {
         self.core.ctr.op(Op::Open);
+        {
+            let t = self.core.t();
+            if let Some(n) = t.get(ino.0)
+                && coherence::watched(n.name.as_str())
+            {
+                coherence::trace(format_args!(
+                    "open {} ino={} vis={:?} is_inj={} flags={:#x}",
+                    n.name.as_str(),
+                    ino.0,
+                    n.vis,
+                    self.is_inj(req),
+                    flags.0
+                ));
+            }
+        }
         if self.is_inj(req) {
             let nf = self.noflush(&Src::Empty);
             let live = lock(&self.io).get(&ino.0).and_then(|e| e.backing.upgrade());
