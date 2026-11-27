@@ -187,19 +187,43 @@ jobs:
           echo "::group::kmutil"; kmutil showloaded 2>&1 | grep -i fuse || echo "no fuse kext loaded"; echo "::endgroup::"
           echo "::group::systemextensionsctl"; systemextensionsctl list 2>&1 || true; echo "::endgroup::"
           echo "::group::doctor"; "$CSYNC_BIN" doctor || true; echo "::endgroup::"
+      # the Settings toggle writes enabledModules.plist through fskit_agent, and pluginkit holds the election; both are set,
+      # then doctor must report the module enabled before the test runs
       - name: enable the FSKit module
-        if: always()
         shell: bash
         run: |
           appex_dir=/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/Extensions
-          for id in "$FSKIT_ID" "$FSKIT_LOCAL_ID"; do
-            echo "::group::enable $id"
-            pluginkit -a "$appex_dir/$id.appex"; echo "pluginkit -a: $?"
-            pluginkit -e use -i "$id"; echo "pluginkit -e use: $?"
-            pluginkit -m -i "$id" -vvv || true
-            echo "::endgroup::"
+          plist="$HOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
+          ok=
+          for attempt in 1 2 3 4 5 6; do
+            sudo killall fskit_agent fskitd 2>&1 || true
+            sleep 2
+            for id in "$FSKIT_ID" "$FSKIT_LOCAL_ID"; do
+              pluginkit -a "$appex_dir/$id.appex"
+              pluginkit -e use -i "$id"
+            done
+            python3 - "$plist" "$FSKIT_ID" "$FSKIT_LOCAL_ID" <<'PY'
+          import plistlib, sys
+          path, ids = sys.argv[1], sys.argv[2:]
+          with open(path, "rb") as f:
+              mods = plistlib.load(f)
+          for i in ids:
+              if i not in mods:
+                  mods.append(i)
+          with open(path, "wb") as f:
+              plistlib.dump(mods, f, fmt=plistlib.FMT_BINARY)
+          PY
+            sleep 3
+            if "$CSYNC_BIN" doctor | grep -q '^PASS  FSKit module'; then ok=1; break; fi
+            echo "attempt $attempt: the module is not enabled yet"
+            sleep 5
           done
-      - name: fskit enablement state
+          plutil -p "$plist"
+          pluginkit -m -A -p com.apple.fskit.fsmodule -vv | grep -i -A2 'io.macfuse' || true
+          "$CSYNC_BIN" doctor | grep -i fskit
+          test -n "$ok"
+          sleep 5
+      - name: fskit client view
         if: always()
         continue-on-error: true
         shell: bash
@@ -216,32 +240,7 @@ jobs:
           if sem.wait(timeout: .now() + 20) == .timedOut { print("timed out") }
           EOF
           swiftc -target "$(uname -m)-apple-macos15.4" -o "$RUNNER_TEMP/fsext" "$RUNNER_TEMP/fsext.swift"
-          echo "::group::FSClient view before restarting the daemons"; "$RUNNER_TEMP/fsext"; echo "::endgroup::"
-          echo "::group::fskit settings container"
-          g="$HOME/Library/Group Containers/group.com.apple.fskit.settings"
-          ls -laR "$g" 2>&1 | head -30
-          for f in "$g"/*.plist "$g"/Library/Preferences/*.plist; do [ -f "$f" ] && { echo "-- $f"; plutil -p "$f"; }; done
-          echo "::endgroup::"
-          echo "::group::add the macfuse modules to enabledModules.plist (what the Settings toggle writes)"
-          sudo killall fskit_agent fskitd 2>&1 || true
-          sleep 2
-          python3 - "$g/enabledModules.plist" "$FSKIT_ID" "$FSKIT_LOCAL_ID" <<'PY'
-          import plistlib, sys
-          path, ids = sys.argv[1], sys.argv[2:]
-          with open(path, "rb") as f:
-              mods = plistlib.load(f)
-          for i in ids:
-              if i not in mods:
-                  mods.append(i)
-          with open(path, "wb") as f:
-              plistlib.dump(mods, f, fmt=plistlib.FMT_BINARY)
-          print(mods)
-          PY
-          sleep 1
           "$RUNNER_TEMP/fsext"
-          echo "::endgroup::"
-          plutil -p "$g/enabledModules.plist"
-          "$CSYNC_BIN" doctor | grep -i fskit || true
       - name: macguest test
         shell: bash
         run: |
