@@ -20,6 +20,9 @@ use std::{
 // every size it learns until its own reply, so a modify is raised another way
 pub static SIZES_FROM_ATTRS: AtomicBool = AtomicBool::new(false);
 
+// TRACE: set while the injector thread runs a syscall through the mount
+pub static BUSY: AtomicBool = AtomicBool::new(false);
+
 pub const QUEUE_MAX: usize = 4_096;
 const BACK_MAX: usize = 1_024;
 const OFFER_WAIT: Duration = Duration::from_secs(1);
@@ -271,7 +274,9 @@ impl Worker {
             }
             if let Some(r) = target {
                 let t0 = std::time::Instant::now();
+                BUSY.store(true, Ordering::SeqCst);
                 let res = self.inject(r, &s, &mut a, &mut b);
+                BUSY.store(false, Ordering::SeqCst);
                 if watch {
                     super::coherence::trace(format_args!(
                         "injector done {s:?} path={a:?} result={res:?} took={:?}",

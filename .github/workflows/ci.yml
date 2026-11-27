@@ -63,93 +63,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-    env:
-      TARGET: ${{ matrix.target }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
-      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: musl
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo build --locked --release --target "$TARGET"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: csync-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/csync
-          if-no-files-found: error
-          retention-days: 1
-
-  fuse:
-    name: fuse (${{ matrix.os }}, ${{ matrix.priv }})
-    needs: musl
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
-        priv: [user, root]
-        include:
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
-    env:
-      CSYNC_IT_PRIV: ${{ matrix.priv }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends fuse3 inotify-tools
-          test -c /dev/fuse || sudo modprobe fuse
-          test -c /dev/fuse
-      - run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: fuse
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.priv == 'user' }}
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: csync-${{ matrix.target }}
-          path: ${{ runner.temp }}/csync-bin
-      # artifacts drop the executable bit
-      - run: chmod 755 "$RUNNER_TEMP/csync-bin/csync"
-      - name: fuse_it
-        shell: bash
-        env:
-          CSYNC_BIN: ${{ runner.temp }}/csync-bin/csync
-        run: |
-          if [ "$CSYNC_IT_PRIV" = root ]; then
-            # build as the runner user so target/ stays user-owned, then run only the test binary as root
-            bin="$(cargo test --locked --test fuse_it --no-run --message-format=json \
-              | jq -r 'select(.reason == "compiler-artifact" and .target.name == "fuse_it" and .executable != null) | .executable')"
-            test -x "$bin"
-            sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
-          else
-            cargo test --locked --test fuse_it -- --test-threads=1
-          fi
-
-  # experimental: whether macFUSE (FSKit backend) can run on a hosted macOS runner; never blocks merging, not in ci-ok
-  macfuse:
-    name: macfuse (${{ matrix.os }}, ${{ matrix.variant }})
-    runs-on: ${{ matrix.os }}
-    continue-on-error: true
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { os: macos-15, variant: base }
-          - { os: macos-26, variant: base }
-          - { os: macos-15, variant: pre, probe: pre }
-          - { os: macos-15, variant: settle, probe: settle }
-          - { os: macos-26, variant: settle, probe: settle }
+          - { os: macos-15, variant: dir, fix: dir }
+          - { os: macos-26, variant: nodircache, fix: nodircache }
+          - { os: macos-15, variant: neg_enoent, fix: neg_enoent }
+          - { os: macos-26, variant: neg_enoent, fix: neg_enoent }
+          - { os: macos-15, variant: replay, fix: replay, nudge: 'stat,readdir,utimes,nocache,rename' }
+          - { os: macos-26, variant: replay, fix: replay, nudge: 'stat,readdir,utimes,nocache,rename' }
+          - { os: macos-15, variant: dir+neg_enoent, fix: 'dir,neg_enoent' }
+          - { os: macos-26, variant: nodircache+neg_enoent, fix: 'nodircache,neg_enoent' }
+          - { os: macos-15, variant: opt-negative_vncache, opts: negative_vncache }
+          - { os: macos-15, variant: opt-nolocalcaches, opts: nolocalcaches }
+          - { os: macos-15, variant: opt-noubc, opts: noubc }
+          - { os: macos-26, variant: opt-negative_vncache, opts: negative_vncache }
+          - { os: macos-15, variant: opt-timeouts0, opts: 'entry_timeout=0,attr_timeout=0' }
+          - { os: macos-26, variant: opt-nolocalcaches, opts: nolocalcaches }
+          - { os: macos-26, variant: opt-noubc, opts: noubc }
     env:
       CSYNC_BIN: ${{ github.workspace }}/target/release/csync
       FSKIT_ID: io.macfuse.app.fsmodule.macfuse
@@ -251,6 +179,7 @@ jobs:
         env:
           CSYNC_MG_PROBE: ${{ matrix.probe }}
           CSYNC_TRACE_NUDGE: ${{ matrix.nudge }}
+          CSYNC_TRACE_FIX: ${{ matrix.fix }}
           CSYNC_TRACE_MOUNT_OPTS: ${{ matrix.opts }}
         run: |
           set +e

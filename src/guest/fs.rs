@@ -1558,7 +1558,11 @@ impl GuestFs {
     // the startup self-test drives the mount from the injector thread and must be served as a user
     #[cfg(target_os = "macos")]
     fn is_inj(&self, req: &Request) -> bool {
-        !coherence::PROBE.active() && self.core.inj.get().is_some_and(|i| i.is_self(req.pid()))
+        !coherence::PROBE.active()
+            && self.core.inj.get().is_some_and(|i| {
+                i.is_self(req.pid())
+                    || (coherence::fix("replay") && super::inject::BUSY.load(SeqCst))
+            })
     }
 
     // TRACE: what a directory listing handed to the kernel contains of the test's names
@@ -1688,6 +1692,17 @@ impl GuestFs {
     // fh 0 means the kernel skips opendir: offset 0 snapshots the directory, later offsets reuse it
     fn dir_list(&self, ino: NodeId, fh: u64, offset: u64) -> Result<Listing, Errno> {
         if fh != INJ_FH {
+            if coherence::fix("dir") {
+                // TRACE experiment: offset 0 starts a pass, so it lists afresh and later offsets reuse that pass
+                if offset == 0 {
+                    let l = self.listing(ino)?;
+                    lock(&self.lists).insert(ino, l.clone());
+                    return Ok(l);
+                }
+                if let Some(l) = lock(&self.lists).get(&ino) {
+                    return Ok(l.clone());
+                }
+            }
             return match self.handle(fh).as_deref() {
                 Some(Handle {
                     src: Src::Dir(l), ..
@@ -3738,11 +3753,14 @@ impl Filesystem for GuestFs {
             .t()
             .get(parent.0)
             .is_some_and(|p| p.domain == GDomain::GitRo);
-        let ttl = if inj || gone || in_git {
+        let ttl = if inj || gone || in_git || coherence::fix("neg_ttl0") {
             Duration::ZERO
         } else {
             synced_ttl()
         };
+        if coherence::fix("neg_enoent") && !inj && !gone {
+            return reply.error(Errno::ENOENT);
+        }
         if coherence::watched(name) {
             let st = format!("negative ttl={ttl:?} inj={inj} gone={gone}");
             if coherence::trace_due(&format!("lookup {name}"), &st) {
@@ -4585,10 +4603,12 @@ impl Filesystem for GuestFs {
             io: Io::None,
             src: Src::Dir(list),
         });
-        reply.opened(
-            FileHandle(fh),
-            FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_CACHE_DIR,
-        );
+        let flags = if coherence::fix("nodircache") {
+            FopenFlags::empty()
+        } else {
+            FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_CACHE_DIR
+        };
+        reply.opened(FileHandle(fh), flags);
     }
 
     fn readdir(

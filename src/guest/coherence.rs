@@ -422,6 +422,15 @@ pub fn trace_due(key: &str, state: &str) -> bool {
     }
 }
 
+// TRACE: experiment switches from CSYNC_TRACE_FIX, a comma list
+pub fn fix(name: &str) -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<String> = OnceLock::new();
+    F.get_or_init(|| std::env::var("CSYNC_TRACE_FIX").unwrap_or_default())
+        .split(',')
+        .any(|x| x == name)
+}
+
 // TRACE: the names the test creates on the host
 pub fn watched(name: &str) -> bool {
     matches!(name, "listed.txt" | "fromhost.txt" | "third.txt" | "second.txt")
@@ -433,7 +442,10 @@ pub fn run(env: &Env<'_>, backend: BackendKind) -> Coherence {
     let observed = observe(env, &PROBE, own);
     trace(format_args!("probe observe result: {observed:?}"));
     let obs = observed.unwrap_or_else(|_| ProbeObs::unverified(own));
-    let c = decide(&obs, backend);
+    let mut c = decide(&obs, backend);
+    if fix("replay") {
+        c.ident = Ident::Pid;
+    }
     apply(&c, backend);
     trace(format_args!(
         "probe backend={:?} obs={obs:?} coherence={c:?} via={:?} replay_on={}",

@@ -405,7 +405,7 @@ mod mac {
         // CSYNC_MG_PROBE: `pre` looks the name up and lists the directory before the host creates it,
         // `settle` leaves the new name alone for 2s before the first look
         let variant = std::env::var("CSYNC_MG_PROBE").unwrap_or_default();
-        let new_window = Duration::from_secs(30);
+        let new_window = Duration::from_secs(10);
         let edit_window = Duration::from_secs(8);
         let create = |name: &str, body: &str| {
             if variant == "pre" {
