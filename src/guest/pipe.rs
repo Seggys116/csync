@@ -887,6 +887,9 @@ impl Pipe {
             }
         }
         self.sh.fire(fires);
+        if !gone.is_empty() {
+            self.sh.wake.notify_all();
+        }
         gone
     }
 
