@@ -2367,4 +2367,72 @@ mod tests {
         assert_eq!(core.tree().get(&rp("f.txt")).unwrap().stat, after);
         assert!(temps(&t.0).is_empty());
     }
+
+    // the guest sends an mk and then the mode and mtime the application set, without waiting in between
+    #[test]
+    fn attribute_changes_queued_behind_an_mk_land_and_the_index_matches_the_filesystem() {
+        use std::os::unix::fs::PermissionsExt;
+        const WHEN: i64 = 1_650_000_000_123_456_789;
+        let t = tmpdir("mk-attr");
+        let (core, _rx) = core_at(&t.0);
+        let root = fs::File::open(&t.0).unwrap();
+        let mk = |p: &str, what: Mk| Op::Mk { path: rp(p), what };
+        let dir = || Mk::Dir { perm: 0o755 };
+        let link = || Mk::Symlink {
+            target: LinkTarget::new("d").unwrap(),
+        };
+
+        assert!(matches!(
+            exec(&core, mk("d", dir()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let attr = Op::SetAttr {
+            path: rp("d"),
+            expect: Expect::Dir,
+            perm: Some(0o750),
+            mtime_ns: Some(WHEN),
+        };
+        match exec(&core, attr, Payload::None, None) {
+            Ok(Reply::Done { meta }) => assert_eq!((meta.perm, meta.mtime_ns), (0o750, WHEN)),
+            other => panic!("expected done, got {other:?}"),
+        }
+        let p = t.0.join("d");
+        assert_eq!(mtime_of(&p), WHEN);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        let landed = fresh_stat(&p);
+        assert_eq!(core.tree().get(&rp("d")).unwrap().stat, landed);
+
+        // a replay after a reconnect is answered done and leaves the directory as it is
+        assert!(matches!(
+            exec(&core, mk("d", dir()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        assert_eq!(fresh_stat(&p), landed);
+        assert_eq!(core.tree().get(&rp("d")).unwrap().stat, landed);
+
+        assert!(matches!(
+            exec(&core, mk("l", link()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let attr = Op::SetAttr {
+            path: rp("l"),
+            expect: Expect::Any,
+            perm: None,
+            mtime_ns: Some(WHEN),
+        };
+        assert!(matches!(
+            exec(&core, attr, Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let st = sys::stat_key_at(root.as_fd(), "l").unwrap();
+        assert_eq!(st.mtime_ns, WHEN);
+        assert_eq!(core.tree().get(&rp("l")).unwrap().stat, st);
+        assert!(matches!(
+            exec(&core, mk("l", link()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+    }
 }

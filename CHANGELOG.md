@@ -32,6 +32,13 @@
 * Closing a new file no longer waits for the host: the commit is queued in order and finished in the background. A
   refusal after the close shows as a notice and as an error at the next flush, fsync or write of a handle still open
   on the file. Edits to existing files still wait at close, and `fsync` always waits for the host.
+* Creating a directory or a symlink, and the chmod and utimes that tar, `cp -p` and rsync make right after writing a
+  file, no longer wait for the host when this guest made the entry and the host has not answered for it yet: the
+  guest replies at once and the host applies everything in the order it was made. A new file's mode and mtime ride in
+  its commit when it has not gone out (a commit waits up to 1 ms for that), and are queued behind it otherwise. If the
+  host then refuses the entry, the guest removes it with everything below it and posts one `refused` notice, and the
+  error shows at the next flush, fsync or write of a handle still open on it; a path the host ignores is moved to
+  the guest-only overlay instead. Renames, unlinks and changes to entries the host already has still wait.
 
 ## 0.1.0
 

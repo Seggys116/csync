@@ -19,13 +19,14 @@ use super::tree::{
     domain_for_new, domain_of,
 };
 use super::write::{
-    Flushed, Job, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect, node_expect,
+    Attr, Flushed, Job, Landing, NoticeFn, OpenW, REFUSED, Refusal, RenameReq, Writer, dest_expect,
+    node_expect,
 };
 use crate::ignore::rules::{Class, Rules};
 use crate::index::tree::StatKey;
 use crate::proto::{
-    Change, DEPTH_MAX, Expect, FILE_MAX, Hash32, INLINE_MAX, Kind, LinkTarget, Meta, Name, Notice,
-    NoticeKind, PathError, RelPath, Seq, TEXT_MAX, VerKey, Version,
+    Change, DEPTH_MAX, Expect, FILE_MAX, Hash32, INLINE_MAX, Kind, LinkTarget, Meta, Mk, Name,
+    Notice, NoticeKind, PathError, RelPath, Seq, TEXT_MAX, VerKey, Version,
 };
 use crate::sys;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
@@ -119,11 +120,29 @@ fn hold_loop(core: &Core, rx: &Receiver<Held>) {
     }
 }
 
-// the thread behind closes that did not wait for the host: runs until stopped, one answer at a time
+// the thread behind closes, creates and attribute changes that did not wait for the host: runs until stopped, one
+// answer at a time
 pub fn settle_loop(core: &Core, rx: &Receiver<Job>) {
-    while let Ok(Job::Settle(sid)) = rx.recv() {
-        core.settle_parked(sid);
+    while let Ok(job) = rx.recv() {
+        if !settle_job(core, job) {
+            return;
+        }
     }
+}
+
+// false for the job that stops the settler
+fn settle_job(core: &Core, job: Job) -> bool {
+    match job {
+        Job::Settle(sid) => core.settle_parked(sid),
+        Job::Landed {
+            node,
+            born,
+            mk,
+            what,
+        } => core.landed(node, born, mk, what),
+        Job::Stop => return false,
+    }
+    true
 }
 
 #[derive(Default)]
@@ -718,11 +737,11 @@ impl Core {
                             drop(t);
                             self.kick(fx);
                         }
-                        // the host has no such file: the guest copy goes too
+                        // the host has no such file: the guest copy goes too, unless it was demoted to the overlay
                         None => {
                             let at = t
                                 .get(node)
-                                .filter(|n| n.attached())
+                                .filter(|n| n.attached() && n.domain != GDomain::Local)
                                 .map(|n| (n.parent, n.name.clone()));
                             if let Some((parent, name)) = at {
                                 t.remove(node);
@@ -778,6 +797,138 @@ impl Core {
         {
             n.staging = None;
         }
+    }
+
+    // the host's answer to an mk (mk) or setattr that was sent without waiting; on the settler thread, after the
+    // writer has queued it. a node whose slot moved on to another generation is not the one that was asked about
+    pub fn landed(&self, node: NodeId, born: u64, mk: bool, what: Landing) {
+        // shutdown fails what is still queued; nothing further can reach the host and nobody is left to tell
+        if !self.writer.closed() {
+            match (mk, what) {
+                (true, Landing::Done) => self.acknowledge(node, born),
+                (true, Landing::Ignored) => self.mk_ignored(node, born),
+                (true, Landing::Conflict(_)) => self.mk_refused(node, born, REFUSED),
+                (true, Landing::Failed(e)) => self.mk_refused(node, born, e),
+                // a host save won while the change was queued: the host's entry stands, as for a synchronous one
+                (false, Landing::Conflict(Some(m))) => self.host_won(node, born, m),
+                (false, Landing::Ignored) => self.late_error(node, born, libc::EPERM),
+                (false, Landing::Failed(e)) => self.late_error(node, born, e),
+                (false, Landing::Done | Landing::Conflict(None)) => {}
+            }
+        }
+        self.writer.landed_done();
+    }
+
+    fn born_as(&self, node: NodeId, born: u64) -> bool {
+        self.t().get(node).is_some_and(|n| n.r#gen == born)
+    }
+
+    fn acknowledge(&self, node: NodeId, born: u64) {
+        if let Some(n) = self.tw().get_mut(node).filter(|n| n.r#gen == born) {
+            n.unacked = None;
+        }
+    }
+
+    fn host_won(&self, node: NodeId, born: u64, current: Meta) {
+        if self.born_as(node, born) {
+            let _ = self.finish(
+                node,
+                Err(Refusal {
+                    errno: REFUSED,
+                    refused: true,
+                    current: Some(current),
+                }),
+            );
+        }
+    }
+
+    // only a node with an open handle has someone to tell
+    fn late_error(&self, node: NodeId, born: u64, errno: i32) {
+        let mut t = self.tw();
+        if t.get(node).is_some_and(|n| n.r#gen == born) && t.set_werr(node, errno) {
+            self.werrs.fetch_add(1, Relaxed);
+        }
+    }
+
+    // the host refused an entry this guest made and told its caller about at once: the entry and everything below it
+    // go, with one notice for its root. what is still queued below it is dropped and what was already sent fails by
+    // itself on the host, its answer finding the node gone
+    fn mk_refused(&self, node: NodeId, born: u64, errno: i32) {
+        let (path, synced) = {
+            let t = self.t();
+            match t.get(node) {
+                Some(n) if n.r#gen == born && n.unacked.is_some() => {
+                    (t.rel_path(node), n.domain == GDomain::Synced)
+                }
+                _ => return,
+            }
+        };
+        // detached by a host change, or moved to the overlay: there is nothing on the host to be refused
+        let Some(path) = path.filter(|_| synced) else {
+            self.acknowledge(node, born);
+            return;
+        };
+        self.writer.drop_under(&path);
+        let mut fx = Vec::new();
+        let (staging, told) = self.tw().rollback(node, errno, &mut fx);
+        self.werrs.fetch_add(told, Relaxed);
+        self.writer.abandon(&staging);
+        self.kick(fx);
+        self.say(NoticeKind::Refused, path);
+    }
+
+    // the host's rules ignore a path this guest believed synced: its entries move to the overlay instead of going
+    // away, which only happens when this guest's rules agree. otherwise it is a refusal like any other
+    fn mk_ignored(&self, node: NodeId, born: u64) {
+        let path = {
+            let t = self.t();
+            t.get(node)
+                .filter(|n| n.r#gen == born && n.unacked.is_some() && n.domain == GDomain::Synced)
+                .and_then(|_| t.rel_path(node))
+        };
+        let Some(path) = path else {
+            return self.mk_refused(node, born, libc::EPERM);
+        };
+        self.demote(&path);
+        let moved = self
+            .t()
+            .get(node)
+            .is_some_and(|n| n.r#gen == born && n.domain == GDomain::Local);
+        if moved {
+            self.acknowledge(node, born);
+        } else {
+            self.mk_refused(node, born, libc::EPERM);
+        }
+    }
+
+    // what an attribute change sent without waiting shows at once: the tree's meta, and for an open file its
+    // staging copy's mtime, which is what getattr reports while it exists
+    fn note_attr(
+        &self,
+        id: NodeId,
+        staging: Option<u32>,
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+    ) -> Result<(), Errno> {
+        if let Some(n) = self.tw().get_mut(id) {
+            if let Some(p) = perm {
+                n.meta.perm = p;
+            }
+            if let Some(m) = mtime_ns {
+                n.meta.mtime_ns = m;
+            }
+            n.meta.ctime_ns = now_ns();
+        }
+        if let Some(m) = mtime_ns
+            && let Some(fd) = staging.and_then(|s| self.writer.staging_fd(s))
+        {
+            let ts = Timestamps {
+                last_access: timespec(None),
+                last_modification: timespec(Some(TimeOrNow::SpecificTime(systime(m)))),
+            };
+            rustix::fs::futimens(&*fd, &ts).map_err(erx)?;
+        }
+        Ok(())
     }
 
     fn attr_with(&self, id: NodeId, n: &GNode, size: u64, mtime_ns: i64) -> FileAttr {
@@ -2132,6 +2283,107 @@ impl GuestFs {
         Ok(id)
     }
 
+    // what the host has not said yet is not waited for: the entry is in the tree and the mk is queued ahead of
+    // anything made inside it, so the reply goes out at once. a refusal rolls it back later (Core::mk_refused)
+    fn insert_pending(
+        &self,
+        parent: NodeId,
+        name: &Name,
+        meta: Meta,
+        path: &RelPath,
+        what: Mk,
+    ) -> Result<NodeId, Errno> {
+        let id = self.insert_new(parent, name, meta, GDomain::Synced)?;
+        let born = {
+            let mut t = self.core.tw();
+            let n = t.get_mut(id).ok_or(Errno::ENOENT)?;
+            n.unacked = Some(0);
+            n.r#gen
+        };
+        match self.core.writer.mk_async(path, what, (id, born)) {
+            Ok(ticket) => {
+                if let Some(n) = self.core.tw().get_mut(id).filter(|n| n.unacked == Some(0)) {
+                    n.unacked = Some(ticket);
+                }
+                Ok(id)
+            }
+            Err(e) => {
+                let mut t = self.core.tw();
+                t.remove(id);
+                t.forget(id, 1);
+                Err(en(e))
+            }
+        }
+    }
+
+    fn make_dir(&self, parent: NodeId, name: &Name, perm: u16) -> Result<NodeId, Errno> {
+        let (dom, path) = self.prep_new(parent, name, true)?;
+        let meta = match dom {
+            GDomain::Local => {
+                let (dir, nm) = path.split_last().ok_or(Errno::EINVAL)?;
+                let d = self.core.overlay_dir(dir, true).map_err(|e| eio(&e))?;
+                fsops::mkdir(d.as_fd(), nm, u32::from(perm)).map_err(en)?;
+                let k = sys::stat_key_at(d.as_fd(), nm).map_err(|e| eio(&e))?;
+                meta_from_key(&k, None).ok_or(Errno::EIO)?
+            }
+            GDomain::Synced => {
+                let now = now_ns();
+                let meta = Meta {
+                    kind: Kind::Dir,
+                    perm,
+                    size: 0,
+                    mtime_ns: now,
+                    ctime_ns: now,
+                    hash: None,
+                    link: None,
+                    git_ro: false,
+                };
+                return self.insert_pending(parent, name, meta, &path, Mk::Dir { perm });
+            }
+            GDomain::GitRo => return Err(Errno::EROFS),
+        };
+        self.insert_new(parent, name, meta, dom)
+    }
+
+    fn make_link(&self, parent: NodeId, name: &Name, target: &str) -> Result<NodeId, Errno> {
+        let target = LinkTarget::new(target).map_err(|e| {
+            if e == PathError::TooLong {
+                Errno::ENAMETOOLONG
+            } else {
+                Errno::EINVAL
+            }
+        })?;
+        let (dom, path) = self.prep_new(parent, name, false)?;
+        let meta = match dom {
+            GDomain::Synced => {
+                if !target.stays_within(&path) {
+                    return Err(Errno::EPERM);
+                }
+                let now = now_ns();
+                let meta = Meta {
+                    kind: Kind::Symlink,
+                    perm: 0o777,
+                    size: target.as_str().len() as u64,
+                    mtime_ns: now,
+                    ctime_ns: now,
+                    hash: None,
+                    link: Some(target.clone()),
+                    git_ro: false,
+                };
+                return self.insert_pending(parent, name, meta, &path, Mk::Symlink { target });
+            }
+            GDomain::Local => {
+                let (dir, nm) = path.split_last().ok_or(Errno::EINVAL)?;
+                let d = self.core.overlay_dir(dir, true).map_err(|e| eio(&e))?;
+                rustix::fs::symlinkat(target.as_str(), &d, nm).map_err(erx)?;
+                let k = sys::stat_key_at(d.as_fd(), nm).map_err(|e| eio(&e))?;
+                meta_from_key(&k, Some(target)).ok_or(Errno::EIO)?
+            }
+            GDomain::GitRo => return Err(Errno::EROFS),
+        };
+        self.insert_new(parent, name, meta, dom)
+    }
+
     fn entry_reply(&self, id: NodeId, reply: ReplyEntry) {
         let t = self.core.t();
         match t.get(id) {
@@ -3436,7 +3688,7 @@ impl GuestFs {
     ) -> Result<(), Errno> {
         // a truncate by path lands on the staged copy or after its commit, never in between
         let _turn = self.core.stage_turn(id);
-        let (domain, kind, meta, mut staging, path) = {
+        let (domain, kind, meta, mut staging, path, born, unacked) = {
             let t = self.core.t();
             let n = t.get(id).ok_or(Errno::ENOENT)?;
             (
@@ -3445,6 +3697,8 @@ impl GuestFs {
                 n.meta.clone(),
                 n.staging,
                 t.rel_path(id),
+                n.r#gen,
+                n.unacked.is_some(),
             )
         };
         let changes = mode.is_some() || size.is_some() || mtime.is_some();
@@ -3562,6 +3816,16 @@ impl GuestFs {
                         TimeOrNow::SpecificTime(s) => ns_of(s),
                         TimeOrNow::Now => now_ns(),
                     };
+                    // a link the host has not answered for is queued behind its mk, and nobody waits
+                    if unacked
+                        && self
+                            .core
+                            .writer
+                            .attr_async(&path, Expect::Any, None, Some(mt), (id, born))
+                            .is_ok()
+                    {
+                        return self.core.note_attr(id, None, None, Some(mt));
+                    }
                     let m = match self.core.writer.setattr(&path, Expect::Any, None, Some(mt)) {
                         Ok(m) => m,
                         Err(e) if e.refused => return self.core.finish(id, Err(e)),
@@ -3574,6 +3838,28 @@ impl GuestFs {
                     return Ok(());
                 }
                 if mode.is_some() || mtime.is_some() {
+                    let perm = mode.map(|m| (m & 0o7777) as u16);
+                    let mt = mtime.map(|t| match t {
+                        TimeOrNow::SpecificTime(s) => ns_of(s),
+                        TimeOrNow::Now => now_ns(),
+                    });
+                    // a directory or file this guest made and the host has not answered for takes the change
+                    // without anyone waiting: queued behind its own creation, or folded into its commit
+                    let early = match kind {
+                        Kind::Dir if unacked => self
+                            .core
+                            .writer
+                            .attr_async(&path, Expect::Dir, perm, mt, (id, born))
+                            .is_ok(),
+                        // a size change in the same call has moved the staging copy past what any commit carries
+                        Kind::File if size.is_none() => staging.is_some_and(|sid| {
+                            self.core.writer.attr_new(sid, (id, born), perm, mt) != Attr::Sync
+                        }),
+                        _ => false,
+                    };
+                    if early {
+                        return self.core.note_attr(id, staging, perm, mt);
+                    }
                     // the host must hold the content first, or a new file is not there to change
                     if let Some(sid) = staging {
                         self.core.finish(id, self.core.writer.flush_ordered(sid))?;
@@ -3584,11 +3870,6 @@ impl GuestFs {
                         let n = t.get(id).ok_or(Errno::ENOENT)?;
                         node_expect(n, t.index_id())
                     };
-                    let perm = mode.map(|m| (m & 0o7777) as u16);
-                    let mt = mtime.map(|t| match t {
-                        TimeOrNow::SpecificTime(s) => ns_of(s),
-                        TimeOrNow::Now => now_ns(),
-                    });
                     match self.core.writer.setattr(&path, expect, perm, mt) {
                         Ok(m) => {
                             if let Some(n) = self.core.tw().get_mut(id) {
@@ -3925,22 +4206,7 @@ impl Filesystem for GuestFs {
             };
         }
         let perm = (mode & !umask & 0o7777) as u16;
-        let r = (|| -> Result<NodeId, Errno> {
-            let (dom, path) = self.prep_new(parent.0, &name, true)?;
-            let meta = match dom {
-                GDomain::Local => {
-                    let (dir, nm) = path.split_last().ok_or(Errno::EINVAL)?;
-                    let d = self.core.overlay_dir(dir, true).map_err(|e| eio(&e))?;
-                    fsops::mkdir(d.as_fd(), nm, u32::from(perm)).map_err(en)?;
-                    let k = sys::stat_key_at(d.as_fd(), nm).map_err(|e| eio(&e))?;
-                    meta_from_key(&k, None).ok_or(Errno::EIO)?
-                }
-                GDomain::Synced => self.core.writer.mkdir(&path, perm).map_err(en)?,
-                GDomain::GitRo => return Err(Errno::EROFS),
-            };
-            self.insert_new(parent.0, &name, meta, dom)
-        })();
-        match r {
+        match self.make_dir(parent.0, &name, perm) {
             Ok(id) => self.entry_reply(id, reply),
             Err(e) => reply.error(e),
         }
@@ -4006,36 +4272,10 @@ impl Filesystem for GuestFs {
                 None => reply.error(Errno::EEXIST),
             };
         }
-        let r = (|| -> Result<NodeId, Errno> {
-            let target = target.to_str().ok_or(Errno::EINVAL)?;
-            let target = LinkTarget::new(target).map_err(|e| {
-                if e == PathError::TooLong {
-                    Errno::ENAMETOOLONG
-                } else {
-                    Errno::EINVAL
-                }
-            })?;
-            let (dom, path) = self.prep_new(parent.0, &name, false)?;
-            let meta = match dom {
-                GDomain::Synced => {
-                    if !target.stays_within(&path) {
-                        return Err(Errno::EPERM);
-                    }
-                    let mut m = self.core.writer.symlink(&path, &target).map_err(en)?;
-                    m.link.get_or_insert(target);
-                    m
-                }
-                GDomain::Local => {
-                    let (dir, nm) = path.split_last().ok_or(Errno::EINVAL)?;
-                    let d = self.core.overlay_dir(dir, true).map_err(|e| eio(&e))?;
-                    rustix::fs::symlinkat(target.as_str(), &d, nm).map_err(erx)?;
-                    let k = sys::stat_key_at(d.as_fd(), nm).map_err(|e| eio(&e))?;
-                    meta_from_key(&k, Some(target)).ok_or(Errno::EIO)?
-                }
-                GDomain::GitRo => return Err(Errno::EROFS),
-            };
-            self.insert_new(parent.0, &name, meta, dom)
-        })();
+        let r = target
+            .to_str()
+            .ok_or(Errno::EINVAL)
+            .and_then(|t| self.make_link(parent.0, &name, t));
         match r {
             Ok(id) => self.entry_reply(id, reply),
             Err(e) => reply.error(e),
@@ -5252,6 +5492,11 @@ pub fn mount(core: Arc<Core>, at: &Path, allow_other: bool, volname: &str) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::cache::{CacheConfig, Done, Remote, RemoteSlot};
+    use crate::guest::pipe::Pipe;
+    use crate::guest::prefetch::TreeView;
+    use crate::net::rpc::{ChunkSink, RpcError};
+    use crate::proto::{Op as WireOp, Reply, ReqId, WireErr};
 
     const INDEX: u128 = 9;
 
@@ -5419,5 +5664,449 @@ mod tests {
         let (tree, id) = tree_with(dir_meta(0o755), 5);
         let got = resolve_node(&tree, id, soon(), |_, _, _, _| panic!("asked the host"));
         assert_eq!(got, Err(Errno::EINVAL));
+    }
+
+    // the host as a script: each op is logged as "verb path" and answered as the plan for that name says
+    #[derive(Clone, Copy)]
+    enum Ans {
+        Done,
+        Fail(WireErr),
+        Hold,
+        // the sender thread stops inside submit until release()
+        Block,
+    }
+
+    struct Fake {
+        log: Mutex<Vec<String>>,
+        plan: Mutex<FxHashMap<String, Ans>>,
+        held: Mutex<VecDeque<Done>>,
+        gate: Mutex<bool>,
+        open: Condvar,
+    }
+
+    fn verb(op: &WireOp) -> String {
+        match op {
+            WireOp::Mk { path, .. } => format!("mk {}", path.as_str()),
+            WireOp::Commit { path, .. } => format!("commit {}", path.as_str()),
+            WireOp::SetAttr { path, .. } => format!("attr {}", path.as_str()),
+            WireOp::Remove { path, .. } => format!("rm {}", path.as_str()),
+            _ => "other".to_owned(),
+        }
+    }
+
+    impl Fake {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                log: Mutex::new(Vec::new()),
+                plan: Mutex::new(FxHashMap::default()),
+                held: Mutex::new(VecDeque::new()),
+                gate: Mutex::new(false),
+                open: Condvar::new(),
+            })
+        }
+
+        fn plan(&self, op: &str, a: Ans) {
+            lock(&self.plan).insert(op.to_owned(), a);
+        }
+
+        fn sent(&self) -> Vec<String> {
+            lock(&self.log).clone()
+        }
+
+        fn answer(&self, r: Result<Reply, RpcError>) {
+            let d = lock(&self.held).pop_front().expect("nothing held");
+            d(r);
+        }
+
+        fn release(&self) {
+            *lock(&self.gate) = true;
+            self.open.notify_all();
+        }
+    }
+
+    impl Remote for Fake {
+        fn call(&self, _op: WireOp, _d: Instant) -> Result<Reply, RpcError> {
+            Err(RpcError::Closed)
+        }
+        fn call_stream(
+            &self,
+            _op: WireOp,
+            _s: Box<dyn ChunkSink>,
+            _d: Instant,
+        ) -> Result<Reply, RpcError> {
+            Err(RpcError::Closed)
+        }
+        fn submit(&self, op: WireOp, done: Done) -> Result<ReqId, RpcError> {
+            let key = verb(&op);
+            let ans = lock(&self.plan).get(&key).copied().unwrap_or(Ans::Done);
+            lock(&self.log).push(key);
+            match ans {
+                Ans::Done => done(Ok(Reply::Done {
+                    meta: dir_meta(0o755),
+                })),
+                Ans::Fail(e) => done(Err(RpcError::Wire(e))),
+                Ans::Hold => lock(&self.held).push_back(done),
+                Ans::Block => {
+                    let mut g = lock(&self.gate);
+                    while !*g {
+                        g = self.open.wait(g).unwrap_or_else(|e| e.into_inner());
+                    }
+                    drop(g);
+                    done(Err(RpcError::Wire(WireErr::NotFound)));
+                }
+            }
+            Ok(1)
+        }
+        fn submit_stream(
+            &self,
+            _op: WireOp,
+            _s: Box<dyn ChunkSink>,
+            _done: Done,
+        ) -> Result<ReqId, RpcError> {
+            Err(RpcError::Closed)
+        }
+        fn send_chunk(
+            &self,
+            _id: ReqId,
+            _off: u64,
+            _last: bool,
+            _data: Vec<u8>,
+        ) -> Result<(), RpcError> {
+            Ok(())
+        }
+        fn cancel(&self, _id: ReqId) {}
+    }
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // field order is drop order: the core and its pipe go before the scratch directory
+    struct Rig {
+        core: Arc<Core>,
+        fake: Arc<Fake>,
+        notes: Arc<Mutex<Vec<Notice>>>,
+        scratch: Scratch,
+    }
+
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            // a sender held inside the fake would never let the pipe close
+            self.fake.release();
+        }
+    }
+
+    fn rig(tag: &str) -> Rig {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "csync-fs-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("overlay")).unwrap();
+        let slot = RemoteSlot::new();
+        let fake = Fake::new();
+        slot.set(Some(fake.clone() as Arc<dyn Remote>));
+        let (landed, _) = crossbeam_channel::unbounded();
+        let pipe = Pipe::new(slot.clone(), landed).unwrap();
+        let cache = Arc::new(
+            BlobCache::open(
+                &CacheConfig {
+                    dir: base.join("cache"),
+                    cap: Some(1 << 30),
+                },
+                slot,
+            )
+            .unwrap(),
+        );
+        let notes = Arc::new(Mutex::new(Vec::new()));
+        let sink = notes.clone();
+        let notice: NoticeFn = Arc::new(move |n: Notice| lock(&sink).push(n));
+        let writer = Writer::new(cache.clone(), pipe, notice.clone());
+        let tree = Arc::new(RwLock::new(GTree::new()));
+        let view: Arc<dyn TreeView> = tree.clone();
+        let prefetch = Prefetch::start(cache.clone(), view).unwrap();
+        let overlay = rustix::fs::open(
+            base.join("overlay").as_path(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let (kick, _) = crossbeam_channel::bounded(1);
+        let core = Arc::new(Core {
+            tree,
+            cache,
+            writer,
+            prefetch,
+            rules: RwLock::new(Rules::new(&[])),
+            inj: OnceLock::new(),
+            inval: OnceLock::new(),
+            overlay,
+            uid: 0,
+            gid: 0,
+            ctr: Arc::new(Counters::default()),
+            kicked: Mutex::new(Vec::new()),
+            kick,
+            case_fold: AtomicBool::new(false),
+            norm_fold: AtomicBool::new(false),
+            passthrough: AtomicBool::new(false),
+            notice,
+            werrs: AtomicU32::new(0),
+            staging_busy: Mutex::new(FxHashSet::default()),
+            staging_done: Condvar::new(),
+            promote_later: Mutex::new(FxHashSet::default()),
+            own_scopes: Mutex::new(FxHashSet::default()),
+            dir_moves: Mutex::new(Vec::new()),
+            dir_moved: Condvar::new(),
+        });
+        Rig {
+            core,
+            fake,
+            notes,
+            scratch: Scratch(base),
+        }
+    }
+
+    fn nm(s: &str) -> Name {
+        Name::new(s).unwrap()
+    }
+
+    fn rp(s: &str) -> RelPath {
+        RelPath::new(s).unwrap()
+    }
+
+    fn wait_for(what: &str, f: impl Fn() -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    // one answer, dealt with as the settler thread would
+    fn pump(core: &Core) {
+        let job = core
+            .writer
+            .jobs()
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a job for the settler");
+        assert!(settle_job(core, job));
+    }
+
+    fn refused(r: &Rig) -> Vec<RelPath> {
+        lock(&r.notes)
+            .iter()
+            .filter(|n| n.kind == NoticeKind::Refused)
+            .map(|n| n.path.clone())
+            .collect()
+    }
+
+    fn host_done(perm: u16) -> Result<Reply, RpcError> {
+        Ok(Reply::Done {
+            meta: dir_meta(perm),
+        })
+    }
+
+    #[test]
+    fn mkdir_replies_before_the_host_and_the_mk_is_already_queued() {
+        let r = rig("mk-reply");
+        r.fake.plan("mk d", Ans::Hold);
+        let gfs = GuestFs::new(r.core.clone());
+        let d = gfs.make_dir(ROOT, &nm("d"), 0o755).unwrap();
+        wait_for("the mk", || r.fake.sent() == ["mk d"]);
+        {
+            let t = r.core.t();
+            assert_eq!(t.lookup(ROOT, "d").map(|(id, _)| id), Some(d));
+            let n = t.get(d).unwrap();
+            assert!(n.unacked.is_some());
+            assert_eq!((n.meta.kind, n.meta.perm), (Kind::Dir, 0o755));
+        }
+        assert!(
+            !r.core.writer.drain(Instant::now()),
+            "the host has not answered"
+        );
+
+        r.fake.answer(host_done(0o755));
+        pump(&r.core);
+        assert!(r.core.t().get(d).unwrap().unacked.is_none());
+        assert!(r.core.writer.drain(Instant::now()));
+        assert!(refused(&r).is_empty());
+    }
+
+    #[test]
+    fn a_child_made_right_after_its_parent_is_queued_after_it() {
+        let r = rig("mk-order");
+        let gfs = GuestFs::new(r.core.clone());
+        let a = gfs.make_dir(ROOT, &nm("a"), 0o755).unwrap();
+        let b = gfs.make_dir(a, &nm("b"), 0o755).unwrap();
+        let l = gfs.make_link(a, &nm("l"), "b").unwrap();
+        wait_for("three mks", || r.fake.sent().len() == 3);
+        assert_eq!(r.fake.sent(), ["mk a", "mk a/b", "mk a/l"]);
+        for _ in 0..3 {
+            pump(&r.core);
+        }
+        {
+            let t = r.core.t();
+            for id in [a, b, l] {
+                assert!(t.get(id).unwrap().unacked.is_none());
+            }
+            let link = t.get(l).unwrap().meta.link.as_ref();
+            assert_eq!(link.map(LinkTarget::as_str), Some("b"));
+        }
+        assert!(r.core.writer.drain(Instant::now()));
+    }
+
+    #[test]
+    fn a_refused_directory_takes_its_subtree_and_says_so_once() {
+        let r = rig("mk-refused");
+        r.fake.plan("mk a", Ans::Fail(WireErr::Exists));
+        r.fake.plan("mk a/b", Ans::Block);
+        let gfs = GuestFs::new(r.core.clone());
+        let a = gfs.make_dir(ROOT, &nm("a"), 0o755).unwrap();
+        wait_for("mk a", || r.fake.sent() == ["mk a"]);
+        let b = gfs.make_dir(a, &nm("b"), 0o755).unwrap();
+        wait_for("mk a/b on the wire", || r.fake.sent().len() == 2);
+
+        // the sender is held inside mk a/b, so what follows stays queued
+        let c = gfs.make_dir(a, &nm("c"), 0o755).unwrap();
+        let (f, src) = gfs.new_file(a, &nm("f"), 0o644).unwrap();
+        let Src::Staged { id: sid, fd } = src else {
+            panic!("a synced file is staged");
+        };
+        pwrite_all(fd.as_fd(), b"x", 0).unwrap();
+        assert!(r.core.writer.flush(sid, false).is_ok());
+        assert_eq!(r.fake.sent(), ["mk a", "mk a/b"]);
+
+        pump(&r.core);
+        assert_eq!(refused(&r), [rp("a")]);
+        {
+            let t = r.core.t();
+            assert!(t.resolve(&rp("a")).is_none());
+            for id in [a, b, c, f] {
+                assert!(t.get(id).is_some_and(|n| !n.attached()));
+            }
+        }
+        assert_eq!(r.core.take_werr(f), Err(Errno::EIO));
+        assert_eq!(r.core.take_werr(f), Ok(()), "given out once");
+        assert_eq!(
+            r.core.writer.flush(sid, false).map_err(|e| e.errno),
+            Err(libc::ECANCELED)
+        );
+
+        // the dropped mk and the one that was on the wire find their nodes gone
+        r.fake.release();
+        pump(&r.core);
+        pump(&r.core);
+        assert!(r.core.writer.drain(Instant::now()));
+        assert_eq!(refused(&r), [rp("a")], "still one notice");
+        assert_eq!(
+            r.fake.sent(),
+            ["mk a", "mk a/b"],
+            "nothing queued below the refused directory was sent"
+        );
+    }
+
+    #[test]
+    fn an_ignored_directory_is_demoted_to_the_overlay_not_deleted() {
+        let r = rig("mk-ignored");
+        r.fake.plan("mk build", Ans::Hold);
+        let gfs = GuestFs::new(r.core.clone());
+        let d = gfs.make_dir(ROOT, &nm("build"), 0o755).unwrap();
+        wait_for("the mk", || r.fake.sent() == ["mk build"]);
+        let rule = &b"build/\n"[..];
+        r.core
+            .rules_mut()
+            .update_rule_file(&rp(".gitignore"), Some(rule));
+        r.fake.answer(Err(RpcError::Wire(WireErr::Ignored)));
+        pump(&r.core);
+        {
+            let t = r.core.t();
+            let n = t.get(d).expect("the node stays");
+            assert_eq!(
+                (n.domain, n.unacked, n.attached()),
+                (GDomain::Local, None, true)
+            );
+        }
+        assert!(refused(&r).is_empty());
+        assert!(r.scratch.0.join("overlay/build").is_dir());
+        assert!(r.core.writer.drain(Instant::now()));
+    }
+
+    #[test]
+    fn an_ignored_answer_the_guests_rules_do_not_share_is_a_refusal() {
+        let r = rig("mk-ignored-refused");
+        r.fake.plan("mk x", Ans::Hold);
+        let gfs = GuestFs::new(r.core.clone());
+        gfs.make_dir(ROOT, &nm("x"), 0o755).unwrap();
+        wait_for("the mk", || r.fake.sent() == ["mk x"]);
+        r.fake.answer(Err(RpcError::Wire(WireErr::Ignored)));
+        pump(&r.core);
+        assert!(r.core.t().resolve(&rp("x")).is_none());
+        assert_eq!(refused(&r), [rp("x")]);
+        assert!(!r.scratch.0.join("overlay/x").exists());
+    }
+
+    #[test]
+    fn a_chmod_of_a_pending_directory_is_queued_and_of_an_acked_one_waits() {
+        let r = rig("attr-dir");
+        r.fake.plan("mk d", Ans::Hold);
+        r.fake.plan("attr d", Ans::Hold);
+        let gfs = GuestFs::new(r.core.clone());
+        let d = gfs.make_dir(ROOT, &nm("d"), 0o755).unwrap();
+        wait_for("the mk", || r.fake.sent().len() == 1);
+
+        gfs.do_setattr(d, Some(0o700), None, None, None, None, None, None)
+            .unwrap();
+        wait_for("the attr", || r.fake.sent() == ["mk d", "attr d"]);
+        assert_eq!(r.core.t().get(d).unwrap().meta.perm, 0o700);
+
+        r.fake.answer(host_done(0o755));
+        r.fake.answer(host_done(0o700));
+        pump(&r.core);
+        pump(&r.core);
+        assert!(r.core.t().get(d).unwrap().unacked.is_none());
+
+        let returned = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                let res = gfs.do_setattr(d, Some(0o750), None, None, None, None, None, None);
+                returned.store(true, SeqCst);
+                res
+            });
+            wait_for("the second attr on the wire", || r.fake.sent().len() == 3);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !returned.load(SeqCst),
+                "a directory the host has acked waits for it"
+            );
+            r.fake.answer(host_done(0o750));
+            assert_eq!(h.join().unwrap(), Ok(()));
+        });
+        assert_eq!(r.core.t().get(d).unwrap().meta.perm, 0o750);
+    }
+
+    #[test]
+    fn a_new_files_chmod_is_queued_behind_its_commit_without_waiting() {
+        let r = rig("attr-new");
+        r.fake.plan("commit f", Ans::Hold);
+        r.fake.plan("attr f", Ans::Hold);
+        let gfs = GuestFs::new(r.core.clone());
+        let (f, src) = gfs.new_file(ROOT, &nm("f"), 0o644).unwrap();
+        let Src::Staged { id: sid, fd } = src else {
+            panic!("a synced file is staged");
+        };
+        pwrite_all(fd.as_fd(), b"data\n", 0).unwrap();
+        assert!(r.core.writer.flush(sid, false).is_ok());
+        wait_for("the commit", || r.fake.sent() == ["commit f"]);
+
+        gfs.do_setattr(f, Some(0o600), None, None, None, None, None, None)
+            .unwrap();
+        wait_for("the attr", || r.fake.sent() == ["commit f", "attr f"]);
+        assert_eq!(r.core.t().get(f).unwrap().meta.perm, 0o600);
+        assert!(!r.core.writer.drain(Instant::now()));
     }
 }

@@ -4,7 +4,9 @@ use super::cache::{Done, Remote, RemoteSlot, lock, pread_full};
 use super::tree::NodeId;
 use crate::delta;
 use crate::net::rpc::RpcError;
-use crate::proto::{Body, CHUNK_MAX, DeltaOp, Expect, Kind, Meta, Op, Reply, ReqId, WireErr};
+use crate::proto::{
+    Body, CHUNK_MAX, DeltaOp, Expect, Kind, Meta, Op, RelPath, Reply, ReqId, Version, WireErr,
+};
 use crossbeam_channel::Sender;
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, VecDeque};
@@ -29,6 +31,8 @@ const POLL: Duration = Duration::from_millis(50);
 const REPLAYS: u32 = 1;
 // staging reads for a streamed body, split into wire chunks
 const READ_BLOCK: usize = CHUNK_MAX * 16;
+// a new file's commit that is last in the queue waits this long, so the chmod or utimes that follows a close folds into it
+pub const LINGER: Duration = Duration::from_millis(1);
 
 // who is told when the op completes; Sync means a caller blocks in wait()
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +79,7 @@ struct Item {
     op: Op,
     payload: Arc<Payload>,
     sink: Sink,
+    queued: Instant,
     deadline: Instant,
     streamed: bool,
     replays: u32,
@@ -121,7 +126,43 @@ impl State {
             .front()
             .and_then(|i| i.not_before)
             .filter(|t| *t > now);
-        flights.chain(queued).chain(retry).min()
+        let linger = self.linger_end().filter(|t| *t > now);
+        flights.chain(queued).chain(retry).chain(linger).min()
+    }
+
+    // when the op at the front stops waiting for company: only a first send of a new file's async commit that
+    // nothing is queued behind waits at all
+    fn linger_end(&self) -> Option<Instant> {
+        let front = self.queue.front()?;
+        (self.queue.len() == 1
+            && front.replays == 0
+            && front.not_before.is_none()
+            && lingers(&front.op))
+        .then(|| front.queued + LINGER)
+    }
+}
+
+fn lingers(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Commit {
+            base: Expect::Absent,
+            sync: false,
+            ..
+        }
+    )
+}
+
+// true when the op names a path strictly below dir
+fn below(op: &Op, dir: &RelPath) -> bool {
+    let under = |p: &RelPath| p != dir && p.starts_with(dir);
+    match op {
+        Op::Commit { path, .. }
+        | Op::Mk { path, .. }
+        | Op::Remove { path, .. }
+        | Op::SetAttr { path, .. } => under(path),
+        Op::Rename { from, to, .. } => under(from) || under(to),
+        Op::Fetch { .. } | Op::FetchMany { .. } | Op::Resolve { .. } | Op::Hashes { .. } => false,
     }
 }
 
@@ -407,6 +448,7 @@ impl Shared {
             op,
             payload: Arc::new(payload),
             sink,
+            queued: Instant::now(),
             deadline,
             streamed,
             replays: 0,
@@ -498,6 +540,7 @@ impl Worker {
             if let Some(front) = g.queue.front()
                 && front.not_before.is_none_or(|t| t <= now)
                 && (!front.streamed || g.streams < STREAMS)
+                && g.linger_end().is_none_or(|t| t <= now)
             {
                 break Act::Send;
             }
@@ -780,6 +823,73 @@ impl Pipe {
         self.sh.cancel(t);
     }
 
+    // folds a mode or mtime change into the newest op for `path` at `ver` that has not been sent: a commit of that
+    // version, or a setattr that expects it. false when none is left to fold into. an op that went out once and came
+    // back (a replay, a busy retry) may already have landed without the change, so it is never amended
+    pub fn amend(
+        &self,
+        path: &RelPath,
+        ver: Version,
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+    ) -> bool {
+        let mut g = lock(&self.sh.st);
+        for it in g.queue.iter_mut().rev() {
+            if it.replays > 0 || it.not_before.is_some() {
+                continue;
+            }
+            match &mut it.op {
+                Op::Commit {
+                    path: p,
+                    new,
+                    perm: cp,
+                    mtime_ns: cm,
+                    ..
+                } if p == path && *new == ver => {
+                    *cp = perm.or(*cp);
+                    *cm = mtime_ns.or(*cm);
+                    return true;
+                }
+                Op::SetAttr {
+                    path: p,
+                    expect: Expect::Is(v),
+                    perm: sp,
+                    mtime_ns: sm,
+                } if p == path && *v == ver => {
+                    *sp = perm.or(*sp);
+                    *sm = mtime_ns.or(*sm);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    // removes the ops not yet sent that name a path below `dir` (the entry that held them was refused) and answers
+    // each with NotFound; ops already on the wire fail on their own. returns the tickets removed
+    pub fn drop_under(&self, dir: &RelPath) -> Vec<Ticket> {
+        let mut fires = Vec::new();
+        let mut gone = Vec::new();
+        {
+            let mut g = lock(&self.sh.st);
+            let mut i = 0;
+            while i < g.queue.len() {
+                if below(&g.queue[i].op, dir)
+                    && let Some(it) = g.queue.remove(i)
+                {
+                    gone.push(it.ticket);
+                    let err = Err(RpcError::Wire(WireErr::NotFound));
+                    complete(&mut g, &mut fires, it.ticket, it.sink, err);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        self.sh.fire(fires);
+        gone
+    }
+
     pub fn is_closed(&self) -> bool {
         self.sh.is_closed()
     }
@@ -825,7 +935,7 @@ impl Drop for Pipe {
 mod tests {
     use super::*;
     use crate::net::rpc::ChunkSink;
-    use crate::proto::Version;
+    use crate::proto::Mk;
     use crossbeam_channel::{Receiver, unbounded};
     use std::fs::File;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -850,7 +960,10 @@ mod tests {
             lock(&self.log)
                 .iter()
                 .map(|o| match o {
-                    Op::Remove { path, .. } | Op::Commit { path, .. } => path.as_str().to_string(),
+                    Op::Remove { path, .. }
+                    | Op::Commit { path, .. }
+                    | Op::Mk { path, .. }
+                    | Op::SetAttr { path, .. } => path.as_str().to_string(),
                     o => panic!("unexpected {o:?}"),
                 })
                 .collect()
@@ -1323,5 +1436,225 @@ mod tests {
         let t = push(&pipe, "a");
         assert!(is_done(pipe.wait(t, later())));
         assert_eq!(fake.names(), ["a"]);
+    }
+
+    fn the_version() -> Version {
+        Version {
+            hash: [0; 32],
+            size: 1,
+        }
+    }
+
+    // the first STREAMS uploads fill the cap, so whatever is pushed after them stays queued
+    fn fill(pipe: &Pipe, first: &str) -> Vec<Ticket> {
+        (0..STREAMS)
+            .map(|i| {
+                let name = if i == 0 {
+                    first.to_string()
+                } else {
+                    format!("u{i}")
+                };
+                let (op, payload) = upload(&name);
+                pipe.push(op, payload, Tag::Sync, later()).unwrap()
+            })
+            .collect()
+    }
+
+    fn answer_all(fake: &Fake, pipe: &Pipe, tickets: Vec<Ticket>) {
+        while fake.held() > 0 {
+            fake.answer(done());
+        }
+        for t in tickets {
+            assert!(is_done(pipe.wait(t, later())));
+        }
+    }
+
+    #[test]
+    fn amend_folds_a_mode_and_mtime_into_an_unsent_commit() {
+        let fake = Fake::scripted(Vec::new());
+        let (_slot, pipe, _rx) = rig(&fake);
+        let mut tickets = fill(&pipe, "first");
+        until("the cap", || fake.sent() == STREAMS);
+        let (op, payload) = upload("late");
+        tickets.push(pipe.push(op, payload, Tag::Sync, later()).unwrap());
+        let late = RelPath::new("late").unwrap();
+        let ver = the_version();
+
+        assert!(pipe.amend(&late, ver, Some(0o600), None));
+        assert!(pipe.amend(&late, ver, None, Some(77)));
+        assert!(!pipe.amend(&RelPath::new("other").unwrap(), ver, Some(1), None));
+        let other = Version {
+            hash: [1; 32],
+            size: 1,
+        };
+        assert!(!pipe.amend(&late, other, Some(1), None));
+
+        fake.answer(done());
+        until("the last upload", || fake.sent() == STREAMS + 1);
+        match lock(&fake.log).last() {
+            Some(Op::Commit { perm, mtime_ns, .. }) => {
+                assert_eq!((*perm, *mtime_ns), (Some(0o600), Some(77)))
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert!(
+            !pipe.amend(&late, ver, Some(0o644), None),
+            "a sent commit is not amended"
+        );
+        answer_all(&fake, &pipe, tickets);
+    }
+
+    #[test]
+    fn amend_folds_into_an_unsent_setattr_that_expects_the_version() {
+        let fake = Fake::scripted(Vec::new());
+        let (_slot, pipe, _rx) = rig(&fake);
+        let mut tickets = fill(&pipe, "first");
+        until("the cap", || fake.sent() == STREAMS);
+        let (op, payload) = upload("late");
+        tickets.push(pipe.push(op, payload, Tag::Sync, later()).unwrap());
+        let p = RelPath::new("p").unwrap();
+        let ver = the_version();
+        let attr = Op::SetAttr {
+            path: p.clone(),
+            expect: Expect::Is(ver),
+            perm: Some(0o600),
+            mtime_ns: None,
+        };
+        tickets.push(pipe.push(attr, Payload::None, Tag::Sync, later()).unwrap());
+
+        assert!(pipe.amend(&p, ver, None, Some(9)));
+        let other = Version {
+            hash: [2; 32],
+            size: 1,
+        };
+        assert!(!pipe.amend(&p, other, None, Some(1)));
+        fake.answer(done());
+        until("the setattr", || fake.sent() == STREAMS + 2);
+        match lock(&fake.log).last() {
+            Some(Op::SetAttr { perm, mtime_ns, .. }) => {
+                assert_eq!((*perm, *mtime_ns), (Some(0o600), Some(9)))
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        assert!(!pipe.amend(&p, ver, Some(1), None));
+        answer_all(&fake, &pipe, tickets);
+    }
+
+    #[test]
+    fn drop_under_removes_unsent_descendants_and_leaves_sent_ones() {
+        let fake = Fake::scripted(Vec::new());
+        let (_slot, pipe, _rx) = rig(&fake);
+        let mut tickets = fill(&pipe, "d/sent");
+        until("the cap", || fake.sent() == STREAMS);
+        let (op, payload) = upload("d/a");
+        let a = pipe.push(op, payload, Tag::Sync, later()).unwrap();
+        let b = push(&pipe, "d/b");
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mk = Op::Mk {
+            path: RelPath::new("d/m").unwrap(),
+            what: Mk::Dir { perm: 0o755 },
+        };
+        let cb = Box::new(move |r| {
+            let _ = tx.send(r);
+        });
+        pipe.push_with(mk, Payload::None, later(), cb).unwrap();
+        tickets.push(push(&pipe, "d"));
+        tickets.push(push(&pipe, "e/x"));
+
+        let mut gone = pipe.drop_under(&RelPath::new("d").unwrap());
+        gone.sort();
+        assert_eq!(gone.len(), 3);
+        assert!(gone.contains(&a) && gone.contains(&b));
+        for t in [a, b] {
+            assert!(matches!(
+                pipe.wait(t, later()),
+                Err(RpcError::Wire(WireErr::NotFound))
+            ));
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Err(RpcError::Wire(WireErr::NotFound))
+        ));
+        until("the rest", || fake.sent() == STREAMS + 2);
+        let names = fake.names();
+        assert_eq!(names[0], "d/sent");
+        assert_eq!(names[STREAMS..], ["d", "e/x"]);
+        answer_all(&fake, &pipe, tickets);
+    }
+
+    fn lone(op: Op, at: Instant) -> State {
+        let item = Item {
+            ticket: 1,
+            op,
+            payload: Arc::new(Payload::None),
+            sink: Sink::Wait,
+            queued: at,
+            deadline: at,
+            streamed: false,
+            replays: 0,
+            backoff: BUSY_MIN,
+            not_before: None,
+        };
+        State {
+            next: 2,
+            epoch: 0,
+            queue: VecDeque::from([item]),
+            flight: BTreeMap::new(),
+            replies: VecDeque::new(),
+            results: FxHashMap::default(),
+            streams: 0,
+            closed: false,
+        }
+    }
+
+    fn commit_op(base: Expect, sync: bool) -> Op {
+        Op::Commit {
+            path: RelPath::new("f").unwrap(),
+            base,
+            new: the_version(),
+            perm: Some(0o644),
+            body: Body::Empty,
+            sync,
+            mtime_ns: None,
+        }
+    }
+
+    #[test]
+    fn only_a_lone_unsynced_new_file_commit_lingers() {
+        let t0 = Instant::now();
+        let new = commit_op(Expect::Absent, false);
+        assert_eq!(lone(new.clone(), t0).linger_end(), Some(t0 + LINGER));
+
+        let mut behind = lone(new.clone(), t0);
+        let second = lone(rm("g"), t0).queue.pop_front().unwrap();
+        behind.queue.push_back(second);
+        assert_eq!(behind.linger_end(), None, "an op behind ends the wait");
+
+        assert_eq!(lone(commit_op(Expect::Absent, true), t0).linger_end(), None);
+        let edit = commit_op(Expect::Is(the_version()), false);
+        assert_eq!(lone(edit, t0).linger_end(), None);
+        assert_eq!(lone(rm("g"), t0).linger_end(), None);
+
+        let mut again = lone(new, t0);
+        again.queue[0].replays = 1;
+        assert_eq!(again.linger_end(), None, "a replay goes out at once");
+    }
+
+    #[test]
+    fn a_lone_new_file_commit_is_sent_after_the_linger_not_before() {
+        let fake = Fake::scripted(vec![done()]);
+        let (_slot, pipe, _rx) = rig(&fake);
+        let t0 = Instant::now();
+        let t = pipe
+            .push(
+                commit_op(Expect::Absent, false),
+                Payload::None,
+                Tag::Sync,
+                later(),
+            )
+            .unwrap();
+        assert!(is_done(pipe.wait(t, later())));
+        assert!(t0.elapsed() >= LINGER);
+        assert_eq!(fake.names(), ["f"]);
     }
 }

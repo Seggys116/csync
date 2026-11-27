@@ -63,6 +63,9 @@ pub struct GNode {
     pub staging: Option<u32>,
     // errno of a commit that failed after its last handle closed, for the next flush, fsync or write; 0 when none
     pub werr: i32,
+    // a directory or link this guest made that the host has not answered yet: the pipe ticket of its mk (0 until
+    // the push returns). the guest is the truth for it meanwhile, so host removes and sweeps leave it alone
+    pub unacked: Option<u64>,
     pub special: Special,
     pub children: Option<Children>,
 }
@@ -278,6 +281,7 @@ impl GTree {
             size_pending: false,
             staging: None,
             werr: 0,
+            unacked: None,
             special: Special::None,
             children: Some(Children::default()),
         };
@@ -586,6 +590,7 @@ impl GTree {
             size_pending: false,
             staging: None,
             werr: 0,
+            unacked: None,
             special: Special::None,
             children,
         };
@@ -957,8 +962,11 @@ impl GTree {
                     self.upsert_at(p, name, meta.clone(), *ver, fx);
                 }
             }
+            // the guest's own mk lands after this remove, so the entry it made stays
             Change::Remove { path } => {
-                if let Some(id) = self.resolve(path) {
+                if let Some(id) = self.resolve(path)
+                    && !self.get(id).is_some_and(|n| n.unacked.is_some())
+                {
                     self.remove_node(id, fx);
                 }
             }
@@ -1401,6 +1409,45 @@ impl GTree {
         self.get_mut(id).map_or(0, |n| std::mem::take(&mut n.werr))
     }
 
+    // removes a refused entry with everything below it, bottom-up. returns the staging ids the writer must drop and
+    // how many nodes with an open handle got errno as a late write error
+    pub fn rollback(&mut self, id: NodeId, errno: i32, fx: &mut Vec<Effect>) -> (Vec<u32>, u32) {
+        let mut order = Vec::new();
+        let mut walk = vec![id];
+        while let Some(x) = walk.pop() {
+            let Some(n) = self.get(x) else { continue };
+            order.push(x);
+            for (name, &k) in n.children.iter().flatten() {
+                if self
+                    .get(k)
+                    .is_some_and(|c| c.parent == x && c.name == *name)
+                {
+                    walk.push(k);
+                }
+            }
+        }
+        let (mut staging, mut told) = (Vec::new(), 0);
+        for &x in order.iter().rev() {
+            if self.set_werr(x, errno) {
+                told += 1;
+            }
+            let Some(n) = self.get_mut(x) else { continue };
+            n.unacked = None;
+            if let Some(s) = n.staging.take() {
+                staging.push(s);
+            }
+            if n.attached() {
+                fx.push(Effect::InvalEntry(n.parent, n.name.clone()));
+            }
+            fx.push(Effect::InvalInode(x));
+        }
+        if let Some(n) = self.get(id).filter(|n| n.attached()) {
+            fx.push(Effect::InvalInode(n.parent));
+        }
+        self.remove(id);
+        (staging, told)
+    }
+
     pub fn was_acked(&self, id: NodeId) -> bool {
         self.acked.contains(&id)
     }
@@ -1447,7 +1494,12 @@ impl GTree {
                 return Err("snapshot parent is not a directory");
             }
             let id = match self.child(parent, e.name.as_str()) {
-                Some(id) if self.acked.contains(&id) => id,
+                Some(id)
+                    if self.acked.contains(&id)
+                        || self.get(id).is_some_and(|n| n.unacked.is_some()) =>
+                {
+                    id
+                }
                 _ => self
                     .upsert_at(parent, e.name.as_str(), e.meta.clone(), e.ver, fx)
                     .unwrap_or(DETACHED),
@@ -1468,14 +1520,15 @@ impl GTree {
 
     fn sweep(&mut self, fx: &mut Vec<Effect>) {
         let ep = self.epoch;
-        // a file with a write in flight may not be on the host yet; it and its directories stay until the commit settles
+        // a file with a write in flight, or a directory or link whose mk is unanswered, may not be on the host yet;
+        // it and its directories stay until the host answers
         let mut keep = rustc_hash::FxHashSet::default();
         for (i, s) in self.slots.iter().enumerate() {
             let id = i as NodeId + 1;
-            if s.node
-                .as_ref()
-                .is_some_and(|n| n.attached() && (n.staging.is_some() || self.acked.contains(&id)))
-            {
+            if s.node.as_ref().is_some_and(|n| {
+                n.attached()
+                    && (n.staging.is_some() || n.unacked.is_some() || self.acked.contains(&id))
+            }) {
                 let mut cur = i as NodeId + 1;
                 while cur != ROOT && keep.insert(cur) {
                     match self.get(cur) {
@@ -2429,5 +2482,121 @@ mod tests {
             !t.exchange((d, tg, &nm("a")), (inner, d, &nm("x"))),
             "a directory cannot swap with its own child"
         );
+    }
+
+    // a directory this guest made whose mk the host has not answered
+    fn pending_dir(t: &mut GTree, parent: NodeId, name: &str, ticket: u64) -> NodeId {
+        let id = t.insert_dir(parent, nm(name), dir(), GDomain::Synced);
+        t.get_mut(id).unwrap().unacked = Some(ticket);
+        id
+    }
+
+    #[test]
+    fn a_host_remove_leaves_a_pending_directory_alone() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        let d = pending_dir(&mut t, src, "d", 7);
+        let mut fx = Vec::new();
+        t.apply(&Change::Remove { path: rp("src/d") }, &mut fx);
+        assert!(fx.is_empty());
+        assert_eq!(t.resolve(&rp("src/d")), Some(d));
+        assert_eq!(t.get(d).unwrap().vis, Vis::Live);
+
+        t.get_mut(d).unwrap().unacked = None;
+        t.apply(&Change::Remove { path: rp("src/d") }, &mut fx);
+        assert_eq!(t.get(d).unwrap().vis, Vis::PendingDelete);
+    }
+
+    #[test]
+    fn a_host_entry_over_a_pending_directory_takes_its_meta_or_replaces_it() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        let d = pending_dir(&mut t, src, "d", 7);
+        up(&mut t, "src/d", dir_meta(0o700));
+        assert_eq!(t.resolve(&rp("src/d")), Some(d));
+        assert_eq!(t.get(d).unwrap().meta.perm, 0o700);
+        assert_eq!(
+            t.get(d).unwrap().unacked,
+            Some(7),
+            "still waiting for its own"
+        );
+
+        up(&mut t, "src/d", file(4));
+        let now = t.resolve(&rp("src/d")).unwrap();
+        assert_eq!(t.get(now).unwrap().meta.kind, Kind::File);
+        assert_eq!(t.get(now).unwrap().unacked, None);
+    }
+
+    #[test]
+    fn a_snapshot_keeps_a_pending_directory_with_its_ancestors_and_its_own_meta() {
+        let mut t = GTree::new();
+        let mut fx = Vec::new();
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        let a = t.resolve(&rp("a")).unwrap();
+        let p = pending_dir(&mut t, a, "p", 3);
+        let q = t.insert_dir(a, nm("q"), dir(), GDomain::Synced);
+        let deep = pending_dir(&mut t, q, "deep", 4);
+
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        assert_eq!(t.resolve(&rp("a/p")), Some(p));
+        assert_eq!(t.resolve(&rp("a/q")), Some(q), "ancestor of a pending one");
+        assert_eq!(t.resolve(&rp("a/q/deep")), Some(deep));
+
+        t.get_mut(deep).unwrap().unacked = None;
+        t.get_mut(p).unwrap().unacked = None;
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        assert!(t.resolve(&rp("a/p")).is_none() && t.resolve(&rp("a/q")).is_none());
+
+        let p = pending_dir(&mut t, a, "p", 5);
+        let theirs = Meta {
+            perm: 0o700,
+            ..dir()
+        };
+        t.apply_snapshot_part(
+            &[entry(0, "a", dir()), entry(1, "p", theirs)],
+            true,
+            &mut fx,
+        )
+        .unwrap();
+        assert_eq!(t.get(p).unwrap().meta.perm, 0o755, "the guest is the truth");
+    }
+
+    #[test]
+    fn rollback_removes_the_subtree_bottom_up_and_names_what_to_drop() {
+        let mut t = GTree::new();
+        let a = pending_dir(&mut t, ROOT, "a", 1);
+        let b = pending_dir(&mut t, a, "b", 2);
+        let f = t.insert(b, nm("f"), file(1), GDomain::Synced, Vis::Live);
+        t.get_mut(f).unwrap().staging = Some(9);
+        t.add_open(f);
+        let g = t.insert(a, nm("g"), file(2), GDomain::Synced, Vis::Live);
+        t.get_mut(g).unwrap().staging = Some(4);
+        let keep = t.insert(ROOT, nm("keep"), dir(), GDomain::Synced, Vis::Live);
+
+        let mut fx = Vec::new();
+        let (mut staging, told) = t.rollback(a, libc::EIO, &mut fx);
+        staging.sort_unstable();
+        assert_eq!((staging, told), (vec![4, 9], 1));
+        assert!(t.resolve(&rp("a")).is_none());
+        assert_eq!(t.resolve(&rp("keep")), Some(keep));
+        assert_eq!(t.take_werr(f), libc::EIO, "the open file is told");
+        assert_eq!(t.take_werr(f), 0);
+        assert!(
+            t.get(f)
+                .is_some_and(|n| !n.attached() && n.unacked.is_none())
+        );
+
+        let at = |e: Effect| fx.iter().position(|x| *x == e).unwrap();
+        let (fb, ba, ar) = (
+            at(Effect::InvalEntry(b, nm("f"))),
+            at(Effect::InvalEntry(a, nm("b"))),
+            at(Effect::InvalEntry(ROOT, nm("a"))),
+        );
+        assert!(fb < ba && ba < ar, "children go before their parent");
+        assert!(fx.contains(&Effect::InvalInode(ROOT)));
+        assert!(fx.contains(&Effect::InvalInode(f)));
     }
 }

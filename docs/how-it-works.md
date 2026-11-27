@@ -109,6 +109,16 @@ The host serves only files that are in its index as synced or `.git` content, an
 4. An edit to a file the host already has waits for the host's answer at close, so a refused commit fails the `close` with `ECANCELED`. A new file (made by this guest, not yet on the host) does not: its commit is queued in the ordered stream when the file is flushed or released, which is before any later operation on it, and the close returns without waiting for the host. The guest keeps the staging copy until the answer arrives, and a background thread then records the host's version or runs the merge, as a close that waited would have. `fsync` always waits for the host's answer.
 5. A refusal after a new file's close (a conflict that cannot be merged, a refused commit, retries that ran out) posts the `refused` notice and rolls the file back as described under Refusal. If a handle of the file is open then, its next `flush`, `fsync` or `write` fails once, with `ECANCELED` for a refused merge and the commit's own error otherwise.
 
+### Entries the host has not answered for
+
+Everything the guest sends to the host goes through one ordered stream, and the host applies it in that order. An entry this guest made and the host has not acknowledged yet (a new directory, a new symlink, a new file) is the guest's own until the host answers, so the operations that follow on it do not wait:
+
+- `mkdir` and `symlink` check everything the guest can decide itself first (a name that exists or only differs in case, an invalid name, `.git`, the guest-only overlay) and fail with the same errors as before. Then the entry is added to the guest's tree, its `mk` is queued, and the call returns. A file or directory made inside it is queued after it, so the host sees the parent first without any dependency tracking. Lookups, listings and reads treat the entry as live, and a host remove of its path that arrives meanwhile is ignored, because the guest's own `mk` lands after it. A host entry of the same kind at that path replaces the entry's metadata; one of another kind wins, and what was queued below it then fails on the host.
+- `chmod` and `utimes` of such an entry are queued behind its creation and return at once. For a new file the change is first merged into its commit if that has not been sent, or recorded for the commit when the file is still open. A commit that is the last thing in the queue and does not ask for durability waits up to 1 ms before it is sent, so the change that usually follows a close can still be merged into it; any other operation queued behind it ends the wait at once, and a commit made for `fsync` never waits. When the commit has already gone out, the change is sent as its own `setattr` that expects the version just committed.
+- `fsync` still waits for the host's answer to its own commit, and since everything before it in the stream has been applied by then, one `fsync` of the last file is a barrier for the directories and files created before it. A refused ancestor makes it fail.
+
+What the host decides is only learned later, so a refusal arrives after the call has returned (see Refusal). Renames, unlinks, and changes to an entry the host already has are not part of this and still wait for the host.
+
 Every close of any copy of a file descriptor counts, so a shell redirection (`exec 3<>f; printf A >&3` closes a duplicate of the descriptor when it restores stdout) or a child process that inherits the descriptor and exits commits the write at that moment, not when the original descriptor is closed. A host program that read the file before that commit and then saves its older copy overwrites the guest write, and csync cannot detect it, because host writes are plain filesystem writes with no compare-and-swap.
 
 ### Compare-and-swap on the host
@@ -135,6 +145,15 @@ If the merge has conflicting regions, a side is binary or too large, or the retr
 - a `refused` notice appears on both sides.
 
 No backup, conflict copy or marker file is written on either side. The host's temporary file is removed whenever a commit does not complete.
+
+A directory or symlink the guest made without waiting (see Entries the host has not answered for) can be refused after the call that made it returned. The guest then rolls it back:
+
+- what is still queued below it is dropped and what was already sent fails on the host by itself, so nothing is created under a path that was refused;
+- the entry and everything below it are removed from the guest's tree bottom-up, and the kernel's cached entries are invalidated;
+- one `refused` notice is posted, for the root of what was removed;
+- a handle still open on a file below it gets `ECANCELED` for a refusal, `EFBIG` when the host is out of space or the file is too large, and `EIO` otherwise, at its next `flush`, `fsync` or `write`, once. The same applies when a queued `chmod` or `utimes` of a file is refused. A queued change that finds the host's entry replaced by a host save leaves the host's version in place.
+
+If the host says the path is ignored, the entries are not deleted. When the guest's own rules agree they are moved to the guest-only overlay, as for an ignore rule this guest wrote itself; when they do not, the entry is refused like any other.
 
 ### Atomic saves
 

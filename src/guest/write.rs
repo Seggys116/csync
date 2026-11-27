@@ -1,6 +1,6 @@
 use super::cache::{
-    BlobCache, BlobRef, DELTA_CAP, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno, lock, pread_full,
-    pwrite_all, read_len, rpc_errno, wire_errno,
+    BlobCache, BlobRef, DELTA_CAP, Done, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno, lock,
+    pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
 };
 use super::pipe::{Payload, Pipe, Tag, Ticket};
 use super::tree::{GNode, NodeId, Vis};
@@ -24,6 +24,7 @@ pub const REFUSED: i32 = libc::ECANCELED;
 const RACY_NS: i64 = 100_000_000;
 // a new file this large commits in place and waits for the host instead of pipelining a copy
 const BORROW_MIN: u64 = 1 << 20;
+const ASYNC_WAIT: Duration = Duration::from_secs(30);
 
 pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
 
@@ -37,11 +38,54 @@ pub enum Flushed {
 }
 
 // work for the settler thread
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Job {
     // the host answered the commit of a new file whose last handle closed without waiting for it
     Settle(u32),
+    // the host answered an mk (mk) or setattr sent without waiting, for the node that was born as `born`
+    Landed {
+        node: NodeId,
+        born: u64,
+        mk: bool,
+        what: Landing,
+    },
     Stop,
+}
+
+// what the host said to an op sent without waiting, as far as the settler cares
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Landing {
+    Done,
+    // the host's entry is not what the op expected
+    Conflict(Option<Meta>),
+    // the host's rules say the path is ignored
+    Ignored,
+    // anything else, as the errno a late write error carries
+    Failed(i32),
+}
+
+impl Landing {
+    fn of(r: Result<Reply, RpcError>) -> Self {
+        match r {
+            Ok(Reply::Done { .. }) => Self::Done,
+            Ok(Reply::Conflict { current, .. }) => Self::Conflict(current),
+            Ok(_) => Self::Failed(libc::EIO),
+            Err(RpcError::Wire(WireErr::Ignored)) => Self::Ignored,
+            Err(RpcError::Wire(WireErr::TooLarge)) => Self::Failed(libc::EFBIG),
+            Err(_) => Self::Failed(libc::EIO),
+        }
+    }
+}
+
+// how attr_new dealt with a chmod or utimes of a file the host has not answered for yet
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attr {
+    // recorded for, or merged into, a commit that has not gone out
+    Folded,
+    // queued behind the commit without waiting
+    Queued,
+    // not a new file, or its content moved on: the caller does it as for any file the host has
+    Sync,
 }
 
 // closes that left their commit to the settler and are not settled yet
@@ -139,6 +183,11 @@ fn mark(stat: StatKey) -> Mark {
 // a stat taken within the timestamp granularity of a write cannot prove the content is unchanged
 fn trusted(m: Option<&Mark>, cur: &StatKey) -> bool {
     m.is_some_and(|(s, at)| s == cur && s.mtime_ns.saturating_add(RACY_NS) < *at)
+}
+
+// an mtime set on the staging copy stands for the commit only while nothing was written after it
+fn stamped(st: &Staged, stat: &StatKey) -> Option<i64> {
+    st.want_mtime.filter(|m| *m == stat.mtime_ns)
 }
 
 fn commit_deadline(size: u64) -> Instant {
@@ -247,6 +296,9 @@ struct Staged {
     unlinked: bool,
     // the last handle closed with the first commit unanswered: the settler finishes the close, for this node
     orphan: Option<NodeId>,
+    // what attr_new was asked to set on a new file; a commit carries them, and the commit's reply shows them
+    want_perm: Option<u16>,
+    want_mtime: Option<i64>,
 }
 
 #[derive(Default)]
@@ -472,6 +524,8 @@ impl Writer {
             unlinked: false,
             unpublished: None,
             orphan: None,
+            want_perm: None,
+            want_mtime: None,
         };
         let mut t = lock(&self.table);
         let id = loop {
@@ -680,6 +734,137 @@ impl Writer {
         sys::stat_key(st.fd.as_fd()).ok()
     }
 
+    fn landing(&self, node: NodeId, born: u64, mk: bool) -> Done {
+        let jobs = self.jobs.clone();
+        Box::new(move |r| {
+            let _ = jobs.send(Job::Landed {
+                node,
+                born,
+                mk,
+                what: Landing::of(r),
+            });
+        })
+    }
+
+    // an op nobody waits for: the shutdown drain counts it until the settler has seen its answer. it outlasts a
+    // link that is down for a while, because giving up rolls the entry back under an application that was told it exists
+    fn queue_async(&self, op: Op, at: (NodeId, u64), mk: bool) -> Result<Ticket, i32> {
+        *lock(&self.parked.n) += 1;
+        self.pipe
+            .push_with(
+                op,
+                Payload::None,
+                Instant::now() + ASYNC_WAIT,
+                self.landing(at.0, at.1, mk),
+            )
+            .inspect_err(|_| self.parked_done())
+    }
+
+    // `at` is the node and its generation, which the settler checks before acting on the answer
+    pub fn mk_async(&self, path: &RelPath, what: Mk, at: (NodeId, u64)) -> Result<Ticket, i32> {
+        let op = Op::Mk {
+            path: path.clone(),
+            what,
+        };
+        self.queue_async(op, at, true)
+    }
+
+    pub fn attr_async(
+        &self,
+        path: &RelPath,
+        expect: Expect,
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+        at: (NodeId, u64),
+    ) -> Result<Ticket, i32> {
+        let op = Op::SetAttr {
+            path: path.clone(),
+            expect,
+            perm,
+            mtime_ns,
+        };
+        self.queue_async(op, at, false)
+    }
+
+    // the settler has dealt with the answer to a queue_async op
+    pub fn landed_done(&self) {
+        self.parked_done();
+    }
+
+    pub fn closed(&self) -> bool {
+        self.pipe.is_closed()
+    }
+
+    pub fn drop_under(&self, dir: &RelPath) -> Vec<Ticket> {
+        self.pipe.drop_under(dir)
+    }
+
+    // a chmod or utimes of a file this guest made that the host has not answered for. it is recorded for the commit
+    // not yet made, merged into a commit that has not gone out, or queued behind the one that has; nobody waits.
+    // a file the host has, or one whose content moved on since its commit was queued, is left to the caller
+    pub fn attr_new(
+        &self,
+        id: u32,
+        at: (NodeId, u64),
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+    ) -> Attr {
+        let Some(e) = self.entry(id) else {
+            return Attr::Sync;
+        };
+        let mut st = lock(&e);
+        if st.base.is_some() || st.refused || st.unlinked || st.closed {
+            return Attr::Sync;
+        }
+        let ver = match &st.pending {
+            Some(p) if st.orphan.is_some() || self.unchanged(&st, p) => Some(p.ver),
+            Some(_) => return Attr::Sync,
+            None => None,
+        };
+        if let Some(p) = perm {
+            st.perm = p;
+            st.want_perm = Some(p);
+        }
+        if mtime_ns.is_some() {
+            st.want_mtime = mtime_ns;
+        }
+        let Some(ver) = ver else {
+            return Attr::Folded;
+        };
+        if self.pipe.amend(&st.path, ver, perm, mtime_ns) {
+            return Attr::Folded;
+        }
+        let op = Op::SetAttr {
+            path: st.path.clone(),
+            expect: Expect::Is(ver),
+            perm,
+            mtime_ns,
+        };
+        match self.queue_async(op, at, false) {
+            Ok(_) => Attr::Queued,
+            Err(_) => Attr::Sync,
+        }
+    }
+
+    // the staging copies of rolled-back files: an open handle keeps its entry so its next flush fails, the rest go now
+    pub fn abandon(&self, ids: &[u32]) {
+        for &id in ids {
+            let Some(e) = self.entry(id) else { continue };
+            let mut st = lock(&e);
+            st.refused = true;
+            st.pending = None;
+            st.base_ref = None;
+            if st.orphan.take().is_some() {
+                self.parked_done();
+            }
+            if st.handles == 0 {
+                st.closed = true;
+                drop(st);
+                lock(&self.table).map.remove(&id);
+            }
+        }
+    }
+
     fn flush_locked(&self, st: &mut Staged, sync: bool) -> Result<Flushed, Refusal> {
         if st.refused {
             return Err(Refusal::err(REFUSED));
@@ -733,7 +918,7 @@ impl Writer {
             perm: Some(st.perm),
             body,
             sync: false,
-            mtime_ns: None,
+            mtime_ns: stamped(st, &stat.0),
         };
         let cell = Arc::new(Cell::default());
         let (c, jobs, id) = (cell.clone(), self.jobs.clone(), st.id);
@@ -866,6 +1051,11 @@ impl Writer {
                         st.base.map_or(Expect::Absent, Expect::Is),
                         st.base.is_none().then_some(st.perm),
                     );
+                    let mtime_ns = if st.base.is_none() {
+                        stamped(st, &stat.0)
+                    } else {
+                        None
+                    };
                     let mk = move |b: Option<Body>| {
                         Some(Op::Commit {
                             path: path.clone(),
@@ -874,7 +1064,7 @@ impl Writer {
                             perm,
                             body: b?,
                             sync,
-                            mtime_ns: None,
+                            mtime_ns,
                         })
                     };
                     self.send(
@@ -886,7 +1076,16 @@ impl Writer {
                 }
             };
             match reply {
-                Reply::Done { meta } => {
+                Reply::Done { mut meta } => {
+                    // a chmod or utimes queued behind this commit has not reached the host yet, but is already true here
+                    if let Some(p) = st.want_perm {
+                        meta.perm = p;
+                    }
+                    if let Some(m) = st.want_mtime
+                        && sys::stat_key(st.fd.as_fd()).is_ok_and(|k| k.mtime_ns == m)
+                    {
+                        meta.mtime_ns = m;
+                    }
                     // sent in place, so it is stamped once sent, as a copy is once copied
                     if tmp.is_borrowed() && sys::stat_key(st.fd.as_fd()).is_ok_and(|k| k == stat.0)
                     {
@@ -1225,6 +1424,10 @@ impl Writer {
             return Err(Refusal::err(REFUSED));
         }
         let stat = sys::stat_key(st.fd.as_fd()).map_err(|e| Refusal::err(io_errno(&e)))?;
+        // a chmod or utimes recorded for a commit that was never made travels in no op of its own
+        let owes = st.base.is_none()
+            && st.pending.is_none()
+            && (st.want_perm.is_some() || st.want_mtime.is_some());
         let (mut host_ver, clean) = match &st.pending {
             Some(p) => (Some(p.ver), trusted(Some(&p.stat), &stat)),
             None => (st.base, trusted(st.synced.as_ref(), &stat)),
@@ -1287,6 +1490,9 @@ impl Writer {
                 } else {
                     Some(mark(stat))
                 };
+                if owes && let Some(v) = st.base {
+                    self.send_owed(st, r.to, v, &stat);
+                }
                 Ok(w.meta)
             }
             Err(e) => {
@@ -1309,6 +1515,25 @@ impl Writer {
                 Err(e)
             }
         }
+    }
+
+    // the rename carried the content of a new file whose mode and mtime were only recorded; they follow it. the
+    // rename is done and answered, so a host that refuses them leaves the file as it is
+    fn send_owed(&self, st: &Staged, to: &RelPath, ver: Version, stat: &StatKey) {
+        let (perm, mtime_ns) = (st.want_perm, stamped(st, stat));
+        if perm.is_none() && mtime_ns.is_none() {
+            return;
+        }
+        let to = to.clone();
+        let mk = move |_: Option<Body>| {
+            Some(Op::SetAttr {
+                path: to.clone(),
+                expect: Expect::Is(ver),
+                perm,
+                mtime_ns,
+            })
+        };
+        let _ = self.send(&mk, None, commit_deadline(0));
     }
 
     fn simple(&self, path: &RelPath, op: Op) -> Result<Meta, Refusal> {
@@ -2270,5 +2495,219 @@ mod tests {
         assert_eq!(r.w.release(id), committed(v));
         assert!(r.w.staging_fd(id).is_none());
         assert_eq!(sent(&r), 1);
+    }
+
+    fn set_mtime(fd: &OwnedFd, ns: i64) {
+        let t = rustix::fs::Timespec {
+            tv_sec: ns.div_euclid(1_000_000_000),
+            tv_nsec: ns.rem_euclid(1_000_000_000) as _,
+        };
+        let ts = rustix::fs::Timestamps {
+            last_access: t,
+            last_modification: t,
+        };
+        rustix::fs::futimens(fd, &ts).unwrap();
+    }
+
+    fn attrs(v: Version, perm: u16, mtime_ns: i64) -> Option<Result<Flushed, Refusal>> {
+        Some(Ok(Flushed::Committed {
+            meta: Meta {
+                perm,
+                mtime_ns,
+                ..meta(v)
+            },
+            merged: false,
+        }))
+    }
+
+    const WHEN: i64 = 1_700_000_000_123_456_789;
+
+    #[test]
+    fn a_chmod_and_utimes_before_the_first_commit_ride_in_it() {
+        let r = rig("attr-fresh");
+        let p = RelPath::new("t.txt").unwrap();
+        let body = b"data\n";
+        let (id, fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        set_mtime(&fd, WHEN);
+        assert_eq!(
+            r.w.attr_new(id, (5, 1), Some(0o600), Some(WHEN)),
+            Attr::Folded
+        );
+        assert_eq!(sent(&r), 0, "recording the change sends nothing");
+
+        lock(&r.script.replies).push_back(done_for(v));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        assert_eq!(r.w.release(id), attrs(v, 0o600, WHEN));
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { perm, mtime_ns, .. }] => {
+                assert_eq!((*perm, *mtime_ns), (Some(0o600), Some(WHEN)))
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mtime_older_than_a_later_write_is_not_stamped() {
+        let r = rig("attr-stale");
+        let p = RelPath::new("t.txt").unwrap();
+        let (id, fd) = open_new(&r, &p, b"one\n");
+        set_mtime(&fd, WHEN);
+        assert_eq!(r.w.attr_new(id, (5, 1), None, Some(WHEN)), Attr::Folded);
+        overwrite(fd.as_fd(), b"two\n").unwrap();
+        lock(&r.script.replies).push_back(done_for(ver(b"two\n")));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(ver(b"two\n"))));
+        until("the commit", || sent(&r) == 1);
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { mtime_ns, .. }] => assert_eq!(*mtime_ns, None),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chmod_after_the_close_is_queued_behind_the_commit_without_waiting() {
+        let r = held_rig("attr-parked");
+        let p = RelPath::new("t.txt").unwrap();
+        let body = b"data\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        assert_eq!(
+            r.w.attr_new(id, (7, 3), Some(0o600), None),
+            Attr::Queued,
+            "the host has not answered the commit"
+        );
+        until("the setattr", || sent(&r) == 2);
+        match &lock(&r.script.ops)[..] {
+            [
+                Op::Commit { .. },
+                Op::SetAttr {
+                    expect,
+                    perm,
+                    mtime_ns,
+                    ..
+                },
+            ] => assert_eq!(
+                (*expect, *perm, *mtime_ns),
+                (Expect::Is(v), Some(0o600), None)
+            ),
+            o => panic!("unexpected {o:?}"),
+        }
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        r.script.answer(done_for(v));
+        let landed = Job::Landed {
+            node: 7,
+            born: 3,
+            mk: false,
+            what: Landing::Done,
+        };
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(landed));
+        assert_eq!(r.w.settle_parked(id), attrs(v, 0o600, 1));
+        assert!(!r.w.drain(Instant::now()), "the setattr is not settled yet");
+        r.w.landed_done();
+        assert!(r.w.drain(Instant::now()));
+    }
+
+    #[test]
+    fn attr_new_leaves_an_edit_and_a_changed_file_to_the_caller() {
+        let r = held_rig("attr-sync");
+        let p = RelPath::new("edit.txt").unwrap();
+        let (id, _fd) = open_edit(&r, &p, b"one\n", b"two\n");
+        assert_eq!(r.w.attr_new(id, (5, 1), Some(0o600), None), Attr::Sync);
+        assert_eq!(r.w.attr_new(9999, (5, 1), Some(0o600), None), Attr::Sync);
+
+        let q = RelPath::new("new.txt").unwrap();
+        let (nid, nfd) = open_new(&r, &q, b"fresh\n");
+        assert_eq!(r.w.flush(nid, false), Ok(Flushed::Sent(ver(b"fresh\n"))));
+        until("the commit", || sent(&r) == 1);
+        overwrite(nfd.as_fd(), b"changed since\n").unwrap();
+        assert_eq!(r.w.attr_new(nid, (6, 1), Some(0o600), None), Attr::Sync);
+        assert_eq!(sent(&r), 1, "nothing was queued for either");
+    }
+
+    #[test]
+    fn abandon_drops_a_parked_entry_and_fails_an_open_one() {
+        let r = held_rig("abandon");
+        let (p, q) = (
+            RelPath::new("parked.txt").unwrap(),
+            RelPath::new("open.txt").unwrap(),
+        );
+        let (a, _fa) = open_new(&r, &p, b"a\n");
+        assert_eq!(r.w.flush(a, false), Ok(Flushed::Sent(ver(b"a\n"))));
+        until("the commit", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(a, 7), None);
+        let (b, _fb) = open_new(&r, &q, b"b\n");
+
+        assert!(!r.w.drain(Instant::now()));
+        r.w.abandon(&[a, b]);
+        assert!(r.w.drain(Instant::now()), "the parked close is given up");
+        assert!(r.w.staging_fd(a).is_none());
+        assert_eq!(r.w.parked_node(a), None);
+        assert!(
+            r.w.staging_fd(b).is_some(),
+            "an open handle keeps its entry"
+        );
+        assert_eq!(
+            r.w.flush(b, false).map_err(|e| e.errno),
+            Err(libc::ECANCELED)
+        );
+        assert_eq!(r.w.release(b), None);
+        assert!(r.w.staging_fd(b).is_none());
+        assert_eq!(sent(&r), 1);
+    }
+
+    #[test]
+    fn landing_says_what_the_host_said() {
+        let wire = |w| Err(RpcError::Wire(w));
+        assert_eq!(Landing::of(done_for(ver(b""))), Landing::Done);
+        let conflict = Ok(Reply::Conflict {
+            current: None,
+            inline: None,
+        });
+        assert_eq!(Landing::of(conflict), Landing::Conflict(None));
+        assert_eq!(Landing::of(wire(WireErr::Ignored)), Landing::Ignored);
+        assert_eq!(
+            Landing::of(wire(WireErr::TooLarge)),
+            Landing::Failed(libc::EFBIG)
+        );
+        for e in [WireErr::NotFound, WireErr::Exists, WireErr::Denied] {
+            assert_eq!(Landing::of(wire(e)), Landing::Failed(libc::EIO));
+        }
+        assert_eq!(
+            Landing::of(Err(RpcError::Closed)),
+            Landing::Failed(libc::EIO)
+        );
+        assert_eq!(
+            Landing::of(Err(RpcError::Timeout)),
+            Landing::Failed(libc::EIO)
+        );
+    }
+
+    #[test]
+    fn mk_async_returns_before_the_host_answers_and_tells_the_settler() {
+        let r = held_rig("mk-async");
+        let d = RelPath::new("d").unwrap();
+        let jobs = r.w.jobs();
+        r.w.mk_async(&d, Mk::Dir { perm: 0o755 }, (4, 2)).unwrap();
+        until("the mk", || sent(&r) == 1);
+        assert!(jobs.try_recv().is_err(), "nothing answered yet");
+        assert!(!r.w.drain(Instant::now() + Duration::from_millis(20)));
+
+        r.script.answer(Err(RpcError::Wire(WireErr::Exists)));
+        let want = Job::Landed {
+            node: 4,
+            born: 2,
+            mk: true,
+            what: Landing::Failed(libc::EIO),
+        };
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(want));
+        r.w.landed_done();
+        assert!(r.w.drain(Instant::now()));
     }
 }
