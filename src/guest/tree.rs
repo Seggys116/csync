@@ -1102,6 +1102,12 @@ impl GTree {
             && (n.open.load(Relaxed) > 0 || n.read_ver.is_some());
         let conflict = content && n.staging.is_some();
         let show = on && was == Vis::Live && self.reachable(id);
+        if on && super::coherence::watched(name) {
+            super::coherence::trace(format_args!(
+                "host update {name} content={content} perm={perm} mtime={mtime} times={times} show={show} warm={warm} old_size={} new_size={} old_mtime={} new_mtime={} hash_moved={hash_moved}",
+                n.meta.size, meta.size, n.meta.mtime_ns, meta.mtime_ns
+            ));
+        }
         let kind = meta.kind;
         let hash = meta.hash;
         let n = self.get_mut(id)?;

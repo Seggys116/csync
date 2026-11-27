@@ -1783,6 +1783,27 @@ impl GuestFs {
                 .is_some_and(|i| i.recognises(req.pid(), &act))
     }
 
+    // TRACE: the name of a watched node
+    fn trace_name(&self, ino: NodeId) -> Option<String> {
+        let t = self.core.t();
+        let n = t.get(ino)?;
+        coherence::watched(n.name.as_str()).then(|| n.name.as_str().to_owned())
+    }
+
+    // TRACE: an attribute reply for a watched node
+    fn trace_attr(&self, what: &str, ino: NodeId, a: &FileAttr, ttl: &Duration) {
+        if let Some(nm) = self.trace_name(ino) {
+            let mt = a
+                .mtime
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let st = format!("size={} mtime_ns={mt} ino={} ttl={ttl:?}", a.size, a.ino.0);
+            if coherence::trace_due(&format!("{what} {nm}"), &st) {
+                coherence::trace(format_args!("{what} {nm} {st}"));
+            }
+        }
+    }
+
     fn add_handle(&self, h: Handle) -> u64 {
         let fh = self.next.fetch_add(1, Relaxed);
         lock(&self.handles).insert(fh, Arc::new(h));
@@ -4030,6 +4051,19 @@ impl Filesystem for GuestFs {
                     #[cfg(target_os = "macos")]
                     coherence::PROBE.lookup(id);
                     if let Some(n) = t.get(id) {
+                        if coherence::watched(name)
+                            && coherence::trace_due(
+                                &format!("lookup {name}"),
+                                &format!("found {:?}", n.vis),
+                            )
+                        {
+                            coherence::trace(format_args!(
+                                "lookup {name} found ino={id} size={} vis={:?} ttl={:?}",
+                                n.kernel_size(),
+                                n.vis,
+                                ttl_of(n)
+                            ));
+                        }
                         return reply.entry(
                             &ttl_of(n),
                             &self.core.entry_attr(&t, id, n),
@@ -4089,7 +4123,10 @@ impl Filesystem for GuestFs {
         #[cfg(target_os = "macos")]
         coherence::PROBE.getattr(ino.0);
         match self.core.live_attr(ino.0) {
-            Ok((a, ttl, _)) => self.attr_reply(ino.0, &ttl, &a, reply),
+            Ok((a, ttl, _)) => {
+                self.trace_attr("getattr", ino.0, &a, &ttl);
+                self.attr_reply(ino.0, &ttl, &a, reply)
+            }
             // an unlinked overlay file is still reachable through a descriptor that stays open
             Err(e) => match self.open_local_stat(ino.0, fh) {
                 Some((a, ttl)) => reply.attr(&ttl, &a),
@@ -4124,11 +4161,23 @@ impl Filesystem for GuestFs {
         // the self-test's truncate is answered as an injected one: the reply, not a truncate, sets the size
         #[cfg(target_os = "macos")]
         let inj = self.is_inj(req, act) || coherence::PROBE.setattr(ino.0);
+        if self.trace_name(ino.0).is_some() {
+            coherence::trace(format_args!(
+                "setattr {} ino={} is_inj={inj} size={size:?} mode={mode:?} fh={:?} pid={}",
+                self.trace_name(ino.0).unwrap_or_default(),
+                ino.0,
+                fh.map(|f| f.0),
+                req.pid()
+            ));
+        }
         if !inj && let Err(e) = self.do_setattr(ino.0, mode, uid, gid, size, atime, mtime, fh) {
             return reply.error(e);
         }
         match self.core.live_attr(ino.0) {
-            Ok((a, ttl, _)) => self.attr_reply(ino.0, &ttl, &a, reply),
+            Ok((a, ttl, _)) => {
+                self.trace_attr("setattr reply", ino.0, &a, &ttl);
+                self.attr_reply(ino.0, &ttl, &a, reply)
+            }
             Err(e) => match self.open_local_stat(ino.0, fh) {
                 Some((a, ttl)) => reply.attr(&ttl, &a),
                 None => reply.error(e),
@@ -4362,6 +4411,15 @@ impl Filesystem for GuestFs {
     ) {
         self.core.ctr.op(Op::Open);
         let reading = flags.acc_mode() == OpenAccMode::O_RDONLY;
+        if let Some(nm) = self.trace_name(ino.0) {
+            coherence::trace(format_args!(
+                "open {nm} ino={} flags={:#x} is_inj={} pid={}",
+                ino.0,
+                flags.0,
+                self.is_inj(req, Act::Open(ino.0, !reading)),
+                req.pid()
+            ));
+        }
         if self.is_inj(req, Act::Open(ino.0, !reading)) {
             let nf = self.noflush(&Src::Empty);
             let live = lock(&self.io).get(&ino.0).and_then(|e| e.backing.upgrade());
@@ -4626,6 +4684,19 @@ impl Filesystem for GuestFs {
             Src::Blob { .. } if !direct => self.counted(id, io),
             _ => io,
         };
+        if let Some(nm) = self.trace_name(id) {
+            let io_name = match &io {
+                Io::None => "none",
+                Io::Cached => "cached",
+                Io::Fresh => "fresh",
+                Io::Direct => "direct",
+                Io::Pass(_) => "pass",
+            };
+            coherence::trace(format_args!(
+                "open {nm} reply io={io_name} direct={direct} keep={keep} keep_cache_flag={}",
+                coherence::keep_cache()
+            ));
+        }
         self.reply_new(reply, Handle { node: id, io, src });
     }
 
@@ -4644,6 +4715,15 @@ impl Filesystem for GuestFs {
         let Some(h) = self.handle(fh.0) else {
             return reply.error(Errno::EBADF);
         };
+        if let Some(nm) = self.trace_name(h.node) {
+            let ver = match &h.src {
+                Src::Blob { ver, .. } => format!("blob size={} hash={:02x?}", ver.size, &ver.hash[..4]),
+                _ => "other".to_owned(),
+            };
+            coherence::trace(format_args!(
+                "read {nm} offset={offset} size={size} src={ver}"
+            ));
+        }
         let want = size.min(IO_MAX) as usize;
         if let Some((cur, path)) = self.moved_on(&h) {
             let cur = match cur {
@@ -5274,12 +5354,18 @@ pub struct Switch {
 
 impl Inval {
     pub fn inode(&self, id: NodeId) {
-        let _ = self.0.inval_inode(INodeNo(id), 0, 0);
+        let r = self.0.inval_inode(INodeNo(id), 0, 0);
+        if id != ROOT {
+            coherence::trace(format_args!("inval_inode {id} -> {r:?}"));
+        }
     }
 
     // attributes only: takes no inode or page lock, so a request thread may send it
     pub fn attrs(&self, id: NodeId) {
-        let _ = self.0.inval_inode(INodeNo(id), -1, 0);
+        let r = self.0.inval_inode(INodeNo(id), -1, 0);
+        if id != ROOT {
+            coherence::trace(format_args!("inval_attrs {id} -> {r:?}"));
+        }
     }
 
     pub fn entry(&self, parent: NodeId, name: &Name) {
@@ -5345,6 +5431,17 @@ impl Core {
                 n.cached.load(Relaxed) > 0,
             )
         });
+        if let Some(n) = self.t().get(id)
+            && coherence::watched(n.name.as_str())
+        {
+            coherence::trace(format_args!(
+                "reload {} ino={id} moved={moved} busy={busy} force={force} shown={:?} page={} size_pending={}",
+                n.name.as_str(),
+                n.shown.map(|v| v.size),
+                n.page.is_some(),
+                n.size_pending
+            ));
+        }
         if !moved {
             lock(&k.1.waiting).remove(&id);
             return k.inode(id);

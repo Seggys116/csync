@@ -196,6 +196,14 @@ mod mac {
         panic!("timed out after {limit:?}: {what}");
     }
 
+    // TRACE timeline marks, on the same clock as the guest's TRACE lines
+    fn mark(what: &str) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() % 1_000_000);
+        eprintln!("TRACE {ms:06} test: {what}");
+    }
+
     // how long after `from` the check first held, polling up to 8s
     fn visible_after(from: Instant, mut f: impl FnMut() -> bool) -> Option<Duration> {
         while from.elapsed() < Duration::from_secs(8) {
@@ -300,6 +308,11 @@ mod mac {
         fs::write(proj.join(".gitignore"), "target/\n").unwrap();
         fs::write(proj.join("hello.txt"), "hello from host\n").unwrap();
         fs::write(proj.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        for shape in ["size", "mtime", "bytes"] {
+            for how in ["read", "fresh"] {
+                fs::write(proj.join(format!("ed_{shape}_{how}.txt")), "alpha one\n").unwrap();
+            }
+        }
         let _unmount = Unmount(mnt.clone());
 
         let hk = csync(&bin, &hh, &["key", "show"]);
@@ -383,6 +396,13 @@ mod mac {
             "pub fn f() {}\n"
         );
 
+        // the `read` files are read and stat'ed through the mount before the host edits them, the `fresh` ones are not
+        for shape in ["size", "mtime", "bytes"] {
+            let p = mnt.join(format!("ed_{shape}_read.txt"));
+            assert_eq!(fs::read_to_string(&p).unwrap(), "alpha one\n");
+            let _ = fs::metadata(&p).unwrap();
+        }
+
         // host changes show on the mount inside the attribute lifetime plus slack; each shape is timed on its own
         // and all are asserted at the end of the test
         let mw = Watch::start(&mnt);
@@ -399,9 +419,77 @@ mod mac {
         let t = Instant::now();
         fs::write(proj.join("src/lib.rs"), "pub fn g() {}\n").unwrap();
         let edited = visible_after(t, || reads("src/lib.rs", "pub fn g() {}\n"));
+        // edits of a synced file by what changes: the size, only the mtime, only the bytes; each on a file the test
+        // read before the edit and on one it did not touch
+        const T_FIXED: u64 = 1_700_000_000;
+        let fixed = std::time::UNIX_EPOCH + Duration::from_secs(T_FIXED);
+        let set_mtime = |p: &std::path::Path, t: std::time::SystemTime| {
+            fs::File::options()
+                .write(true)
+                .open(p)
+                .and_then(|f| f.set_modified(t))
+                .unwrap();
+        };
+        let mut edits: Vec<(String, Option<Duration>, String)> = Vec::new();
+        for how in ["read", "fresh"] {
+            for shape in ["size", "mtime", "bytes"] {
+                let name = format!("ed_{shape}_{how}.txt");
+                let host = proj.join(&name);
+                let mnt_p = mnt.join(&name);
+                let old_mtime = fs::metadata(&host).unwrap().modified().unwrap();
+                let seen = std::cell::RefCell::new(String::new());
+                let t = Instant::now();
+                mark(&format!("host edits {name}"));
+                let probe: Box<dyn FnMut() -> bool> = match shape {
+                    "size" => {
+                        fs::write(&host, "alpha twelve\n").unwrap();
+                        Box::new(|| {
+                            let c = fs::read_to_string(&mnt_p).unwrap_or_default();
+                            let m = fs::metadata(&mnt_p).ok();
+                            *seen.borrow_mut() = format!(
+                                "size={:?} read={c:?}",
+                                m.map(|m| std::os::unix::fs::MetadataExt::size(&m))
+                            );
+                            c == "alpha twelve\n"
+                        })
+                    }
+                    "mtime" => {
+                        fs::write(&host, "alpha one\n").unwrap();
+                        set_mtime(&host, fixed);
+                        Box::new(|| {
+                            let m = fs::metadata(&mnt_p).ok();
+                            let secs = m
+                                .as_ref()
+                                .map(std::os::unix::fs::MetadataExt::mtime)
+                                .unwrap_or(0);
+                            *seen.borrow_mut() = format!("mtime={secs}");
+                            secs == T_FIXED as i64
+                        })
+                    }
+                    _ => {
+                        fs::write(&host, "alpha ONE\n").unwrap();
+                        set_mtime(&host, old_mtime);
+                        Box::new(|| {
+                            let c = fs::read_to_string(&mnt_p).unwrap_or_default();
+                            *seen.borrow_mut() = format!("read={c:?}");
+                            c == "alpha ONE\n"
+                        })
+                    }
+                };
+                let mut probe = probe;
+                let d = visible_after(t, &mut probe);
+                drop(probe);
+                let last = seen.borrow().clone();
+                mark(&format!("{name}: {d:?} (last seen: {last})"));
+                edits.push((name, d, last));
+            }
+        }
         let t = Instant::now();
         fs::write(proj.join("third.txt"), "three\n").unwrap();
         let after_listing = visible_after(t, || reads("third.txt", "three\n"));
+        for (name, d, last) in &edits {
+            eprintln!("edit shape {name}: {d:?} (last seen: {last})");
+        }
         eprintln!(
             "host changes on the mount: new file by listing {by_listing:?}, new file by lookup {by_lookup:?}, edit of a synced file {edited:?}, new file by lookup after a listing {after_listing:?}"
         );
@@ -411,7 +499,11 @@ mod mac {
             ("new file by lookup", by_lookup),
             ("edit of a synced file", edited),
             ("new file by lookup after a listing", after_listing),
-        ];
+        ]
+        .into_iter()
+        .map(|(l, d)| (l.to_owned(), d))
+        .chain(edits.iter().map(|(n, d, _)| (format!("edit {n}"), *d)))
+        .collect::<Vec<_>>();
 
         // a guest create, write and close reaches the host byte for byte
         mw.drain();

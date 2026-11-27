@@ -413,6 +413,44 @@ fn own_ident() -> Seen {
 }
 
 // runs on the injector thread right after the mount and leaves the policy applied
+// TRACE diagnostics, never to be merged
+pub fn trace(args: std::fmt::Arguments<'_>) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() % 1_000_000);
+    eprintln!("TRACE {ms:06} {args}");
+}
+
+// TRACE: true when this key's state changed or a second passed since it was last printed
+pub fn trace_due(key: &str, state: &str) -> bool {
+    use std::{collections::HashMap, sync::Mutex};
+    static LAST: Mutex<Option<HashMap<String, (String, Instant)>>> = Mutex::new(None);
+    let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let m = g.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    match m.get(key) {
+        Some((s, t)) if s == state && now.duration_since(*t) < Duration::from_secs(1) => false,
+        _ => {
+            m.insert(key.to_owned(), (state.to_owned(), now));
+            true
+        }
+    }
+}
+
+// TRACE: the names the test edits on the host
+pub fn watched(name: &str) -> bool {
+    name.starts_with("ed_") || name == "lib.rs"
+}
+
+// TRACE: experiment switches from CSYNC_TRACE_FIX, a comma list
+pub fn fix(name: &str) -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<String> = OnceLock::new();
+    F.get_or_init(|| std::env::var("CSYNC_TRACE_FIX").unwrap_or_default())
+        .split(',')
+        .any(|x| x == name)
+}
+
 pub fn run(env: &Env<'_>, backend: BackendKind) -> Coherence {
     let own = own_ident();
     let obs = observe(env, &PROBE, own).unwrap_or_else(|_| ProbeObs::unverified(own));

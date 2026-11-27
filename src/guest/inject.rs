@@ -491,6 +491,78 @@ fn mode(perm: u16) -> Mode {
     Mode::from_bits_truncate((u32::from(perm) & 0o7777) as _)
 }
 
+// TRACE: what the kernel reports for a descriptor the injector holds
+#[cfg(target_os = "macos")]
+fn trace_view(label: &str, fd: &OwnedFd) {
+    let r = rustix::fs::fstat(fd).map(|s| (s.st_size, s.st_mtime, s.st_mtime_nsec, s.st_ino));
+    super::coherence::trace(format_args!("injector view {label}: size/mtime/mtime_ns/ino {r:?}"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trace_view(_label: &str, _fd: &OwnedFd) {}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn nocache(fd: &OwnedFd) -> i32 {
+    use std::os::fd::AsRawFd;
+    // SAFETY: fcntl on a descriptor this function borrows, with an integer argument
+    unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_NOCACHE, 1) }
+}
+
+// TRACE: extra operations through the mount after the injected truncate, chosen by CSYNC_TRACE_NUDGE
+#[cfg(target_os = "macos")]
+fn nudges(root: &OwnedFd, fd: &OwnedFd, path: &str, size: u64, perm: u16, node: NodeId, w: &Worker) {
+    use rustix::fs::{Timespec, Timestamps, UTIME_NOW};
+    let Ok(kinds) = std::env::var("CSYNC_TRACE_NUDGE") else {
+        return;
+    };
+    for k in kinds.split(',').filter(|k| !k.is_empty()) {
+        let t0 = std::time::Instant::now();
+        let _w = w.arm(&[Act::Setattr(node, true), Act::Open(node, true)]);
+        let res: String = match k {
+            "plus" => {
+                let a = rustix::fs::ftruncate(fd, size + 1);
+                let b = rustix::fs::ftruncate(fd, size);
+                format!("{a:?} {b:?}")
+            }
+            "utimes" => {
+                let now = Timespec { tv_sec: 0, tv_nsec: UTIME_NOW as _ };
+                let ts = Timestamps { last_access: now, last_modification: now };
+                format!("{:?}", rustix::fs::futimens(fd, &ts))
+            }
+            "nocache" => format!("{}", nocache(fd)),
+            "fsync" => format!("{:?}", rustix::fs::fsync(fd)),
+            "chmod" => format!(
+                "{:?}",
+                rustix::fs::chmodat(root, path, mode(perm), AtFlags::empty())
+            ),
+            "renameself" => format!("{:?}", rustix::fs::renameat(root, path, root, path)),
+            "readthrough" => {
+                let r = rustix::fs::openat(
+                    root,
+                    path,
+                    OFlags::RDONLY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                match r {
+                    Ok(f) => {
+                        let mut buf = [0u8; 64];
+                        let n = rustix::io::read(&f, &mut buf);
+                        format!("{n:?} {:?}", String::from_utf8_lossy(&buf[..n.unwrap_or(0)]))
+                    }
+                    Err(e) => format!("open {e:?}"),
+                }
+            }
+            _ => "unknown".to_owned(),
+        };
+        super::coherence::trace(format_args!("nudge {k}: {res} in {:?}", t0.elapsed()));
+        trace_view(&format!("after {k}"), fd);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn nudges(_: &OwnedFd, _: &OwnedFd, _: &str, _: u64, _: u16, _: NodeId, _: &Worker) {}
+
 fn open_root(mount: &Path) -> Option<OwnedFd> {
     rustix::fs::open(mount, ROOT_FLAGS, Mode::empty()).ok()
 }
@@ -680,6 +752,9 @@ impl Worker {
                 if kind == Kind::Symlink {
                     return Ok(());
                 }
+                super::coherence::trace(format_args!(
+                    "injector modify node={node} path={a:?} kind={kind:?} perm={perm:o} size={size}"
+                ));
                 if matches!(s, Synth::Modify { .. }) && kind == Kind::File && perm & 0o200 != 0 {
                     // truncating to the current size raises IN_MODIFY without touching content
                     let opened = {
@@ -700,7 +775,24 @@ impl Worker {
                         }
                         Ok(fd) => {
                             let _w = self.arm(&[Act::Setattr(*node, true)]);
-                            return Ok(rustix::fs::ftruncate(&fd, size)?);
+                            let watch = a
+                                .rsplit('/')
+                                .next()
+                                .is_some_and(super::coherence::watched);
+                            if watch {
+                                trace_view("before ftruncate", &fd);
+                            }
+                            let t0 = std::time::Instant::now();
+                            let r = rustix::fs::ftruncate(&fd, size);
+                            if watch {
+                                super::coherence::trace(format_args!(
+                                    "injector ftruncate node={node} size={size} -> {r:?} in {:?}",
+                                    t0.elapsed()
+                                ));
+                                trace_view("after ftruncate", &fd);
+                                nudges(root, &fd, a.as_str(), size, perm, *node, self);
+                            }
+                            return Ok(r?);
                         }
                         Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::TXTBSY) => {}
                         Err(e) => return Err(e.into()),
