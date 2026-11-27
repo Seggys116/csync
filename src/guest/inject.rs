@@ -837,6 +837,12 @@ impl Worker {
                                 trace_view("after ftruncate", &fd);
                                 nudges(root, &fd, a.as_str(), size, perm, *node, self);
                             }
+                            // TRACE experiment: truncating to 0 and back drops the kernel's pages on FSKit
+                            #[cfg(target_os = "macos")]
+                            if r.is_ok() && size > 0 && super::coherence::fix("zeroinval") {
+                                let _ = rustix::fs::ftruncate(&fd, 0);
+                                let _ = rustix::fs::ftruncate(&fd, size);
+                            }
                             return Ok(r?);
                         }
                         Err(Errno::ACCESS | Errno::PERM | Errno::ROFS | Errno::TXTBSY) => {}

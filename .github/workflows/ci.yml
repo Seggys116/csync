@@ -145,14 +145,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-15, variant: direct, fix: direct }
-          - { os: macos-15, variant: zero, nudge: zero }
-          - { os: macos-15, variant: msync, nudge: msync }
-          - { os: macos-15, variant: noubc, opts: noubc }
-          - { os: macos-15, variant: nolocalcaches, opts: nolocalcaches }
-          - { os: macos-15, variant: direct_io, opts: direct_io }
-          - { os: macos-15, variant: auto_cache, opts: auto_cache }
-          - { os: macos-15, variant: settle, probe: settle }
+          - { os: macos-15, variant: zeroinval-a, fix: zeroinval }
+          - { os: macos-15, variant: zeroinval-b, fix: zeroinval }
+          - { os: macos-26, variant: zeroinval, fix: zeroinval }
+          - { os: macos-26, variant: base-control }
     env:
       CSYNC_BIN: ${{ github.workspace }}/target/release/csync
       FSKIT_ID: io.macfuse.app.fsmodule.macfuse
