@@ -164,6 +164,13 @@ mod mac {
             .any(|l| l.contains(&needle))
     }
 
+    fn mount_table() -> String {
+        Command::new("/sbin/mount")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    }
+
     fn csync(bin: &Path, home: &Path, args: &[&str]) -> String {
         let out = Command::new(bin)
             .args(args)
@@ -337,7 +344,21 @@ mod mac {
         );
         guest.wait_line("the guest mount", START, |l| l.starts_with("mounted "));
         assert!(guest.alive(), "the guest exited after mounting");
-        assert!(mounted(&mnt), "no mount in the mount table at {m}");
+        let t_mount = Instant::now();
+        while !mounted(&mnt) {
+            assert!(
+                t_mount.elapsed() < Duration::from_secs(30),
+                "the guest reported mounted but the mount table has no mount at {m} after 30s:\n{}\nguest alive: {}\n{}",
+                mount_table(),
+                guest.alive(),
+                guest.dump()
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!(
+            "mount table entry appeared {:?} after the guest reported mounted",
+            t_mount.elapsed()
+        );
         let state = gh.join("state/hosts").join(&host_fpr);
         assert!(state.is_dir(), "no guest state at {}", state.display());
 

@@ -234,7 +234,7 @@ jobs:
         run: |
           mount | grep -i -E 'fuse|csync|fskit' || echo "nothing fuse-like in the mount table"
           log show --predicate 'process CONTAINS "macfuse" OR process CONTAINS "csync" OR subsystem CONTAINS "fskit" OR process CONTAINS "fskit"' --last 15m --style compact 2>&1 \
-            | grep -i -E 'macfuse|csync|error|fail|denied|not enabled' | tail -120 || true
+            | grep -a -i -E 'io.macfuse|fskitd|fskit_agent|mount|not enabled|denied' | grep -a -v -E 'Security|CoreAnalytics|libsqlite3|xpc:connection' | tail -80 || true
 
   install-scripts:
     runs-on: ubuntu-24.04
