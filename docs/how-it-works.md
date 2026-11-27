@@ -1,6 +1,6 @@
 # How csync works
 
-csync keeps one project directory on a macOS host and a FUSE mount on a Linux guest in step, in both directions. This page covers the design behind the README: the components, what happens on a read or a write, ignore rules, the wire protocol, trust, and how it fails.
+csync keeps one project directory on a macOS host and a FUSE mount on a Linux guest (or, experimentally, a macOS guest) in step, in both directions. This page covers the design behind the README: the components, what happens on a read or a write, ignore rules, the wire protocol, trust, and how it fails.
 
 ## Purpose
 
@@ -15,27 +15,85 @@ When both sides change the same file, the later write is checked against the ver
 | Part | What it does |
 |---|---|
 | Watcher | FSEvents on macOS, inotify on Linux. FSEvents keeps a resume token (volume UUID and last event id) so a restart can replay what happened while the host was down. inotify watches only directories that are synced or under `.git`. |
-| Index and journal | An in-memory tree of every synced path with its stat key, BLAKE3 content hash and a sequence number. Each change is also appended to a journal of up to 262,144 entries so a guest that reconnects can be sent only what it missed. The index (not the journal) is saved to disk every 60 s when it changed, and on exit. |
-| Applier | Merges watcher bursts, stats each path, hashes only files whose stat key changed, updates the index and pushes the resulting changes to guests. |
+| Index and journal | An in-memory tree of every synced path with its stat key, a sequence number and, once known, its BLAKE3 content hash. The scan does not read file contents, so a non-empty file starts without a hash ("pending"); see [lazy hashing](#lazy-hashing). Each change is also appended to a journal of up to 262,144 entries so a guest that reconnects can be sent only what it missed. The index (not the journal) is saved to disk every 60 s when it changed, and on exit, and the saved index can contain pending entries. |
+| Hasher | Two low-priority threads that fill in the hashes of pending files in the background and push them to guests. See [lazy hashing](#lazy-hashing). |
+| Applier | Merges watcher bursts, stats each path, reads and hashes a file at once only when its stat key changed, updates the index and pushes the resulting changes to guests. |
 | Committer | One thread that applies every guest write in order: commits, mkdir, symlink, remove, rename and attribute changes. |
-| Serve pool | Four threads that answer guest fetches: whole files, byte ranges, batches of small files and deltas. |
+| Serve pool | Four threads that answer guest requests: whole files, byte ranges, batches of small files, deltas, version resolution and hash lookups. |
 
-### Guest (`csync join`, Linux only)
+### Guest (`csync join`, Linux; macOS is experimental)
 
 | Part | What it does |
 |---|---|
-| FUSE mount | Built on `fuser`, 8 worker threads. Lookups, `getattr` and `readdir` are answered from memory without a round trip. |
-| In-memory tree | The whole metadata tree, received as a snapshot on connect and kept current by pushed changes. It is saved as `tree.rkyv` so the next join can ask only for changes. |
-| Blob cache | File contents stored by content hash on local disk. A new blob is checked against its hash before it is stored. |
-| Overlay | Paths the host's ignore rules exclude (`target/`, `node_modules/`, `.env` and so on) live only on the guest, in a private overlay directory, and stay there. |
-| Prefetch | After each connect it fetches ignore files, common manifests (`Cargo.toml`, `package.json`, `go.mod` and others) and git metadata first, then warms every file up to 1 MiB breadth-first until the cache is 90% full. It runs at a lower CPU priority and yields while a write waits on the host. |
+| FUSE mount | On Linux, built on `fuser`, 8 worker threads. On macOS it goes through csync's own binding to macFUSE's `libfuse3` (see [the macOS guest](#the-macos-guest-experimental)). Lookups, `getattr` and `readdir` are answered from memory without a round trip. |
+| In-memory tree | The whole metadata tree, received as a snapshot on connect and kept current by pushed changes. It lives only in memory: nothing is saved to disk, and every join starts from a fresh snapshot. A link that drops inside a running session still resumes by sequence number. |
+| Blob cache | File contents stored by content hash on local disk. A new blob is checked against its hash before it is stored. The cache belongs to one session: it is deleted when the session ends. |
+| Overlay | Paths the host's ignore rules exclude (`target/`, `node_modules/`, `.env` and so on) live only on the guest, in a private overlay directory, for as long as the session runs. The overlay is deleted when the session ends, so build outputs, `node_modules` and virtual environments are rebuilt on the next join. |
+| Session wipe | When a guest closes its session (the `q` key, SIGINT, SIGTERM, a revoked or forgotten host, or an error) csync unmounts, then deletes this host's whole state directory and blob cache. Only the identity, the trust file and the host key are kept, so the next join needs no new pairing. If the mount cannot be released the wipe is skipped, and a message on the status line says so. See [failure behaviour](#failure-behaviour). |
+| Prefetch | After each connect it fetches ignore files, common manifests (`Cargo.toml`, `package.json`, `go.mod` and others) and git metadata first, then warms every file up to 1 MiB breadth-first until the cache is 90% full. Files whose hash is not known yet are fetched by version, many in one round trip. It runs at a lower CPU priority and yields while a write waits on the host. |
 | Injector | Replays host changes through the mount itself so inotify watchers on the guest see them. See [a host edit reaching the guest](#a-host-edit-reaching-the-guest). |
+
+### The macOS guest (experimental)
+
+`csync join` is also implemented for macOS. The code is written but it has not been run against a real macFUSE mount, so treat everything below as the design, not as measured behaviour.
+
+What is implemented:
+
+- **Binding.** csync has its own binding to macFUSE's `libfuse3`, loaded with `dlopen` from `/usr/local/lib/libfuse3.4.dylib` when `csync join` starts, so the binary needs no macFUSE at build or install time. If the library is missing, not owned by root, or older than macFUSE 5.5, `csync join` exits with code 3 and a message that says what to install.
+- **Backends.** It mounts with the FSKit (user-space) backend first and falls back to the macFUSE kernel extension. FSKit needs macOS 15.4 or later and the FSKit extension enabled; the kernel extension needs to be allowed with Reduced Security on Apple silicon.
+- **Mount options.** `noappledouble`, `noapplexattr` and `nobrowse`, besides `nodev`, `nosuid`, `noatime` and `default_permissions`. They keep `._*` files and Finder volume entries out of the project. A `.DS_Store` that Finder left as the only entry of the mount point is removed before mounting; any other content makes `csync join` refuse the directory.
+- **Attribute lifetime.** FSKit has no kernel invalidation, so the guest cannot ask the kernel to drop a cached inode or entry as it does on Linux. Attribute and entry lifetimes on the mount are therefore short, and the mechanism that makes a host change visible is the injected operations described under [event injection](#event-injection), not invalidation.
+- **Overlay.** Ignored paths live in `overlay.noindex` inside the host's state directory, a name that Spotlight does not index. Like the Linux overlay it is deleted when the session ends.
+- **Names.** Lookups are exact: `cat README.md` does not find `readme.md`, even though the default macOS volume folds case.
+
+What is not known until it has been run:
+
+- whether FSEvents reports the operations the injector performs through the mount, which is what a watcher such as a dev server relies on;
+- whether the FSKit backend keeps its caches coherent with a host edit that arrives while a file is open;
+- throughput and latency, for either backend.
+
+Missing on macOS compared with Linux: no kernel passthrough, no writeback cache and no `readdirplus`, so every read of a synced file and every directory listing goes through csync.
+
+## Lazy hashing
+
+The host does not read file contents to start. The scan (`cook` in `src/index/scan.rs`) records each entry's stat key and reads no file to hash it (it reads only the `.gitignore` files it needs for ignore rules), so the content hash of a file is not known when the index is first built:
+
+- A non-empty regular file with no hash already in the index is indexed as pending (`Meta.hash` is empty). An empty file gets the hash of empty content at once. A rescan, for example after a restart without a usable FSEvents resume token, keeps a known hash when the stat key is unchanged and leaves a new or changed file pending.
+- Changes the watcher reports are different: the applier still reads and hashes a file whose stat key changed before it enters the index.
+- Starting to index is therefore a metadata walk. Measured once on a tree of 198,640 entries on an M4 Mac that was under heavy load, a cold start to a complete index took about 0.6 to 1.5 s. The earlier design, which hashed every file during the scan, took about 6 to 7 s on that tree, and a parallel walk that still hashed took about 3.5 s. These figures come from that one tree and that machine state.
+
+The walk itself is parallel and per directory. It uses up to `min(cores, 8)` workers, which start once enough directories are queued to share. Each directory is read by one worker through a descriptor handed down from its parent, and the per-directory results are merged into the tree in breadth-first order from the root.
+
+### Versions
+
+The content version `ver` of a file is the sequence number of its host index entry, qualified by the index identity as a `VerKey` (index id, `ver`, size). A hash that is filled in later does not change the entry's sequence number, so a `VerKey` names a version before anyone has its hash. When the host observes the file change, the entry gets a new sequence number, so an old `VerKey` stops matching.
+
+### The host hasher
+
+`src/host/hasher.rs` runs two threads at lower priority that hash pending files in this order:
+
+1. directories a guest has asked about,
+2. rule files, common manifests and the `.git` files git reads first,
+3. files up to 1 MiB,
+4. everything else.
+
+The threads wait while the host is serving a request or applying a commit, but for at most 50 ms at a time. They read with plain BLAKE3 in 4 MiB reads. A hash is accepted only if the file's stat key (including ctime) is the same after the read as before, and only if the index entry is still the same version; otherwise it is dropped and the entry stays pending.
+
+Learned hashes are buffered for up to 100 ms (or 8,192 hashes) and pushed to live guests in batches (`Push::Hashes`) on the bulk queue. A push is droppable: a guest whose queue is full misses it. When no pending entry is left, the host sends `Push::HashesDone`, and the guest then asks for whatever hashes it still lacks (`Op::Hashes`). That request is a pure index lookup: it returns a hash only for an entry at exactly the asked sequence number whose hash is already known, and it never hashes.
+
+### What the guest does with hashes
+
+- A pushed or pulled hash is a claim. It only labels a node, and the guest never stores bytes under a hash they do not match: every blob is checked against the hash it was asked for before it enters the cache.
+- Opening a pending file sends `Op::Resolve`. The host hashes the file, checks that it did not change meanwhile and returns the hash, with the bytes inline for a file up to 48 KiB. A longer file is then fetched by that hash as usual.
+- A fetch can also name a version instead of a hash (`Want::Ver`). The prefetcher uses this with `FetchMany` to warm many pending files in one round trip.
+- Rule files never depend on the background hasher. Before the mount, the guest fetches its pending rule files by version in batches (`resolve_pending` in `src/guest/mod.rs`), so ignore rules are known first.
+- A guest operation on a pending file carries `Expect::Ver`, described under [compare-and-swap](#compare-and-swap-on-the-host). The guest never sends `Expect::Any` for a file it knows from the host.
 
 ## The life of a read
 
-1. `open` on the guest finds the node in memory. If the blob is in the cache and complete, the file is served from it.
+1. `open` on the guest finds the node in memory. If the file's hash is known and the blob is in the cache and complete, the file is served from it.
 2. csync answers each `read` from the blob file, and the kernel keeps those pages cached across opens until the content changes, so a warm file is read from memory. Synced files are not read through FUSE passthrough; see Passthrough under [known limitations](#known-limitations) for why.
-3. On a cache miss, the first `read` sends one fetch for that content hash. Concurrent readers of the same hash share it. The read waits only for the bytes it asked for.
+3. On a cache miss, the first `read` sends one fetch for that content hash. Concurrent readers of the same hash share it. The read waits only for the bytes it asked for. If the hash is not known yet, the open first resolves the version (see [lazy hashing](#lazy-hashing)), which also brings the bytes of a file up to 48 KiB.
 4. Files of 64 MiB or more are fetched in 4 MiB ranges into a sparse blob. Files between 1 MiB and 32 MiB whose previous version is still cached are fetched as a delta against it.
 5. A cold open also hints the prefetcher, which fetches small siblings in the same directory (each up to 256 KiB, 4 MiB in total). Eight cold opens within 50 ms make the prefetcher favour the directories being scanned.
 
@@ -49,12 +107,14 @@ The host serves only files that are in its index as synced or `.git` content, an
 2. Writes go to the staging copy.
 3. On `close` (FUSE flush) or `fsync`, if the content changed, the guest hashes it and sends a commit carrying the base version. The body is inline up to 48 KiB, a delta for files between 1 MiB and 32 MiB when the base is cached, and streamed in chunks otherwise.
 
+Every close of any copy of a file descriptor counts, so a shell redirection (`exec 3<>f; printf A >&3` closes a duplicate of the descriptor when it restores stdout) or a child process that inherits the descriptor and exits commits the write at that moment, not when the original descriptor is closed. A host program that read the file before that commit and then saves its older copy overwrites the guest write, and csync cannot detect it, because host writes are plain filesystem writes with no compare-and-swap.
+
 ### Compare-and-swap on the host
 
 The committer applies a commit only if the file on disk still matches the base:
 
 1. It writes the new content to a temporary file named `.csync~...` in the destination directory, created with `O_EXCL` and never following symlinks.
-2. It opens the destination and checks its current hash (taken from the index when the stat key matches, hashed otherwise). If that is not the base, it replies with a conflict that carries the current version, and its bytes when they fit in 48 KiB.
+2. It opens the destination and checks it against the base the guest sent. A base that is a hash (`Expect::Is`) is compared with the file's current hash, taken from the index when the stat key matches and computed on the spot otherwise, so it is never an unverified hash. For a file whose hash the guest does not know yet the base is a version (`Expect::Ver`): it holds only if the index entry's sequence number equals that version and the file's live stat key still equals the indexed one. If the base does not hold, it replies with a conflict that carries the current version, and its bytes when they fit in 48 KiB.
 3. It swaps the temporary file and the destination in one atomic rename-exchange, then checks that the old inode was not modified in the meantime. If it was, it swaps back and replies with a conflict. Otherwise it removes the old file.
 4. It records the new stat key and hash in the index, so when the watcher reports the write it matches the index and is not sent out a second time. Other guests receive the change; the guest that made it does not.
 
@@ -146,7 +206,7 @@ When an ignore file changes on the host, the affected subtree is reclassified. P
 
 A guest may edit ignore files, but those edits can only narrow what is synced. Until the host itself changes the file, the host keeps applying the last rules it trusted as well as the guest's version, so a guest cannot expose an ignored file such as `.env` by deleting or rewriting a `.gitignore`.
 
-When a guest's own `.gitignore` edit makes entries it can already see ignored, they move into its overlay with their content and times instead of disappearing. Tools rely on this: `python -m venv`, meson, pytest, mypy and ruff fill a directory and then write a `*` `.gitignore` into it. Such a self-ignoring `.gitignore` keeps governing its directory on the guest, as it does in git, including after a restart. The host keeps the copies it received before the rule existed, as ignored files it never sends back. When the guest later removes the directory, the host also removes those leftovers if they are only empty directories, symlinks that stay inside, and `.gitignore` files this guest wrote; a regular file among them stays, and the removal fails with `ENOTEMPTY` until it is deleted on the host.
+When a guest's own `.gitignore` edit makes entries it can already see ignored, they move into its overlay with their content and times instead of disappearing. Tools rely on this: `python -m venv`, meson, pytest, mypy and ruff fill a directory and then write a `*` `.gitignore` into it. Such a self-ignoring `.gitignore` keeps governing its directory on the guest, as it does in git, for the rest of the session. The host keeps the copies it received before the rule existed, as ignored files it never sends back. When the guest later removes the directory, the host also removes those leftovers if they are only empty directories, symlinks that stay inside, and `.gitignore` files this guest wrote; a regular file among them stays, and the removal fails with `ENOTEMPTY` until it is deleted on the host.
 
 ### Git on the guest
 
@@ -167,8 +227,9 @@ One TCP connection per guest, encrypted with Noise (see [pairing and trust](#pai
 - **Chunks.** File data travels as chunks outside postcard: one segment holding a request id, an offset and up to 64,000 bytes. Chunks may interleave with message segments, so a large transfer does not hold up control traffic.
 - **Compression.** A message of 512 bytes or more, or a chunk, is lz4-compressed when that saves at least an eighth. For a given transfer the sender stops trying once a chunk compresses to more than 90% of its size. The declared size is checked against the limit before anything is decompressed.
 - **Limits.** After decoding, every list is checked against its bound: 8,192 entries per batch, 65,536 delta signatures, 4 MiB per range request, 64 GiB per file, 1 MiB of excludes text. Names are at most 255 bytes, paths at most 4,096 bytes and 128 components. A message that breaks a limit closes the connection.
-- **Request and response.** The guest sends requests with an id (fetch, fetch-many, commit, mkdir or symlink, remove, rename, set-attributes) and the host answers each by id, or the guest cancels it. At most 256 requests may be in flight; more is a protocol error. The host never sends requests to the guest.
-- **Pushes and acks.** The host pushes snapshot parts, change batches and notices. Each change batch carries a sequence number and the guest acknowledges it.
+- **Request and response.** The guest sends requests with an id (fetch, fetch-many, resolve, hashes, commit, mkdir or symlink, remove, rename, set-attributes) and the host answers each by id, or the guest cancels it. At most 256 requests may be in flight; more is a protocol error. The host never sends requests to the guest.
+- **Pushes and acks.** The host pushes snapshot parts, change batches, notices, hashes learned in the background and a marker that none are left pending (see [lazy hashing](#lazy-hashing)). Each change batch carries a sequence number and the guest acknowledges it; pushed hashes are not acknowledged.
+- **Version.** The protocol version is 2. The version travels in the handshake hello, and a hello with another version fails the handshake as a malformed hello, so a peer on version 1 (csync 0.1.0) never connects and the failure does not name the version. Host and guest must run the same release; `csync update` on both machines does that.
 - **Delta.** Content-defined chunk signatures (fastcdc) of the old version let the other side send only the new parts.
 - **Keepalive and clock.** Each side pings every 30 s. The pong carries the host's clock, from which the guest estimates the clock skew shown in the status.
 
@@ -212,23 +273,25 @@ What it does not protect:
 
 **Threads.** csync uses a fixed set of blocking threads and no async runtime.
 
-- Host: the terminal or line-protocol thread and its input reader, the main session loop, the accept thread plus one short-lived thread per handshake (at most 16), the watcher, the applier, the committer, four fetch threads, the control socket, mDNS, and a reader and a writer per guest (at most 16 guests). Scans and hashing use a rayon pool.
+- Host: the terminal or line-protocol thread and its input reader, the main session loop, the accept thread plus one short-lived thread per handshake (at most 16), the watcher, the applier, the committer, four fetch threads, two background hasher threads, the control socket, mDNS, and a reader and a writer per guest (at most 16 guests). A scan starts up to 8 walker threads for its duration. The applier and committer use a rayon pool.
 - Guest: the terminal or line-protocol thread and its input reader, the session loop (the only thread that sends kernel notifications), 8 FUSE workers, a network reader and writer, the injector, the prefetcher, a rule-file worker, the control socket, and a reconnect thread while the link is down. mDNS browsing stops once a host is chosen.
 
-**Idle.** Threads block in kernel reads or on channels. With nothing changing, the only timers are the 30 s ping on each link and the periodic save, which runs only when there is something to save. The TUI redraws only when the state changes, an animation is running or a deadline is due, and not at all while the terminal is unfocused.
+**Idle.** Threads block in kernel reads or on channels. With nothing changing, the only timers are the 30 s ping on each link and, on the host, the periodic index save, which runs only when there is something to save. A guest never saves its tree. The TUI redraws only when the state changes, an animation is running or a deadline is due, and not at all while the terminal is unfocused.
 
 **Backpressure.** Every queue is bounded.
 
 - Each link has a control queue and a bulk queue for file data. Control messages are always sent first, and each socket write batches up to 1 MiB.
 - At most 64 change batches may be unacknowledged per guest. A guest that falls further behind is marked as lagging and later caught up from the journal, or with a fresh snapshot when the journal no longer covers it.
 - The host runs at most 128 fetches and 64 uploads per guest and answers "busy" beyond that. An upload idle for 60 s is dropped.
-- The guest cache evicts least recently used blobs once it passes its cap, down to 95% of the cap. Blobs of open files are never evicted, and blobs opened in the last 15 minutes go last.
+- The guest cache evicts least recently used blobs once it passes its cap, down to 95% of the cap. The cap bounds one session, because the cache is deleted when it ends. Blobs of open files are never evicted, and blobs opened in the last 15 minutes go last.
 
 ## Failure behaviour
 
-**Host restart.** On start the host loads its saved index. On macOS, if the saved resume token belongs to the same volume, FSEvents replays the events since then. Otherwise, and always on Linux, it rescans in parallel and reuses each hash whose stat key is unchanged. After a clean shutdown the index keeps its identity, so a reconnecting guest usually receives only the changes found since. After a crash the host gives the index a new identity and reconnecting guests receive a full snapshot; cached blobs are reused because the cache is keyed by content. Leftover `.csync~` temporary files older than the new process are removed.
+**Host restart.** On start the host loads its saved index. On macOS, if the saved resume token belongs to the same volume, FSEvents replays the events since then. Otherwise, and always on Linux, it rescans in parallel and reuses each hash whose stat key is unchanged; a new or changed file is left pending and the hasher fills it in. After a clean shutdown the index keeps its identity, so a guest that stayed running through the restart usually receives only the changes found since. After a crash the host gives the index a new identity and running guests receive a full snapshot; their cached blobs are reused because the cache is keyed by content. Leftover `.csync~` temporary files older than the new process are removed.
 
-**Link loss.** The guest shows the host as disconnected and redials with IK, backing off from 100 ms to 5 s. Meanwhile cached files stay readable, overlay paths work normally, and uncached reads and writes to synced files wait for the link up to a deadline of a few seconds (longer for large files), then fail with `EIO`. A write interrupted by the drop is sent again once on the new link; the host answers "done" if it had already landed. On reconnect the guest asks for the changes since the last sequence number it applied.
+**Link loss.** The guest shows the host as disconnected and redials with IK, backing off from 100 ms to 5 s. Meanwhile cached files stay readable, overlay paths work normally, and uncached reads and writes to synced files wait for the link up to a deadline of a few seconds (longer for large files), then fail with `EIO`. A write interrupted by the drop is sent again once on the new link; the host answers "done" if it had already landed. On reconnect the guest asks for the changes since the last sequence number it applied. This resume works only inside a running session, from the tree in memory; it never spans two sessions.
+
+**Session end and fresh joins.** Every join starts clean, with a fresh snapshot from the host, an empty blob cache and an empty overlay. When a guest session ends, csync unmounts and then deletes this host's state directory (the overlay, the marker file `session.live` and anything else in it) and its blob cache directory, so a file the host deleted on purpose can never be restored or sent back by a later join. The wipe never follows symlinks, opens up read-only and no-execute directories (Go module caches are `0555`), keeps going past a failure, and does not cross into another filesystem: a mount found inside the overlay is left alone and reported. It deletes nothing while the mount point is still mounted, while the unmount failed, or while another thread still uses the cache; it then keeps the state, shows a message on the status line and leaves the cleanup to the next join of that host. A guest that is killed, loses power or crashes cannot wipe anything, so `session.live` stays behind: the next `csync join` to that host deletes whatever is left before it loads or mounts anything, and refuses to start if it cannot (also if another csync process holds the cache). Pairing, the identity and the host key are not touched, so no join needs to pair again.
 
 **Stale mounts.** A guest that was killed leaves a mount that answers `ENOTCONN`. `csync join` detects this and clears it with `fusermount3 -uz` before mounting again; `csync doctor` lists such mounts.
 
@@ -241,9 +304,8 @@ What it does not protect:
 - **macOS case-insensitive volumes.** The host probes whether its volume folds case and Unicode normalisation. On a folding volume, names that differ only in case (or only in normalisation) cannot coexist in the synced tree, and the guest refuses to create them with `EEXIST`. Lookups on the guest stay exact: `cat README.md` does not find `readme.md`. A name the host has a volume mounted on fails with `EEXIST` on the guest and is not listed.
 - **macOS host files.** Volumes mounted inside the project (disk images, network shares) are not entered, because FSEvents never reports their changes; guest writes into them fail with `EACCES`. A project on a network volume is not supported. iCloud Drive and File Provider placeholders (dataless files) are never downloaded by the host: they are left out until they are materialised on the Mac. A host file the user cannot change (`chflags uchg`, `uappnd`, an ACL that denies delete, a read-only directory) refuses guest edits with `EACCES`. Because a guest edit replaces the file by rename, an ACL entry that denies only writing does not stop it. Hard links on the host show as independent files on the guest. Extended attribute changes on the host reach the guest as a ctime change only.
 - **Path limits.** Paths deeper than 128 components or longer than 4,096 bytes, and names longer than 255 bytes, are not synced (APFS allows 255 characters, so a long accented or CJK name on the Mac can exceed this and stay host-only). Names starting with `.csync~` are reserved. Guest file names must be valid UTF-8; other names fail with `EINVAL`.
-- **File types.** Regular files, directories and symlinks are synced. FIFOs and Unix sockets can be created in ignored (guest-only) directories, where they work as usual and survive a restart of the guest; in the synced tree `mkfifo` and `bind` fail with `EPERM`, and moving one into the synced tree fails with `EXDEV`. Device nodes are refused everywhere (the mount is `nodev`).
-- **Hard links.** In ignored (guest-only) directories `link` makes a real hard link: every name is the same inode, with one page cache, size and `st_nlink`. The host index has no hard links, so in the synced tree `link` creates an independent copy of the file under the new name: it succeeds and reaches the host as a new file, both names report `st_nlink` 1, and a later write to one name does not change the other. This keeps `tar x`, `cp -a` and `rsync -aH` working on trees that contain hard links. A link between the synced tree and an ignored directory fails with `EXDEV`. After a restart of the guest, two names of one overlay file show as separate inodes that still share their data on disk.
-- **Moves between the synced tree and ignored directories.** Renaming a file or a directory from the synced tree onto an ignored name (`mv src/.tmpX src/target`, as cargo does) or back works: csync copies the entries into the overlay or commits them to the host as new files inside the `rename` call, then removes the source. A directory with more than 4,096 entries or 1 GiB of files, or one holding `.git`, a hard-linked overlay file, or a FIFO or socket bound for the synced tree, fails with `EXDEV`, which makes `mv` fall back to its own copy. If the host changed a file while the move ran, its newer copy stays at the old path and reappears there on the guest.
+- **File types.** Regular files, directories and symlinks are synced. FIFOs and Unix sockets can be created in ignored (guest-only) directories, where they work as usual until the session ends; in the synced tree `mkfifo` and `bind` fail with `EPERM`, and moving one into the synced tree fails with `EXDEV`. Device nodes are refused everywhere (the mount is `nodev`).
+- **Hard links.** In ignored (guest-only) directories `link` makes a real hard link: every name is the same inode, with one page cache, size and `st_nlink`. The host index has no hard links, so in the synced tree `link` creates an independent copy of the file under the new name: it succeeds and reaches the host as a new file, both names report `st_nlink` 1, and a later write to one name does not change the other. This keeps `tar x`, `cp -a` and `rsync -aH` working on trees that contain hard links. A link between the synced tree and an ignored directory fails with `EXDEV`.- **Moves between the synced tree and ignored directories.** Renaming a file or a directory from the synced tree onto an ignored name (`mv src/.tmpX src/target`, as cargo does) or back works: csync copies the entries into the overlay or commits them to the host as new files inside the `rename` call, then removes the source. A directory with more than 4,096 entries or 1 GiB of files, or one holding `.git`, a hard-linked overlay file, or a FIFO or socket bound for the synced tree, fails with `EXDEV`, which makes `mv` fall back to its own copy. If the host changed a file while the move ran, its newer copy stays at the old path and reappears there on the guest.
 - **Extended attributes.** `getxattr`, `setxattr`, `listxattr` and `removexattr` fail with `EOPNOTSUPP`, and the kernel remembers that after the first call; the kernel answers the POSIX ACL names itself with `ENODATA`. Supporting them would make the kernel ask csync for `security.capability` on every `write(2)`. `cp -a`, `tar` and `rsync -a` skip extended attributes on such a filesystem without failing; `tar --xattrs` warns for each file it cannot read or set attributes on and still exits 0, and `rsync -X` does the same and exits with code 23.
 - **Ownership.** In ignored directories ownership is real: `chown` changes the backing file and the new owner is shown, with the usual rule that only root can give a file away. Synced files show the uid and gid of the csync process, because the host decides who owns them; there `chown` to any owner the kernel allows (any owner for root) succeeds and changes nothing, so `tar x`, `rsync -a` and `cp -a` running as root complete. For other users the kernel refuses `chown` to another owner with `EPERM`, as POSIX requires.
 - **Modes.** New files, directories, FIFOs and sockets get exactly the mode the caller asked for after its own umask, in both trees. The host stores only the permission bits, so setuid, setgid and sticky bits are dropped in the synced tree; they work in ignored directories (the mount is `nosuid`, so setuid never takes effect).
@@ -252,8 +314,9 @@ What it does not protect:
 - **Locks.** `flock` and `fcntl` locks are kept by the guest kernel. They exclude other processes on the same guest but are not seen by the host or by other guests, and they do not survive a restart of the guest.
 - **Symlinks.** In ignored (guest-only) directories any symlink can be made, absolute or not, as a virtual environment's `bin/python3 -> /usr/bin/python3` needs; it never leaves the guest, and csync itself never follows it. In the synced tree a symlink a guest creates that is absolute or climbs out of the root is refused with `EPERM`, and so is renaming a relative symlink to a shallower directory where it would climb out. Moving a directory that would carry such a link, or carry ignored entries, is refused with `EACCES`. A dangling relative link is fine: Emacs lock links (`.#file` pointing to `user@host.pid:boot`) are created, synced and removed like any other symlink.
 - **One project per host process.** Each `csync host` serves one root, and one root can have only one running host. To serve several projects from one Mac, run several hosts with different `--listen` ports.
+- **No state between joins.** Ending a guest session deletes its overlay and blob cache, so every join downloads the project again and anything that lived only in the overlay (build outputs, `node_modules`, virtual environments, guest-only files) is gone. Copy what you want to keep out of the mount before you quit. There is no option to keep the state.
 - **One guest process per host cache.** The blob cache for a host is locked by the process using it, so two `csync join` sessions to the same host need different `CSYNC_HOME` directories.
-- **Guest platform.** `csync join` runs on Linux only and needs `/dev/fuse` and `fusermount3` from fuse3 (setuid root, or csync running as root).
+- **Guest platform.** `csync join` runs on Linux, where it needs `/dev/fuse` and `fusermount3` from fuse3 (setuid root, or csync running as root), and experimentally on macOS, where it needs macFUSE 5.5 or later with the FSKit extension enabled or the kernel extension allowed. The macOS guest has not been verified against a real macFUSE mount; see [the macOS guest](#the-macos-guest-experimental) for what is implemented and what is unknown. Nothing in this page about invalidation, passthrough, the writeback cache or `inotify` applies to it unless it says so.
 - **Passthrough.** Kernel passthrough for file data needs a kernel that offers it (`csync doctor` checks for 6.9 or later), `CAP_SYS_ADMIN` in the csync process, and a backing filesystem under the cache that accepts it. Without it csync serves file data itself and uses the kernel writeback cache when available. Metadata operations always go through csync. When it is on, csync uses it only for files whose backing file cannot change while they are open: ignored (guest-only) files, backed by their overlay file, and synced files a guest process is writing, backed by their staging file until the last handle closes. Reads of synced and `.git` content are served by csync from the blob cache instead. The kernel lets an open file have only one backing file and refuses every other open of it while that one is in use, but a host edit or a guest write gives a synced file new content in a different blob while readers still hold the old one, so passthrough there would make every new open fail with `EIO` until the last reader closed. Warm reads of synced files still come from the kernel page cache; only reads the page cache does not hold go through csync.
 - **Merging.** Only UTF-8 text without NUL bytes, up to 8 MiB per side, is merged. The base is the version last served to any open of the file on the guest, not the one the writing process read: if another guest process (a search, a build) reads a newer host version between an agent's read and its save, the save looks like it undoes the host's edit and can be refused even though the two edits touch different lines. Edits on neighbouring lines conflict, as in `git merge`.
 - **Reads racing a host save.** A guest process that opened a file just before the host replaced it, and whose content was not cached yet, gets `ESTALE` from `read`: the host no longer has that version. Opening the name again returns the new file.

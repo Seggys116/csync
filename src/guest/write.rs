@@ -1,15 +1,16 @@
 use super::cache::{
-    BlobCache, BlobRef, DELTA_CAP, Done, Remote, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno,
-    lock, pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
+    BlobCache, BlobRef, DELTA_CAP, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno, lock, pread_full,
+    pwrite_all, read_len, rpc_errno, wire_errno,
 };
+use super::pipe::{Payload, Pipe, Tag, Ticket};
 use super::tree::{GNode, Vis};
 use crate::delta;
 use crate::index::tree::StatKey;
 use crate::merge::merge3;
 use crate::net::rpc::RpcError;
 use crate::proto::{
-    Body, Bytes, CHUNK_MAX, DELTA_MIN, DeltaOp, Expect, INLINE_MAX, Kind, LinkTarget, MERGE_MAX,
-    Meta, Mk, Notice, NoticeKind, Op, RelPath, Reply, ReqId, Version, WireErr,
+    Body, Bytes, DELTA_MIN, Expect, INLINE_MAX, IndexId, Kind, LinkTarget, MERGE_MAX, Meta, Mk,
+    Notice, NoticeKind, Op, RelPath, Reply, Version, WireErr,
 };
 use crate::sys;
 use rustc_hash::FxHashMap;
@@ -20,12 +21,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MERGE_TRIES: u32 = 3;
 pub const REFUSED: i32 = libc::ECANCELED;
 const RACY_NS: i64 = 100_000_000;
-const BUSY_MIN: Duration = Duration::from_millis(1);
-const BUSY_MAX: Duration = Duration::from_millis(50);
 // a new file this large commits in place and waits for the host instead of pipelining a copy
 const BORROW_MIN: u64 = 1 << 20;
-// staging reads for a streamed body, split into wire chunks
-const READ_BLOCK: usize = CHUNK_MAX * 16;
 
 pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
 
@@ -89,18 +86,23 @@ pub fn resolve(base: Option<&[u8]>, ours: Option<&[u8]>, theirs: Option<&[u8]>) 
     }
 }
 
+// a file only this guest has made has no host version yet, so it alone is not held to one
+pub fn node_expect(n: &GNode, index: IndexId) -> Expect {
+    if n.is_pending() && n.ver == 0 {
+        Expect::Any
+    } else {
+        n.expect(index)
+    }
+}
+
 // the CAS expectation for a rename target: the version last served to an open of it, else its current one
-pub fn dest_expect(node: Option<&GNode>) -> Expect {
+pub fn dest_expect(node: Option<&GNode>, index: IndexId) -> Expect {
     match node {
         None => Expect::Absent,
         Some(n) if n.vis == Vis::PendingDelete => Expect::Absent,
-        Some(n) => match n.meta.kind {
-            Kind::Dir => Expect::Dir,
-            Kind::Symlink => Expect::Any,
-            Kind::File => n
-                .read_ver
-                .or_else(|| n.meta.version())
-                .map_or(Expect::Any, Expect::Is),
+        Some(n) => match (n.meta.kind, n.read_ver) {
+            (Kind::File, Some(v)) => Expect::Is(v),
+            _ => node_expect(n, index),
         },
     }
 }
@@ -185,8 +187,7 @@ impl Cell {
 }
 
 struct Pending {
-    id: ReqId,
-    remote: Arc<dyn Remote>,
+    ticket: Ticket,
     tmp: TmpBlob,
     ver: Version,
     stat: Mark,
@@ -219,19 +220,6 @@ struct Table {
     next: u32,
 }
 
-enum Chunks<'a> {
-    None,
-    File {
-        fd: BorrowedFd<'a>,
-        len: u64,
-    },
-    Literals {
-        new: Vec<u8>,
-        ops: Vec<DeltaOp>,
-        data_len: u64,
-    },
-}
-
 enum Next {
     Merged(Vec<u8>, Version),
     Refuse(Option<Meta>, Option<(Version, Vec<u8>)>),
@@ -254,18 +242,14 @@ struct Written {
     merged: Option<Vec<u8>>,
 }
 
-fn body_for<'a>(
-    fd: BorrowedFd<'a>,
-    size: u64,
-    base: Option<&BlobRef>,
-) -> Result<(Body, Chunks<'a>), i32> {
+fn body_for(fd: BorrowedFd<'_>, size: u64, base: Option<&BlobRef>) -> Result<(Body, Payload), i32> {
     if size == 0 {
-        return Ok((Body::Empty, Chunks::None));
+        return Ok((Body::Empty, Payload::None));
     }
     if size <= INLINE_MAX as u64 {
         return Ok((
             Body::Inline(Bytes(read_len(fd, size, INLINE_MAX as u64)?)),
-            Chunks::None,
+            Payload::None,
         ));
     }
     if (DELTA_MIN..=DELTA_CAP).contains(&size)
@@ -279,7 +263,7 @@ fn body_for<'a>(
                     ops: e.ops.clone(),
                     data_len: e.data_len,
                 },
-                Chunks::Literals {
+                Payload::Literals {
                     new,
                     ops: e.ops,
                     data_len: e.data_len,
@@ -287,89 +271,27 @@ fn body_for<'a>(
             ));
         }
     }
-    Ok((Body::Stream { len: size }, Chunks::File { fd, len: size }))
-}
-
-// chunk offsets count from the start of the body stream; the last chunk carries last=true
-fn send_chunks(remote: &dyn Remote, id: ReqId, chunks: &Chunks<'_>) -> Result<(), RpcError> {
-    match chunks {
-        Chunks::None => Ok(()),
-        Chunks::File { fd, len } => {
-            let mut block = vec![0u8; (*len).min(READ_BLOCK as u64) as usize];
-            let mut off = 0u64;
-            while off < *len {
-                let n = (*len - off).min(block.len() as u64) as usize;
-                match pread_full(*fd, &mut block[..n], off) {
-                    Ok(k) if k == n => {}
-                    _ => return Err(RpcError::Wire(WireErr::Io)),
-                }
-                for (i, c) in block[..n].chunks(CHUNK_MAX).enumerate() {
-                    let at = off + (i * CHUNK_MAX) as u64;
-                    let end = at + c.len() as u64;
-                    remote.send_chunk(id, at, end == *len, c.to_vec())?;
-                }
-                off += n as u64;
-            }
-            Ok(())
-        }
-        Chunks::Literals { new, ops, data_len } => {
-            let mut buf = Vec::with_capacity(CHUNK_MAX);
-            let mut off = 0u64;
-            for mut s in delta::literals(new, ops) {
-                while !s.is_empty() {
-                    let take = (CHUNK_MAX - buf.len()).min(s.len());
-                    let (a, rest) = s.split_at(take);
-                    buf.extend_from_slice(a);
-                    s = rest;
-                    if buf.len() == CHUNK_MAX {
-                        let n = buf.len() as u64;
-                        let full = std::mem::replace(&mut buf, Vec::with_capacity(CHUNK_MAX));
-                        remote.send_chunk(id, off, off + n == *data_len, full)?;
-                        off += n;
-                    }
-                }
-            }
-            if !buf.is_empty() {
-                remote.send_chunk(id, off, true, buf)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn submit_cell(
-    remote: &dyn Remote,
-    op: &Op,
-    deadline: Instant,
-) -> Result<(ReqId, Arc<Cell>), RpcError> {
-    let cell = Arc::new(Cell::default());
-    loop {
-        let c = cell.clone();
-        let done: Done = Box::new(move |r: Result<Reply, RpcError>| c.put(r));
-        match remote.submit(op.clone(), done) {
-            Ok(id) => return Ok((id, cell)),
-            Err(RpcError::Busy) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    // the pipe sends the chunks after this returns, so it holds its own descriptor
+    let fd = fd.try_clone_to_owned().map_err(|e| io_errno(&e))?;
+    Ok((Body::Stream { len: size }, Payload::File { fd, len: size }))
 }
 
 // precondition for every method: the paths are Synced; Local and ignored paths never reach the host
 pub struct Writer {
     cache: Arc<BlobCache>,
     remote: Arc<RemoteSlot>,
+    pipe: Arc<Pipe>,
     notice: NoticeFn,
     table: Mutex<Table>,
 }
 
 impl Writer {
-    pub fn new(cache: Arc<BlobCache>, notice: NoticeFn) -> Self {
+    pub fn new(cache: Arc<BlobCache>, pipe: Arc<Pipe>, notice: NoticeFn) -> Self {
         let remote = cache.remote().clone();
         Self {
             cache,
             remote,
+            pipe,
             notice,
             table: Mutex::new(Table::default()),
         }
@@ -433,9 +355,8 @@ impl Writer {
                 return Ok((id, st.fd.clone()));
             }
         }
-        let fd = Arc::new(self.cache.staging()?);
         let mut base_ref = None;
-        let mut synced = None;
+        let mut cloned = None;
         if let Some(v) = o.base {
             if o.trunc {
                 base_ref = self.cache.get(&v.hash);
@@ -443,12 +364,19 @@ impl Writer {
                 let b = self
                     .cache
                     .fetch_whole(&v.hash, o.path, v.size, fetch_deadline(v.size))?;
-                sys::clone_or_copy(b.fd(), fd.as_fd()).map_err(|e| io_errno(&e))?;
+                cloned = Some(self.cache.staging_from(b.fd())?);
                 base_ref = Some(b);
             }
-            if !o.trunc || v.size == 0 {
-                synced = Some(mark(sys::stat_key(fd.as_fd()).map_err(|e| io_errno(&e))?));
-            }
+        }
+        let fd = Arc::new(match cloned {
+            Some(fd) => fd,
+            None => self.cache.staging()?,
+        });
+        let mut synced = None;
+        if let Some(v) = o.base
+            && (!o.trunc || v.size == 0)
+        {
+            synced = Some(mark(sys::stat_key(fd.as_fd()).map_err(|e| io_errno(&e))?));
         }
         let st = Staged {
             path: o.path.clone(),
@@ -639,8 +567,7 @@ impl Writer {
         stat: Mark,
     ) -> Result<(), Refusal> {
         let deadline = commit_deadline(ver.size);
-        let (_, remote) = self.remote.get(deadline).map_err(Refusal::err)?;
-        let (body, chunks) = body_for(tmp.fd(), ver.size, None).map_err(Refusal::err)?;
+        let (body, payload) = body_for(tmp.fd(), ver.size, None).map_err(Refusal::err)?;
         let op = Op::Commit {
             path: st.path.clone(),
             base: Expect::Absent,
@@ -648,17 +575,16 @@ impl Writer {
             perm: Some(st.perm),
             body,
             sync: false,
+            mtime_ns: None,
         };
-        let (id, cell) =
-            submit_cell(&*remote, &op, deadline).map_err(|e| Refusal::err(rpc_errno(&e)))?;
-        if let Err(e) = send_chunks(&*remote, id, &chunks) {
-            remote.cancel(id);
-            return Err(Refusal::err(rpc_errno(&e)));
-        }
-        drop(chunks);
+        let cell = Arc::new(Cell::default());
+        let c = cell.clone();
+        let ticket = self
+            .pipe
+            .push_with(op, payload, deadline, Box::new(move |r| c.put(r)))
+            .map_err(Refusal::err)?;
         st.pending = Some(Pending {
-            id,
-            remote,
+            ticket,
             tmp,
             ver,
             stat,
@@ -674,7 +600,7 @@ impl Writer {
         let r = match p.cell.wait(commit_deadline(p.ver.size)) {
             Some(r) => r,
             None => {
-                p.remote.cancel(p.id);
+                self.pipe.cancel(p.ticket);
                 Err(RpcError::Timeout)
             }
         };
@@ -742,57 +668,19 @@ impl Writer {
         content: Option<(BorrowedFd<'_>, u64, Option<&BlobRef>)>,
         deadline: Instant,
     ) -> Result<Reply, i32> {
-        let (body, chunks) = match content {
+        let (body, payload) = match content {
             Some((fd, size, base)) => {
-                let (b, c) = body_for(fd, size, base)?;
-                (Some(b), c)
+                let (b, p) = body_for(fd, size, base)?;
+                (Some(b), p)
             }
-            None => (None, Chunks::None),
+            None => (None, Payload::None),
         };
         // background warming yields the link while a write waits on the host
         let _busy = self.cache.gate().enter();
-        let (mut gen_seen, mut remote) = self.remote.get(deadline)?;
-        let mut retried = false;
-        let mut backoff = BUSY_MIN;
-        loop {
-            let op = mk(body.clone()).ok_or(libc::EINVAL)?;
-            // replays are safe: the host answers Done when the current content already equals `new`
-            match Self::exchange(&*remote, op, &chunks, deadline) {
-                Err(RpcError::Closed) if !retried => {
-                    retried = true;
-                    (gen_seen, remote) = self.remote.newer(gen_seen, deadline)?;
-                }
-                // busy means the host changed nothing: it caught a host write mid-flight or was out of slots
-                Err(RpcError::Wire(WireErr::Busy)) if Instant::now() + backoff < deadline => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(BUSY_MAX);
-                }
-                r => return r.map_err(|e| rpc_errno(&e)),
-            }
-        }
-    }
-
-    fn exchange(
-        remote: &dyn Remote,
-        op: Op,
-        chunks: &Chunks<'_>,
-        deadline: Instant,
-    ) -> Result<Reply, RpcError> {
-        if matches!(chunks, Chunks::None) {
-            return remote.call(op, deadline);
-        }
-        let (id, cell) = submit_cell(remote, &op, deadline)?;
-        if let Err(e) = send_chunks(remote, id, chunks) {
-            remote.cancel(id);
-            return Err(e);
-        }
-        match cell.wait(deadline) {
-            Some(r) => r,
-            None => {
-                remote.cancel(id);
-                Err(RpcError::Timeout)
-            }
-        }
+        let op = mk(body).ok_or(libc::EINVAL)?;
+        // the pipe resends after a reconnect and on busy, in place
+        let ticket = self.pipe.push(op, payload, Tag::Sync, deadline)?;
+        self.pipe.wait(ticket, deadline).map_err(|e| rpc_errno(&e))
     }
 
     fn commit(
@@ -823,6 +711,7 @@ impl Writer {
                             perm,
                             body: b?,
                             sync,
+                            mtime_ns: None,
                         })
                     };
                     self.send(
@@ -879,7 +768,9 @@ impl Writer {
                         }
                     }
                 }
-                Reply::Blob { .. } | Reply::Blobs { .. } => return Err(Refusal::err(libc::EIO)),
+                Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                    return Err(Refusal::err(libc::EIO));
+                }
             }
         }
     }
@@ -904,7 +795,7 @@ impl Writer {
         let b = match base {
             Expect::Absent => Some(Vec::new()),
             Expect::Is(v) => self.base_bytes(path, v, base_ref),
-            Expect::Dir | Expect::Any => None,
+            Expect::Dir | Expect::Any | Expect::Ver(_) => None,
         };
         let o = read_len(ours.fd(), ours_size, MERGE_MAX).ok();
         match (
@@ -1046,6 +937,7 @@ impl Writer {
                         perm,
                         body,
                         sync: false,
+                        mtime_ns: None,
                     })
                 }
             };
@@ -1109,7 +1001,9 @@ impl Writer {
                         }
                     }
                 }
-                Reply::Blob { .. } | Reply::Blobs { .. } => return Err(Refusal::err(libc::EIO)),
+                Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                    return Err(Refusal::err(libc::EIO));
+                }
             }
         }
     }
@@ -1262,7 +1156,9 @@ impl Writer {
         {
             Reply::Done { meta } => Ok(meta),
             Reply::Conflict { current, inline } => Err(self.refuse_path(path, current, inline)),
-            Reply::Blob { .. } | Reply::Blobs { .. } => Err(Refusal::err(libc::EIO)),
+            Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                Err(Refusal::err(libc::EIO))
+            }
         }
     }
 
@@ -1322,8 +1218,10 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::cache::CacheConfig;
+    use crate::guest::cache::{CacheConfig, Done, Remote};
+    use crate::guest::tree::{GTree, NodeId};
     use crate::net::rpc::ChunkSink;
+    use crate::proto::{Change, ReqId, Seq, VerKey};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1406,6 +1304,8 @@ mod tests {
         let slot = RemoteSlot::new();
         let script = Arc::new(Script::default());
         slot.set(Some(script.clone() as Arc<dyn Remote>));
+        let (landed, _) = crossbeam_channel::unbounded();
+        let pipe = Pipe::new(slot.clone(), landed).unwrap();
         let cache = Arc::new(
             BlobCache::open(
                 &CacheConfig {
@@ -1418,7 +1318,11 @@ mod tests {
         );
         let notes = Arc::new(Mutex::new(Vec::new()));
         let n = notes.clone();
-        let w = Writer::new(cache.clone(), Arc::new(move |x: Notice| lock(&n).push(x)));
+        let w = Writer::new(
+            cache.clone(),
+            pipe,
+            Arc::new(move |x: Notice| lock(&n).push(x)),
+        );
         Rig {
             d: Dir(p),
             cache,
@@ -1831,5 +1735,123 @@ mod tests {
         assert_eq!(resolve(s(b"a\0"), s(b"b\0"), s(b"a\0")), Resolve::Refuse);
         assert_eq!(resolve(None, s(b"x\n"), s(b"y\n")), Resolve::Refuse);
         assert_eq!(resolve(s(b""), s(b"x\n"), None), Resolve::Refuse);
+    }
+
+    fn pending_meta(size: u64) -> Meta {
+        Meta {
+            hash: None,
+            size,
+            ..meta(ver(b""))
+        }
+    }
+
+    fn tree_with(m: Meta, host_ver: Seq) -> (GTree, NodeId) {
+        let mut t = GTree::new();
+        t.set_version(9, 1);
+        let p = RelPath::new("a.rs").unwrap();
+        let up = Change::Upsert {
+            path: p.clone(),
+            meta: m,
+            ver: host_ver,
+        };
+        t.apply(&up, &mut Vec::new());
+        let id = t.resolve(&p).unwrap();
+        (t, id)
+    }
+
+    #[test]
+    fn dest_expect_holds_a_pending_file_to_its_host_entry() {
+        let (t, id) = tree_with(pending_meta(7), 5);
+        let key = VerKey {
+            index: 9,
+            ver: 5,
+            size: 7,
+        };
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Ver(key));
+        assert_eq!(node_expect(t.get(id).unwrap(), 9), Expect::Ver(key));
+    }
+
+    #[test]
+    fn dest_expect_prefers_the_version_last_served_over_a_pending_one() {
+        let (mut t, id) = tree_with(pending_meta(7), 5);
+        let served = ver(b"served");
+        t.get_mut(id).unwrap().read_ver = Some(served);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Is(served));
+    }
+
+    #[test]
+    fn dest_expect_keeps_its_meaning_for_known_and_absent_nodes() {
+        let v = ver(b"known");
+        let (mut t, id) = tree_with(meta(v), 5);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Is(v));
+        assert_eq!(dest_expect(None, 9), Expect::Absent);
+        t.get_mut(id).unwrap().vis = Vis::PendingDelete;
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Absent);
+        let (t, id) = tree_with(
+            Meta {
+                kind: Kind::Dir,
+                hash: None,
+                ..meta(v)
+            },
+            5,
+        );
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Dir);
+    }
+
+    #[test]
+    fn a_file_only_this_guest_has_is_not_held_to_a_host_version() {
+        let (t, id) = tree_with(pending_meta(0), 0);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Any);
+    }
+
+    #[test]
+    fn simple_mutations_reach_the_host_in_call_order() {
+        let r = rig("order");
+        let d = RelPath::new("d").unwrap();
+        let l = RelPath::new("l").unwrap();
+        let f = RelPath::new("f").unwrap();
+        for _ in 0..4 {
+            lock(&r.script.replies).push_back(Ok(Reply::Done {
+                meta: meta(ver(b"")),
+            }));
+        }
+        r.w.mkdir(&d, 0o755).unwrap();
+        r.w.symlink(&l, &LinkTarget::new("d").unwrap()).unwrap();
+        r.w.setattr(&f, Expect::Any, Some(0o600), None).unwrap();
+        r.w.remove(&f, Expect::Any).unwrap();
+        match &lock(&r.script.ops)[..] {
+            [
+                Op::Mk {
+                    what: Mk::Dir { .. },
+                    ..
+                },
+                Op::Mk {
+                    what: Mk::Symlink { .. },
+                    ..
+                },
+                Op::SetAttr { .. },
+                Op::Remove { .. },
+            ] => {}
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_busy_mutation_is_sent_again_before_the_next_one() {
+        let r = rig("busy-mk");
+        let d = RelPath::new("d").unwrap();
+        let f = RelPath::new("f").unwrap();
+        lock(&r.script.replies).push_back(Err(RpcError::Wire(WireErr::Busy)));
+        for _ in 0..2 {
+            lock(&r.script.replies).push_back(Ok(Reply::Done {
+                meta: meta(ver(b"")),
+            }));
+        }
+        r.w.mkdir(&d, 0o755).unwrap();
+        r.w.remove(&f, Expect::Any).unwrap();
+        match &lock(&r.script.ops)[..] {
+            [Op::Mk { .. }, Op::Mk { .. }, Op::Remove { .. }] => {}
+            o => panic!("unexpected {o:?}"),
+        }
     }
 }

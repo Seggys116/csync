@@ -475,6 +475,100 @@ pub fn clone_at(
     }
 }
 
+// clones an open file into a new name beside dir; dst must not exist, and the clone is isolated from later writes to src
+#[cfg(target_os = "macos")]
+pub fn clone_fd_at(src: BorrowedFd<'_>, dst_dir: BorrowedFd<'_>, dst: &str) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    check_component(dst)?;
+    let d = CString::new(dst).map_err(|_| invalid("nul in name"))?;
+    // SAFETY: the name is a valid nul-terminated string and both fds are open for the call.
+    let r = unsafe { libc::fclonefileat(src.as_raw_fd(), dst_dir.as_raw_fd(), d.as_ptr(), 0) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+// fallocate mode 0: blocks are reserved and the size grows to offset+len, but a larger file never shrinks
+#[cfg(target_os = "macos")]
+pub fn extend_allocated(fd: BorrowedFd<'_>, offset: u64, len: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if len == 0 {
+        return Err(Errno::INVAL.into());
+    }
+    let end = offset
+        .checked_add(len)
+        .and_then(|e| i64::try_from(e).ok())
+        .ok_or(Errno::FBIG)?;
+    let cur = rustix::fs::fstat(fd)?.st_size;
+    if end <= cur {
+        return Ok(());
+    }
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATEALL,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: end - cur,
+        fst_bytesalloc: 0,
+    };
+    // SAFETY: store is a valid fstore_t for the call and fd is open.
+    let r = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_PREALLOCATE, &raw mut store) };
+    if r == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(rustix::fs::ftruncate(fd, end.unsigned_abs())?)
+}
+
+// rustix has no mknodat on apple targets; mode carries the file type bits
+#[cfg(target_os = "macos")]
+pub fn mknod_at(dir: BorrowedFd<'_>, name: &str, mode: u32) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    check_component(name)?;
+    let n = CString::new(name).map_err(|_| invalid("nul in name"))?;
+    // SAFETY: the name is a valid nul-terminated string and dir is open for the call.
+    let r = unsafe { libc::mknodat(dir.as_raw_fd(), n.as_ptr(), mode as libc::mode_t, 0) };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+// lowers the calling thread alone; the rest of the process keeps its priority
+#[cfg(target_os = "macos")]
+pub fn lower_thread_priority() {
+    // SAFETY: the call only changes the scheduling class of the calling thread.
+    let _ = unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+}
+
+// nice 10 and the lowest best-effort io level for the calling thread alone; both are best effort
+#[cfg(target_os = "linux")]
+pub fn lower_thread_priority() {
+    const NICE: i32 = 10;
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_BE: libc::c_long = 2;
+    const IOPRIO_CLASS_SHIFT: u32 = 13;
+    const IOPRIO_LOWEST: libc::c_long = 7;
+    let tid = rustix::thread::gettid();
+    let _ = rustix::process::setpriority_process(Some(tid), NICE);
+    let prio = (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_LOWEST;
+    // SAFETY: ioprio_set takes three plain integers and only changes the io priority of the thread named by tid.
+    let _ = unsafe {
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            libc::c_long::from(tid.as_raw_pid()),
+            prio,
+        )
+    };
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn lower_thread_priority() {}
+
 // (case_fold, norm_fold) of the volume holding dir, learned from an internal probe name that is removed again
 pub fn probe_fold(dir: BorrowedFd<'_>) -> io::Result<(bool, bool)> {
     let mut r = [0u8; 8];
@@ -696,5 +790,57 @@ mod tests {
         clone_at(d.as_fd(), "src", d.as_fd(), "dst2").unwrap();
         assert_eq!(fs::read(t.0.join("dst2")).unwrap(), data);
         assert!(clone_at(d.as_fd(), "src", d.as_fd(), "dst2").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn rename_noreplace_refuses_an_existing_target() {
+        let t = tmp("noreplace");
+        fs::write(t.0.join("from"), b"new").unwrap();
+        fs::write(t.0.join("to"), b"old").unwrap();
+        let d = open_dir(&t.0);
+        let e = rename_noreplace(d.as_fd(), "from", "to").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EEXIST));
+        assert_eq!(fs::read(t.0.join("to")).unwrap(), b"old");
+        assert_eq!(fs::read(t.0.join("from")).unwrap(), b"new");
+        rename_noreplace(d.as_fd(), "from", "fresh").unwrap();
+        assert_eq!(fs::read(t.0.join("fresh")).unwrap(), b"new");
+        assert!(!t.0.join("from").exists());
+        assert!(rename_noreplace(d.as_fd(), "fresh", "../x").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn clone_fd_at_isolates_the_clone_from_the_source() {
+        let t = tmp("clonefd");
+        fs::write(t.0.join("src"), b"original bytes").unwrap();
+        let d = open_dir(&t.0);
+        let s = rustix::fs::openat(d.as_fd(), "src", OFlags::RDWR, Mode::empty()).unwrap();
+        clone_fd_at(s.as_fd(), d.as_fd(), "copy").unwrap();
+        assert_eq!(fs::read(t.0.join("copy")).unwrap(), b"original bytes");
+        rustix::io::pwrite(&s, b"CHANGED", 0).unwrap();
+        assert_eq!(fs::read(t.0.join("copy")).unwrap(), b"original bytes");
+        assert!(clone_fd_at(s.as_fd(), d.as_fd(), "copy").is_err());
+        assert!(clone_fd_at(s.as_fd(), d.as_fd(), "../escape").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extend_allocated_grows_and_never_shrinks() {
+        let t = tmp("alloc");
+        fs::write(t.0.join("f"), b"0123456789").unwrap();
+        let d = open_dir(&t.0);
+        let f = rustix::fs::openat(d.as_fd(), "f", OFlags::RDWR, Mode::empty()).unwrap();
+        extend_allocated(f.as_fd(), 0, 3 * 4096).unwrap();
+        assert_eq!(stat_key(f.as_fd()).unwrap().size, 3 * 4096);
+        extend_allocated(f.as_fd(), 0, 100).unwrap();
+        assert_eq!(stat_key(f.as_fd()).unwrap().size, 3 * 4096);
+        extend_allocated(f.as_fd(), 4096, 3 * 4096).unwrap();
+        assert_eq!(stat_key(f.as_fd()).unwrap().size, 4 * 4096);
+        let e = extend_allocated(f.as_fd(), 0, 0).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        let e = extend_allocated(f.as_fd(), u64::MAX, 2).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EFBIG));
+        assert_eq!(fs::read(t.0.join("f")).unwrap()[..10], *b"0123456789");
     }
 }

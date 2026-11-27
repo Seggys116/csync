@@ -3,8 +3,9 @@ use crate::index::persist;
 use crate::net::conn::Out;
 use crate::net::rpc::{ChunkSink, Rpc, RpcError};
 use crate::proto::{
-    Body, Bytes, ChunkSig, DELTA_MIN, DeltaOp, FILE_MAX, Hash32, Kind, Op, RANGE_FILE_MIN,
-    RANGE_UNIT, RelPath, Reply, ReqId, Version, WireErr,
+    BATCH_MAX, BlobItem, Body, Bytes, ChunkSig, DELTA_MIN, DeltaOp, FILE_MAX, Hash32, IndexId,
+    Kind, Op, RANGE_FILE_MIN, RANGE_UNIT, RelPath, Reply, ReqId, Seq, VerKey, Version, Want,
+    WireErr,
 };
 use crate::sys;
 use rustc_hash::FxHashMap;
@@ -12,7 +13,9 @@ use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +38,9 @@ const LRU_FILE: &str = "lru.bin";
 const HEX: &[u8; 16] = b"0123456789abcdef";
 const LANDERS: usize = 4;
 const LAND_SPLIT: usize = 16;
+// one FetchMany reply is a single frame the host builds before sending, so a part stays small
+const VER_PART_BYTES: u64 = 1 << 20;
+const VER_PART_ITEMS: usize = 512;
 
 pub type Done = Box<dyn FnOnce(Result<Reply, RpcError>) + Send>;
 
@@ -99,8 +105,16 @@ impl Remote for Rpc {
 // the live connection, swapped on reconnect; the generation lets callers wait for a fresh one
 #[derive(Default)]
 pub struct RemoteSlot {
-    cur: Mutex<(u64, Option<Arc<dyn Remote>>)>,
+    cur: Mutex<Cur>,
     cv: Condvar,
+}
+
+#[derive(Default)]
+struct Cur {
+    generation: u64,
+    link: Option<Arc<dyn Remote>>,
+    // no newer link will come, so nobody waits for one
+    closed: bool,
 }
 
 impl RemoteSlot {
@@ -111,14 +125,24 @@ impl RemoteSlot {
     pub fn set(&self, r: Option<Arc<dyn Remote>>) {
         {
             let mut g = lock(&self.cur);
-            g.0 = g.0.wrapping_add(1);
-            g.1 = r;
+            g.generation = g.generation.wrapping_add(1);
+            g.link = r;
         }
         self.cv.notify_all();
     }
 
     pub fn current(&self) -> Option<Arc<dyn Remote>> {
-        lock(&self.cur).1.clone()
+        lock(&self.cur).link.clone()
+    }
+
+    // the session is ending: the current link stays usable, waits for another one fail at once
+    pub fn close(&self) {
+        lock(&self.cur).closed = true;
+        self.cv.notify_all();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        lock(&self.cur).closed
     }
 
     pub fn get(&self, deadline: Instant) -> Result<(u64, Arc<dyn Remote>), i32> {
@@ -132,10 +156,13 @@ impl RemoteSlot {
     fn wait(&self, after: Option<u64>, deadline: Instant) -> Result<(u64, Arc<dyn Remote>), i32> {
         let mut g = lock(&self.cur);
         loop {
-            if after != Some(g.0)
-                && let Some(r) = &g.1
+            if after != Some(g.generation)
+                && let Some(r) = &g.link
             {
-                return Ok((g.0, r.clone()));
+                return Ok((g.generation, r.clone()));
+            }
+            if g.closed {
+                return Err(libc::EIO);
             }
             let (ng, alive) = wait_until(&self.cv, g, deadline);
             g = ng;
@@ -689,9 +716,13 @@ impl Shared {
         self.shards.get(usize::from(h[0])).ok_or(libc::EIO)
     }
 
-    fn new_tmp(&self) -> Result<TmpBlob, i32> {
+    fn tmp_name(&self) -> String {
         let n = self.names.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{:x}-{n:x}", self.pid);
+        format!("{:x}-{n:x}", self.pid)
+    }
+
+    fn new_tmp(&self) -> Result<TmpBlob, i32> {
+        let name = self.tmp_name();
         let fd = rustix::fs::openat(
             &*self.tmp,
             name.as_str(),
@@ -726,16 +757,21 @@ impl Shared {
             lock(&self.inner).add(v.hash, v.size, path.cloned());
             return Ok(());
         }
-        let n = self.names.fetch_add(1, Ordering::Relaxed);
-        let name = format!("{:x}-{n:x}", self.pid);
-        let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
-        let linked = rustix::fs::linkat(
-            rustix::fs::CWD,
-            proc.as_str(),
-            &*self.tmp,
-            name.as_str(),
-            AtFlags::SYMLINK_FOLLOW,
-        );
+        let name = self.tmp_name();
+        #[cfg(target_os = "linux")]
+        let linked = {
+            let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
+            rustix::fs::linkat(
+                rustix::fs::CWD,
+                proc.as_str(),
+                &*self.tmp,
+                name.as_str(),
+                AtFlags::SYMLINK_FOLLOW,
+            )
+        };
+        // the staging file is anonymous here, so a copy-on-write clone stands in for linking it
+        #[cfg(target_os = "macos")]
+        let linked = sys::fs_unix::clone_fd_at(fd, self.tmp.as_fd(), name.as_str());
         let t = match linked {
             Ok(()) => {
                 let own = rustix::fs::openat(
@@ -878,6 +914,71 @@ impl Shared {
         self.publish_tmp(t, path)
     }
 
+    // one request on the live link, repeated once on a fresh link if the first one dropped; Gone is ESTALE, anything else EIO
+    fn call(&self, op: Op, deadline: Instant) -> Result<Reply, i32> {
+        let (mut gen_seen, mut remote) = self.remote.get(deadline)?;
+        let mut retried = false;
+        loop {
+            match remote.call(op.clone(), deadline) {
+                Ok(reply) => return Ok(reply),
+                Err(RpcError::Closed) if !retried => {
+                    retried = true;
+                    (gen_seen, remote) = self.remote.newer(gen_seen, deadline)?;
+                }
+                Err(RpcError::Wire(WireErr::Gone)) => return Err(libc::ESTALE),
+                Err(_) => return Err(libc::EIO),
+            }
+        }
+    }
+
+    // stores the bytes of a version-addressed reply only if they hash to what the host claims
+    fn land_ver(
+        &self,
+        path: &RelPath,
+        key: &VerKey,
+        r: Result<(Hash32, Bytes), WireErr>,
+    ) -> Result<Version, i32> {
+        let (hash, bytes) = r.map_err(wire_errno)?;
+        if bytes.0.len() as u64 != key.size {
+            return Err(libc::EIO);
+        }
+        self.insert_bytes(&hash, &bytes.0, Some(path))?;
+        Ok(Version {
+            hash,
+            size: key.size,
+        })
+    }
+
+    // one FetchMany for a part; the host may answer only a prefix when the reply frame fills up
+    fn many_ver(
+        &self,
+        part: &[(RelPath, VerKey)],
+        deadline: Instant,
+    ) -> Result<Vec<Result<Version, i32>>, i32> {
+        let op = Op::FetchMany {
+            items: part
+                .iter()
+                .map(|(p, k)| (p.clone(), Want::Ver(*k)))
+                .collect(),
+        };
+        let Reply::Blobs { items } = self.call(op, deadline)? else {
+            return Err(libc::EIO);
+        };
+        if items.len() > part.len() {
+            return Err(libc::EIO);
+        }
+        Ok(part
+            .iter()
+            .zip(items)
+            .map(|((path, key), (got, r))| {
+                if got != *path {
+                    return Err(libc::EIO);
+                }
+                self.land_ver(path, key, r)
+            })
+            .collect())
+    }
+
     fn tmp_from_bytes(&self, data: &[u8]) -> Result<(TmpBlob, Version), i32> {
         if data.len() as u64 > FILE_MAX {
             return Err(libc::EFBIG);
@@ -894,8 +995,7 @@ impl Shared {
 
     // the hash is taken from the written copy, so what gets published is exactly what was verified
     fn snapshot(&self, src: BorrowedFd<'_>) -> Result<(TmpBlob, Version), i32> {
-        let mut t = self.new_tmp()?;
-        sys::clone_or_copy(src, t.fd.as_fd()).map_err(|e| io_errno(&e))?;
+        let mut t = self.copy_tmp(src)?;
         let size = sys::stat_key(t.fd.as_fd()).map_err(|e| io_errno(&e))?.size;
         if size > FILE_MAX {
             return Err(libc::EFBIG);
@@ -908,32 +1008,93 @@ impl Shared {
         Ok((t, v))
     }
 
+    // a private writable copy of src in tmp/, cloned copy-on-write where the filesystem can
+    fn copy_tmp(&self, src: BorrowedFd<'_>) -> Result<TmpBlob, i32> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(t) = self.clone_tmp(src) {
+                return Ok(t);
+            }
+        }
+        let t = self.new_tmp()?;
+        sys::clone_or_copy(src, t.fd.as_fd()).map_err(|e| io_errno(&e))?;
+        Ok(t)
+    }
+
+    // an open fd cannot be the target of a clone, so macos clones into a new name and opens that
+    #[cfg(target_os = "macos")]
+    fn clone_tmp(&self, src: BorrowedFd<'_>) -> Option<TmpBlob> {
+        let name = self.tmp_name();
+        sys::fs_unix::clone_fd_at(src, self.tmp.as_fd(), name.as_str()).ok()?;
+        let flags = OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        match rustix::fs::openat(&*self.tmp, name.as_str(), flags, Mode::empty()) {
+            Ok(fd) => Some(TmpBlob {
+                dir: self.tmp.clone(),
+                name,
+                fd: Arc::new(fd),
+                ver: None,
+                live: true,
+                borrowed: false,
+            }),
+            Err(_) => {
+                let _ = rustix::fs::unlinkat(&*self.tmp, name.as_str(), AtFlags::empty());
+                None
+            }
+        }
+    }
+
+    // an anonymous staging file already holding the bytes of base
+    fn staging_from(&self, base: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(t) = self.clone_tmp(base) {
+                let fd = t.fd.clone();
+                drop(t);
+                if let Ok(fd) = Arc::try_unwrap(fd) {
+                    return Ok(fd);
+                }
+            }
+        }
+        let fd = self.staging()?;
+        sys::clone_or_copy(base, fd.as_fd()).map_err(|e| io_errno(&e))?;
+        Ok(fd)
+    }
+
     fn staging(&self) -> Result<OwnedFd, i32> {
         let mode = Mode::from_bits_truncate(0o600);
-        match rustix::fs::openat(
-            &*self.tmp,
-            ".",
-            OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
-            mode,
-        ) {
-            Ok(fd) => Ok(fd),
-            Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL | Errno::NOENT) => {
-                let name = format!(
-                    "s{:x}-{:x}",
-                    self.pid,
-                    self.names.fetch_add(1, Ordering::Relaxed)
-                );
-                let flags = OFlags::RDWR
-                    | OFlags::CREATE
-                    | OFlags::EXCL
-                    | OFlags::NOFOLLOW
-                    | OFlags::CLOEXEC;
-                let fd = rustix::fs::openat(&*self.tmp, name.as_str(), flags, mode).map_err(os)?;
-                rustix::fs::unlinkat(&*self.tmp, name.as_str(), AtFlags::empty()).map_err(os)?;
-                Ok(fd)
+        #[cfg(target_os = "linux")]
+        {
+            match rustix::fs::openat(
+                &*self.tmp,
+                ".",
+                OFlags::RDWR | OFlags::TMPFILE | OFlags::CLOEXEC,
+                mode,
+            ) {
+                Ok(fd) => Ok(fd),
+                Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL | Errno::NOENT) => {
+                    self.staging_unlinked(mode)
+                }
+                Err(e) => Err(os(e)),
             }
-            Err(e) => Err(os(e)),
         }
+        // macos has no tmpfile open
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.staging_unlinked(mode)
+        }
+    }
+
+    fn staging_unlinked(&self, mode: Mode) -> Result<OwnedFd, i32> {
+        let name = format!(
+            "s{:x}-{:x}",
+            self.pid,
+            self.names.fetch_add(1, Ordering::Relaxed)
+        );
+        let flags =
+            OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::openat(&*self.tmp, name.as_str(), flags, mode).map_err(os)?;
+        rustix::fs::unlinkat(&*self.tmp, name.as_str(), AtFlags::empty()).map_err(os)?;
+        Ok(fd)
     }
 
     fn join(self: &Arc<Self>, h: &Hash32) -> Result<Join, i32> {
@@ -1186,7 +1347,7 @@ impl Shared {
             ));
             let op = Op::Fetch {
                 path: fill.path.clone(),
-                want: Some(fill.h),
+                want: Some(Want::Hash(fill.h)),
                 have: sigs.take(),
                 range: None,
             };
@@ -1220,7 +1381,7 @@ impl Shared {
             ));
             let op = Op::Fetch {
                 path: fill.path.clone(),
-                want: Some(fill.h),
+                want: Some(Want::Hash(fill.h)),
                 have: None,
                 range: None,
             };
@@ -1444,7 +1605,7 @@ impl Shared {
         let ulen = fill.size.saturating_sub(uoff).min(UNIT);
         let op = || Op::Fetch {
             path: fill.path.clone(),
-            want: Some(fill.h),
+            want: Some(Want::Hash(fill.h)),
             have: None,
             range: Some((uoff, ulen as u32)),
         };
@@ -1662,18 +1823,21 @@ impl Batch {
         self.fills.len()
     }
 
-    pub fn request(&self) -> Vec<(RelPath, Hash32)> {
-        self.fills.iter().map(|f| (f.path.clone(), f.h)).collect()
+    pub fn request(&self) -> Vec<(RelPath, Want)> {
+        self.fills
+            .iter()
+            .map(|f| (f.path.clone(), Want::Hash(f.h)))
+            .collect()
     }
 
     // the host answers in request order and may stop early; anything unanswered or mismatched fails
-    pub fn land(mut self, items: Vec<(RelPath, Result<Bytes, WireErr>)>) -> usize {
+    pub fn land(mut self, items: Vec<BlobItem>) -> usize {
         let fills = std::mem::take(&mut self.fills);
         let mut got = items.into_iter();
         let mut ok = Vec::with_capacity(fills.len());
         for f in fills {
             match got.next() {
-                Some((p, Ok(b))) if p == f.path => ok.push((f, b)),
+                Some((p, Ok((h, b)))) if p == f.path && h == f.h => ok.push((f, b)),
                 _ => self.s.complete(&f, Err(libc::EIO)),
             }
         }
@@ -1992,9 +2156,114 @@ impl BlobCache {
         self.s.insert_bytes(h, data, path)
     }
 
+    // names the version a pending host entry holds; inline bytes are stored only if they hash to the claimed hash
+    pub fn resolve(
+        &self,
+        path: &RelPath,
+        at: VerKey,
+        inline: bool,
+        deadline: Instant,
+    ) -> Result<Version, i32> {
+        let op = Op::Resolve {
+            path: path.clone(),
+            at,
+            inline,
+        };
+        let Reply::Blob { meta, body } = self.s.call(op, deadline)? else {
+            return Err(libc::EIO);
+        };
+        let hash = meta.hash.ok_or(libc::EIO)?;
+        if meta.kind != Kind::File || meta.size != at.size {
+            return Err(libc::EIO);
+        }
+        match body {
+            Body::Inline(b) if b.0.len() as u64 == at.size => {
+                self.s.insert_bytes(&hash, &b.0, Some(path))?;
+            }
+            Body::Empty if at.size == 0 => self.s.insert_bytes(&hash, &[], Some(path))?,
+            // not inlined: only the hash is learned and the bytes are fetched by it later
+            Body::Empty => {}
+            _ => return Err(libc::EIO),
+        }
+        Ok(Version {
+            hash,
+            size: at.size,
+        })
+    }
+
+    pub fn pull_hashes(
+        &self,
+        index: IndexId,
+        items: &[(RelPath, Seq)],
+        deadline: Instant,
+    ) -> Result<Vec<Option<Hash32>>, i32> {
+        let mut out = Vec::with_capacity(items.len());
+        for part in items.chunks(BATCH_MAX) {
+            let op = Op::Hashes {
+                index,
+                items: part.to_vec(),
+            };
+            let Reply::Hashes { items: got } = self.s.call(op, deadline)? else {
+                return Err(libc::EIO);
+            };
+            if got.len() != part.len() {
+                return Err(libc::EIO);
+            }
+            out.extend(got);
+        }
+        Ok(out)
+    }
+
+    // every blob is stored only after its bytes hash to what the host sent; one result per item, in order
+    pub fn fetch_many_ver(
+        &self,
+        items: &[(RelPath, VerKey)],
+        deadline: Instant,
+    ) -> Vec<(RelPath, Result<Version, i32>)> {
+        let mut out = Vec::with_capacity(items.len());
+        let mut rest = items;
+        while !rest.is_empty() {
+            let (mut n, mut bytes) = (0, 0u64);
+            for (_, k) in rest {
+                let full = n >= VER_PART_ITEMS || bytes.saturating_add(k.size) > VER_PART_BYTES;
+                if n > 0 && full {
+                    break;
+                }
+                n += 1;
+                bytes = bytes.saturating_add(k.size);
+            }
+            let Some((part, tail)) = rest.split_at_checked(n) else {
+                break;
+            };
+            match self.s.many_ver(part, deadline) {
+                // an early stop leaves the unanswered items for the next round
+                Ok(results) if !results.is_empty() => {
+                    let done = results.len();
+                    out.extend(part.iter().zip(results).map(|((p, _), r)| (p.clone(), r)));
+                    rest = rest.get(done..).unwrap_or_default();
+                }
+                Ok(_) => {
+                    out.extend(part.iter().map(|(p, _)| (p.clone(), Err(libc::EIO))));
+                    rest = tail;
+                }
+                Err(e) => {
+                    out.extend(part.iter().map(|(p, _)| (p.clone(), Err(e))));
+                    rest = tail;
+                }
+            }
+        }
+        out.extend(rest.iter().map(|(p, _)| (p.clone(), Err(libc::EIO))));
+        out
+    }
+
     // an anonymous O_TMPFILE on the cache filesystem: nothing is left on disk once the last fd closes
     pub fn staging(&self) -> Result<OwnedFd, i32> {
         self.s.staging()
+    }
+
+    // the same anonymous staging file, already holding the bytes of base
+    pub fn staging_from(&self, base: BorrowedFd<'_>) -> Result<OwnedFd, i32> {
+        self.s.staging_from(base)
     }
 
     pub fn snapshot(&self, src: BorrowedFd<'_>) -> Result<(TmpBlob, Version), i32> {
@@ -2065,7 +2334,7 @@ impl BlobCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{Bytes, Meta};
+    use crate::proto::{Bytes, INLINE_MAX, Meta};
     use std::sync::atomic::AtomicUsize;
 
     struct Dir(PathBuf);
@@ -2117,16 +2386,123 @@ mod tests {
         }
     }
 
+    const FAKE_INDEX: IndexId = 77;
+
+    // one host index entry as the fake host answers for it
+    #[derive(Clone)]
+    struct HostFile {
+        path: RelPath,
+        ver: Seq,
+        data: Vec<u8>,
+        known: Option<Hash32>,
+        // bytes sent in place of data while the claimed hash stays the one of data
+        forged: Option<Vec<u8>>,
+        // size the reply meta claims instead of the real one
+        meta_size: Option<u64>,
+    }
+
+    fn host_file(path: &str, ver: Seq, data: &[u8]) -> HostFile {
+        HostFile {
+            path: RelPath::new(path).unwrap(),
+            ver,
+            data: data.to_vec(),
+            known: None,
+            forged: None,
+            meta_size: None,
+        }
+    }
+
+    fn key_of(f: &HostFile) -> VerKey {
+        VerKey {
+            index: FAKE_INDEX,
+            ver: f.ver,
+            size: f.data.len() as u64,
+        }
+    }
+
+    fn hash_of(data: &[u8]) -> Hash32 {
+        *blake3::hash(data).as_bytes()
+    }
+
+    fn dl() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
     #[derive(Default)]
     struct Fake {
         calls: AtomicUsize,
+        rounds: AtomicUsize,
         parked: Mutex<Vec<(Box<dyn ChunkSink>, Done)>>,
         inline: Mutex<Option<Vec<u8>>>,
+        files: Mutex<Vec<HostFile>>,
+        // a FetchMany reply stops after this many items, as a full reply frame does
+        many_limit: Mutex<Option<usize>>,
+    }
+
+    impl Fake {
+        // the entry only while index, ver and (when asked) size still match: anything else is a stale reference
+        fn find(
+            &self,
+            path: &RelPath,
+            index: IndexId,
+            ver: Seq,
+            size: Option<u64>,
+        ) -> Option<HostFile> {
+            lock(&self.files)
+                .iter()
+                .find(|f| {
+                    f.path == *path
+                        && index == FAKE_INDEX
+                        && f.ver == ver
+                        && size.is_none_or(|s| s == f.data.len() as u64)
+                })
+                .cloned()
+        }
     }
 
     impl Remote for Fake {
-        fn call(&self, _op: Op, _d: Instant) -> Result<Reply, RpcError> {
-            Err(RpcError::Closed)
+        fn call(&self, op: Op, _d: Instant) -> Result<Reply, RpcError> {
+            self.rounds.fetch_add(1, Ordering::SeqCst);
+            match op {
+                Op::Resolve { path, at, inline } => {
+                    let f = self
+                        .find(&path, at.index, at.ver, Some(at.size))
+                        .ok_or(RpcError::Wire(WireErr::Gone))?;
+                    let mut meta = file_meta(f.meta_size.unwrap_or(f.data.len() as u64));
+                    meta.hash = Some(hash_of(&f.data));
+                    let body = if inline && !f.data.is_empty() && f.data.len() <= INLINE_MAX {
+                        Body::Inline(Bytes(f.forged.unwrap_or(f.data)))
+                    } else {
+                        Body::Empty
+                    };
+                    Ok(Reply::Blob { meta, body })
+                }
+                Op::Hashes { index, items } => Ok(Reply::Hashes {
+                    items: items
+                        .iter()
+                        .map(|(p, v)| self.find(p, index, *v, None).and_then(|f| f.known))
+                        .collect(),
+                }),
+                Op::FetchMany { items } => {
+                    let limit = (*lock(&self.many_limit)).unwrap_or(usize::MAX);
+                    let items = items
+                        .into_iter()
+                        .take(limit)
+                        .map(|(p, w)| {
+                            let r = match w {
+                                Want::Ver(k) => self
+                                    .find(&p, k.index, k.ver, Some(k.size))
+                                    .map(|f| (hash_of(&f.data), Bytes(f.forged.unwrap_or(f.data))))
+                                    .ok_or(WireErr::Gone),
+                                Want::Hash(_) => Err(WireErr::Invalid),
+                            };
+                            (p, r)
+                        })
+                        .collect();
+                    Ok(Reply::Blobs { items })
+                }
+                _ => Err(RpcError::Closed),
+            }
         }
         fn call_stream(
             &self,
@@ -2316,8 +2692,11 @@ mod tests {
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
 
         let landed = batch.land(vec![
-            (items[0].0.clone(), Ok(Bytes(a.clone()))),
-            (items[1].0.clone(), Ok(Bytes(b"BRAVO".to_vec()))),
+            (items[0].0.clone(), Ok((items[0].1, Bytes(a.clone())))),
+            (
+                items[1].0.clone(),
+                Ok((items[1].1, Bytes(b"BRAVO".to_vec()))),
+            ),
         ]);
         assert_eq!(landed, 1);
         assert!(c.contains(&items[0].1));
@@ -2350,7 +2729,7 @@ mod tests {
         let replies = items
             .iter()
             .zip(&bodies)
-            .map(|(i, b)| (i.0.clone(), Ok(Bytes(b.clone()))))
+            .map(|(i, b)| (i.0.clone(), Ok((i.1, Bytes(b.clone())))))
             .collect();
         assert_eq!(batch.land(replies), 100);
         for (i, b) in items.iter().zip(&bodies) {
@@ -2358,5 +2737,352 @@ mod tests {
             assert_eq!(&std::fs::read(blob_path(&d.0, &i.1)).unwrap(), b);
         }
         assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn tampered_inline_resolve_is_rejected_and_stores_nothing() {
+        let d = tmpdir("tamper");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let mut same_len = host_file("a", 1, b"original");
+        same_len.forged = Some(b"TAMPERED".to_vec());
+        let mut other_len = host_file("b", 1, b"original too");
+        other_len.forged = Some(b"short".to_vec());
+        let files = [same_len, other_len];
+        *lock(&fake.files) = files.to_vec();
+        for f in &files {
+            let r = c.resolve(&f.path, key_of(f), true, dl());
+            assert_eq!(r, Err(libc::EIO));
+            assert!(!c.contains(&hash_of(&f.data)));
+            assert!(!c.contains(&hash_of(f.forged.as_ref().unwrap())));
+            assert!(!blob_path(&d.0, &hash_of(&f.data)).exists());
+        }
+        assert_eq!(c.usage().0, 0);
+        assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn resolve_stores_verified_inline_bytes_and_maps_stale_to_estale() {
+        let d = tmpdir("resolve");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let small = host_file("small", 4, b"small body");
+        let empty = host_file("empty", 5, b"");
+        let big = host_file("big", 6, &[7u8; INLINE_MAX + 1]);
+        *lock(&fake.files) = vec![small.clone(), empty.clone(), big.clone()];
+
+        let v = c.resolve(&small.path, key_of(&small), true, dl()).unwrap();
+        assert_eq!(
+            v,
+            Version {
+                hash: hash_of(&small.data),
+                size: 10
+            }
+        );
+        assert_eq!(c.get(&v.hash).unwrap().read_all(64).unwrap(), small.data);
+
+        let v = c.resolve(&empty.path, key_of(&empty), true, dl()).unwrap();
+        assert_eq!(v.hash, empty_hash());
+        assert!(c.contains(&v.hash));
+
+        // not inlined: the hash is learned but nothing is stored
+        let v = c.resolve(&big.path, key_of(&big), true, dl()).unwrap();
+        assert_eq!(v.hash, hash_of(&big.data));
+        assert!(!c.contains(&v.hash));
+        let other = host_file("other", 8, b"not asked inline");
+        lock(&fake.files).push(other.clone());
+        let v = c.resolve(&other.path, key_of(&other), false, dl()).unwrap();
+        assert!(!c.contains(&v.hash));
+
+        let mut stale = key_of(&small);
+        stale.ver += 1;
+        assert_eq!(c.resolve(&small.path, stale, true, dl()), Err(libc::ESTALE));
+        let mut resized = key_of(&small);
+        resized.size += 1;
+        assert_eq!(
+            c.resolve(&small.path, resized, true, dl()),
+            Err(libc::ESTALE)
+        );
+        let mut elsewhere = key_of(&small);
+        elsewhere.index += 1;
+        assert_eq!(
+            c.resolve(&small.path, elsewhere, true, dl()),
+            Err(libc::ESTALE)
+        );
+        assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn resolve_rejects_a_reply_size_that_differs_from_the_asked_one() {
+        let d = tmpdir("resolve-size");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let mut f = host_file("a", 1, b"twelve bytes");
+        f.meta_size = Some(13);
+        *lock(&fake.files) = vec![f.clone()];
+        assert_eq!(c.resolve(&f.path, key_of(&f), true, dl()), Err(libc::EIO));
+        assert!(!c.contains(&hash_of(&f.data)));
+        assert_eq!(c.usage().0, 0);
+    }
+
+    #[test]
+    fn resolve_without_a_link_fails_at_the_deadline() {
+        let d = tmpdir("resolve-down");
+        let c = BlobCache::open(
+            &CacheConfig {
+                dir: d.0.clone(),
+                cap: Some(1 << 30),
+            },
+            RemoteSlot::new(),
+        )
+        .unwrap();
+        let f = host_file("a", 1, b"x");
+        let end = Instant::now() + Duration::from_millis(30);
+        assert_eq!(c.resolve(&f.path, key_of(&f), true, end), Err(libc::EIO));
+    }
+
+    #[test]
+    fn fetch_many_ver_verifies_each_item_and_the_rest_still_land() {
+        let d = tmpdir("many-ver");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let good = host_file("good", 1, b"good bytes");
+        let mut forged = host_file("forged", 2, b"genuine!!!");
+        forged.forged = Some(b"forgeries!".to_vec());
+        let mut short = host_file("short", 3, b"abcdef");
+        short.forged = Some(b"abc".to_vec());
+        let stale = host_file("stale", 4, b"stale bytes");
+        let last = host_file("last", 5, b"last bytes");
+        *lock(&fake.files) = vec![
+            good.clone(),
+            forged.clone(),
+            short.clone(),
+            stale.clone(),
+            last.clone(),
+        ];
+        let mut old = key_of(&stale);
+        old.ver -= 1;
+        let missing = RelPath::new("missing").unwrap();
+        let items = vec![
+            (good.path.clone(), key_of(&good)),
+            (forged.path.clone(), key_of(&forged)),
+            (short.path.clone(), key_of(&short)),
+            (stale.path.clone(), old),
+            (missing.clone(), key_of(&last)),
+            (last.path.clone(), key_of(&last)),
+        ];
+        let out = c.fetch_many_ver(&items, dl());
+        let paths: Vec<&RelPath> = out.iter().map(|(p, _)| p).collect();
+        assert_eq!(paths, items.iter().map(|(p, _)| p).collect::<Vec<_>>());
+        let res: Vec<Result<Version, i32>> = out.into_iter().map(|(_, r)| r).collect();
+        assert_eq!(
+            res,
+            vec![
+                Ok(Version {
+                    hash: hash_of(&good.data),
+                    size: 10
+                }),
+                Err(libc::EIO),
+                Err(libc::EIO),
+                Err(libc::ESTALE),
+                Err(libc::ESTALE),
+                Ok(Version {
+                    hash: hash_of(&last.data),
+                    size: 10
+                }),
+            ]
+        );
+        assert!(c.contains(&hash_of(&good.data)) && c.contains(&hash_of(&last.data)));
+        for f in [&forged, &short] {
+            assert!(!c.contains(&hash_of(&f.data)));
+            assert!(!c.contains(&hash_of(f.forged.as_ref().unwrap())));
+            assert!(!blob_path(&d.0, &hash_of(&f.data)).exists());
+        }
+        assert_eq!(
+            std::fs::read(blob_path(&d.0, &hash_of(&good.data))).unwrap(),
+            good.data
+        );
+        assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn fetch_many_ver_continues_after_a_reply_that_stops_early() {
+        let d = tmpdir("many-ver-early");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let files: Vec<HostFile> = (0..5u64)
+            .map(|i| host_file(&format!("f{i}"), i + 1, format!("body {i}").as_bytes()))
+            .collect();
+        *lock(&fake.files) = files.clone();
+        *lock(&fake.many_limit) = Some(2);
+        let items: Vec<_> = files.iter().map(|f| (f.path.clone(), key_of(f))).collect();
+        let out = c.fetch_many_ver(&items, dl());
+        assert_eq!(out.len(), 5);
+        for ((p, r), f) in out.iter().zip(&files) {
+            assert_eq!(p, &f.path);
+            assert_eq!(r.map(|v| v.hash), Ok(hash_of(&f.data)));
+            assert!(c.contains(&hash_of(&f.data)));
+        }
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn fetch_many_ver_splits_a_long_list_into_parts() {
+        let d = tmpdir("many-ver-parts");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let files: Vec<HostFile> = (0..600u64)
+            .map(|i| host_file(&format!("f{i}"), i + 1, format!("body {i}").as_bytes()))
+            .collect();
+        *lock(&fake.files) = files.clone();
+        let items: Vec<_> = files.iter().map(|f| (f.path.clone(), key_of(f))).collect();
+        let out = c.fetch_many_ver(&items, dl());
+        assert_eq!(out.len(), 600);
+        assert!(out.iter().all(|(_, r)| r.is_ok()));
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 2);
+        assert!(c.fetch_many_ver(&[], dl()).is_empty());
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pull_hashes_keeps_order_and_none_entries() {
+        let d = tmpdir("pull");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let mut a = host_file("a", 1, b"aaa");
+        a.known = Some([1; 32]);
+        let b = host_file("b", 2, b"bbb");
+        let mut z = host_file("z", 3, b"zzz");
+        z.known = Some([3; 32]);
+        *lock(&fake.files) = vec![a.clone(), b.clone(), z.clone()];
+        let ask = [
+            (z.path.clone(), 3),
+            (b.path.clone(), 2),
+            (RelPath::new("unknown").unwrap(), 9),
+            (a.path.clone(), 1),
+            // a ver the host no longer holds has no known hash either
+            (a.path.clone(), 2),
+        ];
+        let got = c.pull_hashes(FAKE_INDEX, &ask, dl()).unwrap();
+        assert_eq!(got, vec![Some([3; 32]), None, None, Some([1; 32]), None]);
+        assert_eq!(
+            c.pull_hashes(FAKE_INDEX + 1, &ask[..1], dl()).unwrap(),
+            vec![None]
+        );
+        assert!(c.pull_hashes(FAKE_INDEX, &[], dl()).unwrap().is_empty());
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn pull_hashes_splits_past_the_batch_bound() {
+        let d = tmpdir("pull-many");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let mut a = host_file("a", 1, b"aaa");
+        a.known = Some([1; 32]);
+        *lock(&fake.files) = vec![a.clone()];
+        let ask: Vec<(RelPath, Seq)> = (0..=BATCH_MAX).map(|_| (a.path.clone(), 1)).collect();
+        let got = c.pull_hashes(FAKE_INDEX, &ask, dl()).unwrap();
+        assert_eq!(got.len(), BATCH_MAX + 1);
+        assert!(got.iter().all(|h| *h == Some([1; 32])));
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staging_clone_adopt_and_snapshot_round_trip() {
+        let d = tmpdir("adopt");
+        let fake = Arc::new(Fake::default());
+        let c = open(&d, 1 << 30, &fake);
+        let base = b"base bytes of a file".to_vec();
+        let bh = *blake3::hash(&base).as_bytes();
+        c.insert_bytes(&bh, &base, None).unwrap();
+        let blob = c.get(&bh).unwrap();
+
+        let fd = c.staging_from(blob.fd()).unwrap();
+        assert_eq!(names(&d.0.join("tmp")), 0);
+        let mut got = vec![0u8; base.len()];
+        assert_eq!(pread_full(fd.as_fd(), &mut got, 0).unwrap(), base.len());
+        assert_eq!(got, base);
+
+        let edited = b"base bytes of a file, edited".to_vec();
+        pwrite_all(fd.as_fd(), &edited, 0).unwrap();
+        assert_eq!(blob.read_all(1 << 20).unwrap(), base);
+        assert_eq!(std::fs::read(blob_path(&d.0, &bh)).unwrap(), base);
+
+        let v = Version {
+            hash: *blake3::hash(&edited).as_bytes(),
+            size: edited.len() as u64,
+        };
+        let p = RelPath::new("edited.txt").unwrap();
+        c.adopt(fd.as_fd(), v, Some(&p)).unwrap();
+        assert!(c.contains(&v.hash));
+        assert_eq!(std::fs::read(blob_path(&d.0, &v.hash)).unwrap(), edited);
+        assert_eq!(names(&d.0.join("tmp")), 0);
+
+        pwrite_all(fd.as_fd(), b"LATER", 0).unwrap();
+        assert_eq!(std::fs::read(blob_path(&d.0, &v.hash)).unwrap(), edited);
+
+        let (t, sv) = c.snapshot(fd.as_fd()).unwrap();
+        assert_eq!(names(&d.0.join("tmp")), 1);
+        assert_eq!(sv.size, edited.len() as u64);
+        assert_eq!(sv.hash, hash_fd(fd.as_fd(), sv.size).unwrap());
+        drop(t);
+        assert_eq!(names(&d.0.join("tmp")), 0);
+    }
+
+    #[test]
+    fn closing_the_slot_ends_link_waits_and_keeps_the_current_link() {
+        let fake = Arc::new(Fake::default());
+        let slot = RemoteSlot::new();
+        slot.set(Some(fake.clone() as Arc<dyn Remote>));
+        let (seen, _) = slot.get(Instant::now()).unwrap();
+        let s = slot.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            (
+                s.newer(seen, t0 + Duration::from_secs(30)).is_err(),
+                t0.elapsed(),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        slot.close();
+        let (failed, took) = waiter.join().unwrap();
+        assert!(failed);
+        assert!(took < Duration::from_secs(2), "waited {took:?}");
+        assert!(slot.get(Instant::now()).is_ok());
+        slot.set(None);
+        let t0 = Instant::now();
+        assert!(slot.get(t0 + Duration::from_secs(30)).is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    // the shutdown hang: prefetch batches waited out their deadline for a link the stopped dialer never brings
+    #[test]
+    fn a_batch_fetch_without_a_link_ends_once_the_slot_closes() {
+        let d = tmpdir("slotclose");
+        let fake = Arc::new(Fake::default());
+        let c = Arc::new(open(&d, 1 << 30, &fake));
+        c.remote().set(None);
+        let items = vec![(
+            RelPath::new("a").unwrap(),
+            VerKey {
+                index: FAKE_INDEX,
+                ver: 1,
+                size: 4,
+            },
+        )];
+        let c2 = c.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let got = c2.fetch_many_ver(&items, t0 + Duration::from_secs(30));
+            (got.iter().all(|(_, r)| r.is_err()), t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        c.remote().close();
+        let (failed, took) = waiter.join().unwrap();
+        assert!(failed);
+        assert!(took < Duration::from_secs(2), "waited {took:?}");
+        assert_eq!(fake.rounds.load(Ordering::SeqCst), 0);
     }
 }

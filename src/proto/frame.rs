@@ -388,6 +388,7 @@ mod tests {
             perm: None,
             body: Body::Inline(Bytes(data)),
             sync: false,
+            mtime_ns: None,
         };
         Msg::Req { id: 3, op }
     }

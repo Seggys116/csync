@@ -4,7 +4,7 @@ pub mod hs;
 pub mod path;
 pub use path::{LinkTarget, Name, PathError, RelPath};
 
-pub const PROTO: u16 = 1;
+pub const PROTO: u16 = 2;
 pub const FRAME_MAX: usize = 4 << 20;
 pub const CHUNK_MAX: usize = 64_000;
 pub const INLINE_MAX: usize = 48 << 10;
@@ -27,6 +27,7 @@ pub type Hash32 = [u8; 32];
 pub type ReqId = u32;
 pub type Seq = u64;
 pub type IndexId = u128;
+pub type BlobItem = (RelPath, Result<(Hash32, Bytes), WireErr>);
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Version {
@@ -64,10 +65,25 @@ impl Meta {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub struct Bytes(#[serde(with = "serde_bytes")] pub Vec<u8>);
 
+// names one content version of a file by the host index entry that held it, without its hash
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct VerKey {
+    pub index: IndexId,
+    pub ver: Seq,
+    pub size: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Want {
+    Hash(Hash32),
+    Ver(VerKey),
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Expect {
     Absent,
     Is(Version),
+    Ver(VerKey),
     Dir,
     Any,
 }
@@ -102,12 +118,21 @@ pub enum Mk {
 pub enum Op {
     Fetch {
         path: RelPath,
-        want: Option<Hash32>,
+        want: Option<Want>,
         have: Option<Vec<ChunkSig>>,
         range: Option<(u64, u32)>,
     },
     FetchMany {
-        items: Vec<(RelPath, Hash32)>,
+        items: Vec<(RelPath, Want)>,
+    },
+    Resolve {
+        path: RelPath,
+        at: VerKey,
+        inline: bool,
+    },
+    Hashes {
+        index: IndexId,
+        items: Vec<(RelPath, Seq)>,
     },
     Commit {
         path: RelPath,
@@ -116,6 +141,7 @@ pub enum Op {
         perm: Option<u16>,
         body: Body,
         sync: bool,
+        mtime_ns: Option<i64>,
     },
     Mk {
         path: RelPath,
@@ -164,7 +190,10 @@ pub enum Reply {
         body: Body,
     },
     Blobs {
-        items: Vec<(RelPath, Result<Bytes, WireErr>)>,
+        items: Vec<BlobItem>,
+    },
+    Hashes {
+        items: Vec<Option<Hash32>>,
     },
     Done {
         meta: Meta,
@@ -180,11 +209,12 @@ pub struct SnapEntry {
     pub parent: u32,
     pub name: Name,
     pub meta: Meta,
+    pub ver: Seq,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Change {
-    Upsert { path: RelPath, meta: Meta },
+    Upsert { path: RelPath, meta: Meta, ver: Seq },
     Remove { path: RelPath },
     Rename { from: RelPath, to: RelPath },
 }
@@ -219,6 +249,13 @@ pub enum Push {
         changes: Vec<Change>,
     },
     Notice(Notice),
+    Hashes {
+        index: IndexId,
+        items: Vec<(RelPath, Seq, Hash32)>,
+    },
+    HashesDone {
+        index: IndexId,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -301,10 +338,26 @@ impl Version {
     }
 }
 
+impl VerKey {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        ensure(self.size <= FILE_MAX, "ver size")
+    }
+}
+
+impl Want {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Hash(_) => Ok(()),
+            Self::Ver(k) => k.validate(),
+        }
+    }
+}
+
 impl Expect {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Is(v) => v.validate(),
+            Self::Ver(k) => k.validate(),
             _ => Ok(()),
         }
     }
@@ -332,7 +385,12 @@ impl Body {
 impl Op {
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Fetch { have, range, .. } => {
+            Self::Fetch {
+                want, have, range, ..
+            } => {
+                if let Some(w) = want {
+                    w.validate()?;
+                }
                 if let Some(h) = have {
                     ensure(h.len() <= SIGS_MAX, "sigs")?;
                 }
@@ -341,7 +399,12 @@ impl Op {
                 }
                 Ok(())
             }
-            Self::FetchMany { items } => ensure(items.len() <= BATCH_MAX, "fetch items"),
+            Self::FetchMany { items } => {
+                ensure(items.len() <= BATCH_MAX, "fetch items")?;
+                items.iter().try_for_each(|(_, w)| w.validate())
+            }
+            Self::Resolve { at, .. } => at.validate(),
+            Self::Hashes { items, .. } => ensure(items.len() <= BATCH_MAX, "hash items"),
             Self::Commit {
                 base, new, body, ..
             } => {
@@ -377,6 +440,7 @@ impl Reply {
                 body.validate()
             }
             Self::Blobs { items } => ensure(items.len() <= BATCH_MAX, "blob items"),
+            Self::Hashes { items } => ensure(items.len() <= BATCH_MAX, "hash items"),
             Self::Done { meta } => meta.validate(),
             Self::Conflict { current, .. } => current.as_ref().map_or(Ok(()), Meta::validate),
         }
@@ -397,7 +461,8 @@ impl Push {
                     _ => Ok(()),
                 })
             }
-            Self::Notice(_) => Ok(()),
+            Self::Notice(_) | Self::HashesDone { .. } => Ok(()),
+            Self::Hashes { items, .. } => ensure(items.len() <= BATCH_MAX, "pushed hashes"),
         }
     }
 }
@@ -467,6 +532,7 @@ mod tests {
             changes: vec![Change::Upsert {
                 path: p.clone(),
                 meta: meta(FILE_MAX + 1),
+                ver: 1,
             }],
         });
         assert!(huge.validate().is_err());
@@ -508,6 +574,7 @@ mod tests {
                 perm: None,
                 body: Body::Stream { len: FILE_MAX + 1 },
                 sync: false,
+                mtime_ns: None,
             },
         };
         assert!(stream.validate().is_err());
@@ -536,10 +603,207 @@ mod tests {
             parent,
             name: Name::new("n").unwrap(),
             meta: meta(0),
+            ver: 0,
         };
         assert!(check_snapshot_part(&[e(0), e(1), e(0)], 1).is_ok());
         assert!(check_snapshot_part(&[e(0), e(2)], 1).is_err());
         assert!(check_snapshot_part(&[e(5)], 5).is_err());
         assert!(check_snapshot_part(&[e(4)], 5).is_ok());
+    }
+
+    fn key(size: u64) -> VerKey {
+        VerKey {
+            index: u128::MAX - 3,
+            ver: 77,
+            size,
+        }
+    }
+
+    fn roundtrip(m: &Msg) {
+        let raw = postcard::to_stdvec(m).unwrap();
+        let back: Msg = postcard::from_bytes(&raw).unwrap();
+        assert_eq!(&back, m);
+        assert!(back.validate().is_ok());
+    }
+
+    #[test]
+    fn commit_mtime_roundtrip() {
+        for mtime_ns in [
+            None,
+            Some(0),
+            Some(1_700_000_000_123_456_789),
+            Some(i64::MIN),
+        ] {
+            roundtrip(&Msg::Req {
+                id: 8,
+                op: Op::Commit {
+                    path: RelPath::new("a/b").unwrap(),
+                    base: Expect::Absent,
+                    new: Version {
+                        hash: [3; 32],
+                        size: 2,
+                    },
+                    perm: Some(0o640),
+                    body: Body::Inline(Bytes(vec![1, 2])),
+                    sync: true,
+                    mtime_ns,
+                },
+            });
+        }
+    }
+
+    #[test]
+    fn new_variants_roundtrip() {
+        let p = RelPath::new("a/b").unwrap();
+        let k = key(10);
+        assert_eq!(
+            postcard::from_bytes::<VerKey>(&postcard::to_stdvec(&k).unwrap()).unwrap(),
+            k
+        );
+        for want in [Want::Hash([9; 32]), Want::Ver(k)] {
+            assert_eq!(
+                postcard::from_bytes::<Want>(&postcard::to_stdvec(&want).unwrap()).unwrap(),
+                want
+            );
+            roundtrip(&Msg::Req {
+                id: 1,
+                op: Op::Fetch {
+                    path: p.clone(),
+                    want: Some(want),
+                    have: None,
+                    range: Some((4, 8)),
+                },
+            });
+            roundtrip(&Msg::Req {
+                id: 2,
+                op: Op::FetchMany {
+                    items: vec![(p.clone(), want)],
+                },
+            });
+        }
+        roundtrip(&Msg::Req {
+            id: 3,
+            op: Op::Resolve {
+                path: p.clone(),
+                at: k,
+                inline: true,
+            },
+        });
+        roundtrip(&Msg::Req {
+            id: 4,
+            op: Op::Hashes {
+                index: 5,
+                items: vec![(p.clone(), 6), (p.clone(), 7)],
+            },
+        });
+        roundtrip(&Msg::Req {
+            id: 5,
+            op: Op::Remove {
+                path: p.clone(),
+                expect: Expect::Ver(k),
+            },
+        });
+        roundtrip(&Msg::Resp {
+            id: 6,
+            res: Ok(Reply::Hashes {
+                items: vec![Some([1; 32]), None],
+            }),
+        });
+        roundtrip(&Msg::Resp {
+            id: 7,
+            res: Ok(Reply::Blobs {
+                items: vec![
+                    (p.clone(), Ok(([2; 32], Bytes(vec![1, 2, 3])))),
+                    (p.clone(), Err(WireErr::Gone)),
+                ],
+            }),
+        });
+        roundtrip(&Msg::Push(Push::Hashes {
+            index: 9,
+            items: vec![(p.clone(), 3, [4; 32])],
+        }));
+        roundtrip(&Msg::Push(Push::HashesDone { index: 9 }));
+        roundtrip(&Msg::Push(Push::Changes {
+            seq: 8,
+            changes: vec![Change::Upsert {
+                path: p.clone(),
+                meta: meta(3),
+                ver: 8,
+            }],
+        }));
+        roundtrip(&Msg::Push(Push::Snapshot {
+            index: 1,
+            seq: 8,
+            part: 0,
+            last: true,
+            entries: vec![SnapEntry {
+                parent: 0,
+                name: Name::new("n").unwrap(),
+                meta: meta(3),
+                ver: 8,
+            }],
+        }));
+    }
+
+    #[test]
+    fn validate_rejects_oversized_hash_lists_and_ver_sizes() {
+        let p = RelPath::new("a").unwrap();
+        let many = |n: usize| Msg::Req {
+            id: 1,
+            op: Op::FetchMany {
+                items: vec![(p.clone(), Want::Hash([0; 32])); n],
+            },
+        };
+        assert!(many(BATCH_MAX + 1).validate().is_err());
+        assert!(many(BATCH_MAX).validate().is_ok());
+        let hashes = |n: usize| Msg::Req {
+            id: 1,
+            op: Op::Hashes {
+                index: 1,
+                items: vec![(p.clone(), 1); n],
+            },
+        };
+        assert!(hashes(BATCH_MAX + 1).validate().is_err());
+        assert!(hashes(BATCH_MAX).validate().is_ok());
+        let pushed = |n: usize| {
+            Msg::Push(Push::Hashes {
+                index: 1,
+                items: vec![(p.clone(), 1, [0; 32]); n],
+            })
+        };
+        assert!(pushed(BATCH_MAX + 1).validate().is_err());
+        assert!(pushed(BATCH_MAX).validate().is_ok());
+        let replied = |n: usize| Msg::Resp {
+            id: 1,
+            res: Ok(Reply::Hashes {
+                items: vec![None; n],
+            }),
+        };
+        assert!(replied(BATCH_MAX + 1).validate().is_err());
+        assert!(replied(BATCH_MAX).validate().is_ok());
+        let by_ver = Msg::Req {
+            id: 1,
+            op: Op::FetchMany {
+                items: vec![(p.clone(), Want::Ver(key(FILE_MAX + 1)))],
+            },
+        };
+        assert!(by_ver.validate().is_err());
+        let resolve = Msg::Req {
+            id: 1,
+            op: Op::Resolve {
+                path: p.clone(),
+                at: key(FILE_MAX + 1),
+                inline: false,
+            },
+        };
+        assert!(resolve.validate().is_err());
+        let expect = Msg::Req {
+            id: 1,
+            op: Op::Remove {
+                path: p,
+                expect: Expect::Ver(key(FILE_MAX + 1)),
+            },
+        };
+        assert!(expect.validate().is_err());
     }
 }

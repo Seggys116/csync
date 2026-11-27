@@ -37,7 +37,7 @@ mod tools {
         self_ignoring_dir(&m, &w.proj);
         vendor_staging_renames(&m, &w.proj);
 
-        // after a restart the overlay copy of the rule file still governs its synced directory
+        // the overlay is wiped on close, so after a restart the rule file the host kept still governs its directory
         guest.quit(Duration::from_secs(30));
         let mut guest = w.spawn_guest(&g, &w.addr.clone(), &[]);
         eventually("README after restart", SYNC, || {

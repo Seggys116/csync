@@ -1905,7 +1905,7 @@ fn draw_guest(f: &mut Frame, area: Rect, s: &UiSnapshot, vs: &ViewState) {
     } else if ph == Phase::Pick {
         &[("↑↓", "select"), ("enter", "join"), ("q", "quit")]
     } else {
-        &[("q", "unmount and quit")]
+        &[("q", "unmount, wipe and quit")]
     };
     keys(f.buffer_mut(), key, items, t);
     if let Some((name, sas)) = &prompt {

@@ -1,5 +1,5 @@
 use crate::proto::{
-    Change, DEPTH_MAX, IndexId, Kind, Meta, Name, PATH_MAX, RelPath, Seq, SnapEntry,
+    Change, DEPTH_MAX, Hash32, IndexId, Kind, Meta, Name, PATH_MAX, RelPath, Seq, SnapEntry,
 };
 use rustc_hash::{FxHashMap, FxHasher};
 use std::{collections::VecDeque, hash::Hasher};
@@ -27,6 +27,24 @@ pub struct Entry {
     pub domain: Domain,
     pub seq: Seq,
 }
+
+impl Entry {
+    // a file whose content hash has not been computed yet
+    pub fn is_pending(&self) -> bool {
+        self.meta.kind == Kind::File && self.meta.hash.is_none()
+    }
+}
+
+// one pending file to hash: the entry version and stat key it was read at
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashJob {
+    pub path: RelPath,
+    pub ver: Seq,
+    pub stat: StatKey,
+}
+
+// nodes looked at per pending_from call, so a caller holding the tree lock lets go regularly
+pub(crate) const SCAN_NODES: usize = 4_096;
 
 pub enum Observed {
     Present {
@@ -189,6 +207,7 @@ pub struct Tree {
     journaling: bool,
     journal_max: usize,
     live: usize,
+    pending: usize,
     scratch: Vec<u32>,
 }
 
@@ -210,6 +229,7 @@ impl Tree {
             journaling: true,
             journal_max: JOURNAL_MAX,
             live: 0,
+            pending: 0,
             scratch: Vec::new(),
         }
     }
@@ -274,6 +294,80 @@ impl Tree {
         self.entry(self.node_of(p)?)
     }
 
+    // files whose hash is still unknown
+    pub fn pending(&self) -> usize {
+        self.pending
+    }
+
+    // fills a pending file's hash if the entry is still the version and stat key the hash was computed for;
+    // the entry keeps its seq and nothing is journaled, so guests learn the hash out of band
+    pub fn set_hash(&mut self, p: &RelPath, ver: Seq, stat: &StatKey, h: Hash32) -> bool {
+        if p.is_root() {
+            return false;
+        }
+        let Some(n) = self.node_of(p) else {
+            return false;
+        };
+        let Some(e) = self
+            .nodes
+            .get_mut(n as usize)
+            .and_then(|x| x.entry.as_mut())
+        else {
+            return false;
+        };
+        if !e.is_pending() || e.seq != ver || e.stat != *stat {
+            return false;
+        }
+        e.meta.hash = Some(h);
+        self.pending -= 1;
+        true
+    }
+
+    // looks at up to SCAN_NODES nodes from `cursor` in node order and pushes at most `max` pending files that
+    // `keep` accepts; returns where to continue, or 0 once the pass reached the end of the tree
+    pub fn pending_from(
+        &self,
+        cursor: u32,
+        max: usize,
+        keep: &dyn Fn(&Name, &Entry) -> bool,
+        out: &mut Vec<HashJob>,
+    ) -> u32 {
+        if self.pending == 0 {
+            return 0;
+        }
+        if max == 0 {
+            return cursor;
+        }
+        let start = (cursor as usize).max(1);
+        let end = self.nodes.len().min(start.saturating_add(SCAN_NODES));
+        let mut taken = 0;
+        let mut i = start;
+        while i < end {
+            let id = i as u32;
+            i += 1;
+            let x = &self.nodes[id as usize];
+            let (Some(e), Some(name)) = (&x.entry, self.names.get(x.name)) else {
+                continue;
+            };
+            if !e.is_pending() || !keep(name, e) {
+                continue;
+            }
+            let Some(path) = self.path_of(id) else {
+                continue;
+            };
+            out.push(HashJob {
+                path,
+                ver: e.seq,
+                stat: e.stat,
+            });
+            taken += 1;
+            if taken == max {
+                break;
+            }
+        }
+        if i >= self.nodes.len() { 0 } else { i as u32 }
+    }
+
     // the parent directory must already be present; turning a directory into a non-directory drops its subtree
     pub fn observe(&mut self, p: &RelPath, o: Observed) -> Option<Change> {
         let (dir, name) = p.split_last()?;
@@ -311,18 +405,24 @@ impl Tree {
                     }
                     let drop_kids = e.meta.kind == Kind::Dir && meta.kind != Kind::Dir;
                     let copy = record.then(|| meta.clone());
+                    let was = e.is_pending();
                     *e = Entry {
                         meta,
                         stat,
                         domain,
                         seq,
                     };
+                    let now = e.is_pending();
+                    self.pending = (self.pending + usize::from(now)) - usize::from(was);
                     if drop_kids {
                         self.free_children(n);
                     }
                     let change = copy.and_then(|meta| {
-                        self.path_for(n, known)
-                            .map(|path| Change::Upsert { path, meta })
+                        self.path_for(n, known).map(|path| Change::Upsert {
+                            path,
+                            meta,
+                            ver: seq,
+                        })
                     });
                     self.bump(change, want)
                 } else {
@@ -342,8 +442,11 @@ impl Tree {
                         },
                     )?;
                     let change = copy.and_then(|meta| {
-                        self.path_for(n, known)
-                            .map(|path| Change::Upsert { path, meta })
+                        self.path_for(n, known).map(|path| Change::Upsert {
+                            path,
+                            meta,
+                            ver: seq,
+                        })
                     });
                     self.bump(change, want)
                 }
@@ -422,6 +525,7 @@ impl Tree {
                 parent,
                 name: name.clone(),
                 meta: e.meta.clone(),
+                ver: e.seq,
             })
         });
     }
@@ -520,6 +624,7 @@ impl Tree {
             return None;
         }
         let nid = self.names.intern(name)?;
+        let pending = entry.is_pending();
         let node = Node {
             parent,
             name: nid,
@@ -550,6 +655,7 @@ impl Tree {
         self.nodes[parent as usize].first = id;
         self.edges.insert((parent, nid), id);
         self.live += 1;
+        self.pending += usize::from(pending);
         Some(id)
     }
 
@@ -599,8 +705,9 @@ impl Tree {
         self.edges.remove(&(node.parent, node.name));
         self.names.release(node.name);
         self.free.push(n);
-        if node.entry.is_some() {
+        if let Some(e) = &node.entry {
             self.live -= 1;
+            self.pending -= usize::from(e.is_pending());
         }
     }
 }
@@ -808,5 +915,284 @@ mod tests {
         let got: HashSet<&str> = full[1..].iter().map(String::as_str).collect();
         let want: HashSet<&str> = paths.iter().map(|(p, _)| *p).collect();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn upserts_and_snapshots_carry_the_entry_seq_as_ver() {
+        let mut t = Tree::new(1);
+        put(&mut t, "a", Kind::Dir, 1);
+        put(&mut t, "a/x", Kind::File, 2);
+        put(&mut t, "a/x", Kind::File, 3);
+        let ups: Vec<(String, Seq)> = t
+            .changes_since(0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|c| match c {
+                Change::Upsert { path, ver, .. } => Some((path.as_str().to_owned(), ver)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ups,
+            vec![
+                ("a".to_owned(), 1),
+                ("a/x".to_owned(), 2),
+                ("a/x".to_owned(), 3)
+            ]
+        );
+        assert_eq!(t.get(&rp("a/x")).map(|e| e.seq), Some(3));
+        let mut vers = Vec::new();
+        t.snapshot(&mut |e| vers.push((e.name.as_str().to_owned(), e.ver)));
+        assert_eq!(vers, vec![("a".to_owned(), 1), ("x".to_owned(), 3)]);
+    }
+
+    fn stat_of(tag: u8) -> StatKey {
+        StatKey {
+            ino: u64::from(tag),
+            ..StatKey::default()
+        }
+    }
+
+    fn put_pending(t: &mut Tree, p: &str, tag: u8) -> Option<Change> {
+        let mut m = meta(Kind::File, 1, tag);
+        m.hash = None;
+        t.observe(
+            &rp(p),
+            Observed::Present {
+                meta: m,
+                stat: stat_of(tag),
+                domain: Domain::Synced,
+            },
+        )
+    }
+
+    fn recount(t: &Tree) -> usize {
+        let mut n = 0;
+        t.walk(&mut |_, _, e| n += usize::from(e.is_pending()));
+        n
+    }
+
+    fn pending_paths(t: &Tree, keep: &dyn Fn(&Name, &Entry) -> bool, max: usize) -> Vec<HashJob> {
+        let mut all = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let before = all.len();
+            cursor = t.pending_from(cursor, max, keep, &mut all);
+            assert!(all.len() - before <= max);
+            if cursor == 0 {
+                return all;
+            }
+        }
+    }
+
+    #[test]
+    fn set_hash_applies_only_to_the_exact_pending_version() {
+        let mut t = Tree::new(1);
+        put(&mut t, "a", Kind::Dir, 1);
+        put_pending(&mut t, "a/x", 2);
+        put(&mut t, "known", Kind::File, 3);
+        assert_eq!(t.pending(), 1);
+        let (seq, ver) = (t.seq(), t.get(&rp("a/x")).unwrap().seq);
+        let stat = stat_of(2);
+        let h = [7u8; 32];
+
+        assert!(!t.set_hash(&rp("a/x"), ver + 1, &stat, h));
+        assert!(!t.set_hash(&rp("a/x"), ver - 1, &stat, h));
+        assert!(!t.set_hash(&rp("a/x"), ver, &stat_of(9), h));
+        let other_mtime = StatKey {
+            mtime_ns: 5,
+            ..stat
+        };
+        assert!(!t.set_hash(&rp("a/x"), ver, &other_mtime, h));
+        let other_ctime = StatKey {
+            ctime_ns: 5,
+            ..stat
+        };
+        assert!(!t.set_hash(&rp("a/x"), ver, &other_ctime, h));
+        assert!(!t.set_hash(&rp("a/missing"), ver, &stat, h));
+        assert!(!t.set_hash(&rp("a"), 1, &stat_of(1), h));
+        assert!(!t.set_hash(&RelPath::root(), 0, &StatKey::default(), h));
+        assert!(!t.set_hash(&rp("known"), 3, &stat_of(3), h));
+        assert_eq!(t.get(&rp("known")).unwrap().meta.hash, Some([3; 32]));
+        assert_eq!(t.get(&rp("a/x")).unwrap().meta.hash, None);
+        assert_eq!(t.pending(), 1);
+
+        assert!(t.set_hash(&rp("a/x"), ver, &stat, h));
+        assert_eq!(t.get(&rp("a/x")).unwrap().meta.hash, Some(h));
+        assert_eq!(t.pending(), 0);
+        assert_eq!(t.seq(), seq);
+        assert_eq!(t.get(&rp("a/x")).unwrap().seq, ver);
+
+        assert!(!t.set_hash(&rp("a/x"), ver, &stat, [8; 32]));
+        assert_eq!(t.get(&rp("a/x")).unwrap().meta.hash, Some(h));
+
+        // the journal still says the entry was pending, and nothing was added to it
+        let journal = t.changes_since(0).unwrap();
+        assert_eq!(journal.len() as u64, seq);
+        assert!(journal.iter().any(|c| matches!(
+            c,
+            Change::Upsert { path, meta, .. } if path.as_str() == "a/x" && meta.hash.is_none()
+        )));
+    }
+
+    #[test]
+    fn a_changed_entry_refuses_the_hash_of_its_older_version() {
+        let mut t = Tree::new(1);
+        put_pending(&mut t, "f", 1);
+        let old_ver = t.get(&rp("f")).unwrap().seq;
+        let old_stat = t.get(&rp("f")).unwrap().stat;
+        put_pending(&mut t, "f", 2);
+        assert!(!t.set_hash(&rp("f"), old_ver, &old_stat, [1; 32]));
+        let e = t.get(&rp("f")).unwrap();
+        assert!(e.is_pending());
+        let (ver, stat) = (e.seq, e.stat);
+        assert!(ver > old_ver);
+        assert!(!t.set_hash(&rp("f"), ver, &old_stat, [1; 32]));
+        assert!(!t.set_hash(&rp("f"), old_ver, &stat, [1; 32]));
+        assert!(t.set_hash(&rp("f"), ver, &stat, [1; 32]));
+    }
+
+    #[test]
+    fn pending_counter_follows_insert_replace_remove_and_rename() {
+        let mut t = Tree::new(1);
+        let check = |t: &Tree, want: usize| {
+            assert_eq!(t.pending(), want);
+            assert_eq!(recount(t), want);
+        };
+        check(&t, 0);
+        put(&mut t, "d", Kind::Dir, 1);
+        put(&mut t, "d/sub", Kind::Dir, 2);
+        put_pending(&mut t, "d/a", 3);
+        put_pending(&mut t, "d/b", 4);
+        put_pending(&mut t, "d/sub/c", 5);
+        put(&mut t, "d/h", Kind::File, 6);
+        check(&t, 3);
+
+        // an unchanged observation is not a new entry
+        assert!(put_pending(&mut t, "d/a", 3).is_none());
+        check(&t, 3);
+
+        // pending replaced by a hashed entry, and the other way round
+        put(&mut t, "d/a", Kind::File, 7);
+        check(&t, 2);
+        put_pending(&mut t, "d/h", 8);
+        check(&t, 3);
+
+        // a hash learned out of band
+        let e = t.get(&rp("d/b")).unwrap();
+        let (ver, stat) = (e.seq, e.stat);
+        assert!(t.set_hash(&rp("d/b"), ver, &stat, [9; 32]));
+        check(&t, 2);
+
+        // a file replaced by a directory and back
+        put(&mut t, "d/h", Kind::Dir, 10);
+        check(&t, 1);
+        put_pending(&mut t, "d/h", 11);
+        check(&t, 2);
+
+        // a rename is a removal plus an insertion
+        t.observe(&rp("d/sub/c"), Observed::Absent);
+        check(&t, 1);
+        put_pending(&mut t, "d/sub/c2", 12);
+        check(&t, 2);
+
+        // removing a directory drops the pending files below it
+        let mut out = Vec::new();
+        t.remove_subtree(&rp("d/sub"), &mut out);
+        check(&t, 1);
+        t.observe(&rp("d"), Observed::Absent);
+        check(&t, 0);
+
+        put(&mut t, "e", Kind::Dir, 20);
+        put_pending(&mut t, "e/x", 21);
+        put_pending(&mut t, "y", 22);
+        check(&t, 2);
+        put(&mut t, "e", Kind::File, 23);
+        check(&t, 1);
+        t.remove_subtree(&RelPath::root(), &mut out);
+        check(&t, 0);
+    }
+
+    #[test]
+    fn pending_from_honours_cursor_max_and_keep() {
+        let mut t = Tree::new(1);
+        put(&mut t, "d", Kind::Dir, 1);
+        for (i, name) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+            put_pending(&mut t, &format!("d/{name}"), 10 + i as u8);
+        }
+        put(&mut t, "d/hashed", Kind::File, 30);
+        put(&mut t, "d/link", Kind::Symlink, 31);
+        put_pending(&mut t, "top", 32);
+
+        let all = pending_paths(&t, &|_, _| true, 2);
+        let mut names: Vec<&str> = all.iter().map(|j| j.path.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["d/a", "d/b", "d/c", "d/d", "d/e", "d/f", "top"]);
+        for j in &all {
+            let e = t.get(&j.path).unwrap();
+            assert_eq!((j.ver, j.stat), (e.seq, e.stat));
+        }
+
+        let few = pending_paths(&t, &|n, _| n.as_str() == "c" || n.as_str() == "top", 8);
+        let mut names: Vec<&str> = few.iter().map(|j| j.path.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["d/c", "top"]);
+
+        let mut one = Vec::new();
+        let next = t.pending_from(0, 1, &|_, _| true, &mut one);
+        assert_eq!(one.len(), 1);
+        assert_ne!(next, 0);
+        // resuming at the returned cursor never repeats a job
+        let mut rest = Vec::new();
+        let mut cur = next;
+        while cur != 0 {
+            cur = t.pending_from(cur, 1, &|_, _| true, &mut rest);
+        }
+        assert_eq!(rest.len(), all.len() - 1);
+        assert!(!rest.contains(&one[0]));
+
+        let mut none = Vec::new();
+        assert_eq!(t.pending_from(u32::MAX, 4, &|_, _| true, &mut none), 0);
+        assert!(none.is_empty());
+        assert_eq!(t.pending_from(3, 0, &|_, _| true, &mut none), 3);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn pending_from_bounds_the_nodes_it_looks_at_per_call() {
+        let mut t = Tree::new(1);
+        for i in 0..(SCAN_NODES * 2 + 100) {
+            put_pending(&mut t, &format!("f{i}"), 1);
+        }
+        let mut out = Vec::new();
+        let first = t.pending_from(0, usize::MAX, &|_, _| false, &mut out);
+        assert!(out.is_empty());
+        assert_ne!(first, 0);
+        assert!((first as usize) <= SCAN_NODES + 1);
+        let mut calls = 1;
+        let mut cur = first;
+        while cur != 0 {
+            cur = t.pending_from(cur, usize::MAX, &|_, _| false, &mut out);
+            calls += 1;
+        }
+        assert_eq!(calls, 3);
+        let mut all = Vec::new();
+        let mut cur = 0;
+        loop {
+            cur = t.pending_from(cur, usize::MAX, &|_, _| true, &mut all);
+            if cur == 0 {
+                break;
+            }
+        }
+        assert_eq!(all.len(), SCAN_NODES * 2 + 100);
+    }
+
+    #[test]
+    fn pending_from_on_a_tree_with_nothing_pending_ends_the_pass() {
+        let mut t = Tree::new(1);
+        put(&mut t, "a", Kind::File, 1);
+        let mut out = Vec::new();
+        assert_eq!(t.pending_from(0, 8, &|_, _| true, &mut out), 0);
+        assert!(out.is_empty());
     }
 }

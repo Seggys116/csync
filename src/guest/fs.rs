@@ -1,5 +1,16 @@
 use super::cache::{BlobCache, BlobRef, Pin, WAIT, lock, pread_full, pwrite_all};
+#[cfg(target_os = "macos")]
+use super::coherence::{self, BackendKind};
 use super::fsops;
+use super::fuse::{
+    BackgroundSession, BackingId, BsdFileFlags, CopyFileRangeFlags, Errno, FileAttr, FileHandle,
+    FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
+    Notifier, OpenAccMode, OpenFlags, Owner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    Request, TimeOrNow, WriteFlags,
+};
+#[cfg(target_os = "linux")]
+use super::fuse::{Config, MountOption, Session, SessionACL};
 use super::gitindex::{self, Shown};
 use super::inject::Injector;
 use super::prefetch::{Hint, Prefetch};
@@ -7,24 +18,21 @@ use super::tree::{
     DETACHED, Effect, GDomain, GNode, GTree, NodeId, ROOT, Refuse, Special, Synth, Vis, dir_meta,
     domain_for_new, domain_of,
 };
-use super::write::{Flushed, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect};
+use super::write::{
+    Flushed, NoticeFn, OpenW, Refusal, RenameReq, Writer, dest_expect, node_expect,
+};
 use crate::ignore::rules::{Class, Rules};
 use crate::index::tree::StatKey;
 use crate::proto::{
-    Change, DEPTH_MAX, Expect, FILE_MAX, Hash32, Kind, LinkTarget, Meta, Name, Notice, NoticeKind,
-    PathError, RelPath, TEXT_MAX, Version,
+    Change, DEPTH_MAX, Expect, FILE_MAX, Hash32, INLINE_MAX, Kind, LinkTarget, Meta, Name, Notice,
+    NoticeKind, PathError, RelPath, Seq, TEXT_MAX, VerKey, Version,
 };
 use crate::sys;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use fuser::{
-    BackgroundSession, BackingId, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr,
-    FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig,
-    LockOwner, MountOption, Notifier, OpenAccMode, OpenFlags, Owner, RenameFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request, Session, SessionACL, TimeOrNow, WriteFlags,
-};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustix::fs::{AtFlags, Mode, OFlags, Timespec, Timestamps, UTIME_NOW, UTIME_OMIT};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 use std::{
     cell::RefCell,
     collections::VecDeque,
@@ -32,7 +40,6 @@ use std::{
     io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
         atomic::{
@@ -44,22 +51,30 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const TTL: Duration = Duration::from_secs(86_400);
+pub(super) const TTL: Duration = Duration::from_secs(86_400);
 // overlay files can change size behind a passthrough handle, so their attributes are kept short
-const LOCAL_TTL: Duration = Duration::from_secs(1);
+pub(super) const LOCAL_TTL: Duration = Duration::from_secs(1);
 // a cached handle held open this long sees a host edit even if it may be mid-read
 const SHOW_LAG: Duration = Duration::from_secs(1);
 const INJ_FH: u64 = 0;
-const IO_MAX: u32 = 1 << 20;
+pub(super) const IO_MAX: u32 = 1 << 20;
 const BACKGROUND_MAX: u16 = 64;
 const STALE_TRIES: u32 = 100;
 const STALE_STEP: Duration = Duration::from_millis(10);
+const RESOLVE_TRIES: u32 = 4;
 const VIEW_MAX: u64 = 256 << 20;
 const EAGER_GIT_MAX: u64 = 64 << 10;
 const EAGER_TRIES: usize = 4;
 const VIEWS_MAX: usize = 64;
+#[cfg(target_os = "linux")]
 const WORKERS: usize = 8;
+#[cfg(target_os = "linux")]
 const CAP_SYS_ADMIN: u32 = 21;
+#[cfg(target_os = "linux")]
+const KEEP_SIZE: i32 = libc::FALLOC_FL_KEEP_SIZE;
+// the fuse protocol keeps linux's mode bits and macos has no libc name for this one
+#[cfg(target_os = "macos")]
+const KEEP_SIZE: i32 = 1;
 const S_IFMT: u32 = 0o170_000;
 const S_IFREG: u32 = 0o100_000;
 const NS: i64 = 1_000_000_000;
@@ -317,8 +332,19 @@ fn ttl_of(n: &GNode) -> Duration {
     match n.domain {
         GDomain::Local => LOCAL_TTL,
         GDomain::GitRo => Duration::ZERO,
-        GDomain::Synced => TTL,
+        GDomain::Synced => synced_ttl(),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn synced_ttl() -> Duration {
+    TTL
+}
+
+// macfuse backends honour a synced entry's lifetime differently, so the startup self-test sets it
+#[cfg(target_os = "macos")]
+fn synced_ttl() -> Duration {
+    coherence::synced_ttl()
 }
 
 fn meta_from_key(k: &StatKey, link: Option<LinkTarget>) -> Option<Meta> {
@@ -393,6 +419,7 @@ fn timespec(t: Option<TimeOrNow>) -> Timespec {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn has_cap_sys_admin() -> bool {
     let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
         return false;
@@ -421,7 +448,91 @@ fn remove_at(dir: BorrowedFd<'_>, name: &str, depth: usize) {
     let _ = rustix::fs::unlinkat(dir, name, AtFlags::REMOVEDIR);
 }
 
+// true once the node moved on, learned a hash or is gone; false if none of that happens by the deadline
+fn await_ver_change(tree: &RwLock<GTree>, id: NodeId, ver: Seq, deadline: Instant) -> bool {
+    let until = deadline.min(Instant::now() + STALE_STEP * STALE_TRIES);
+    loop {
+        {
+            let t = tree.read().unwrap_or_else(|e| e.into_inner());
+            match t.get(id) {
+                Some(n) if n.ver == ver && n.meta.hash.is_none() => {}
+                _ => return true,
+            }
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        std::thread::sleep(STALE_STEP);
+    }
+}
+
+// the tree learns a resolved hash only while the node still holds the host entry that was asked about
+fn resolve_node(
+    tree: &RwLock<GTree>,
+    id: NodeId,
+    deadline: Instant,
+    mut resolve: impl FnMut(&RelPath, VerKey, bool, Instant) -> Result<Version, i32>,
+) -> Result<Version, Errno> {
+    for _ in 0..RESOLVE_TRIES {
+        let (path, key) = {
+            let t = tree.read().unwrap_or_else(|e| e.into_inner());
+            let n = t.get(id).ok_or(Errno::ENOENT)?;
+            if n.meta.kind != Kind::File {
+                return Err(Errno::EINVAL);
+            }
+            if let Some(v) = n.meta.version() {
+                return Ok(v);
+            }
+            if n.domain == GDomain::Local || n.ver == 0 {
+                return Err(Errno::ENOENT);
+            }
+            let key = n.ver_key(t.index_id()).ok_or(Errno::EIO)?;
+            (t.rel_path(id).ok_or(Errno::ESTALE)?, key)
+        };
+        match resolve(&path, key, key.size <= INLINE_MAX as u64, deadline) {
+            Ok(v) => {
+                let mut t = tree.write().unwrap_or_else(|e| e.into_inner());
+                if t.learn_hash(id, key.ver, v.hash) {
+                    return Ok(v);
+                }
+                let same = t
+                    .get(id)
+                    .is_some_and(|n| n.ver == key.ver && n.meta.size == key.size);
+                if same {
+                    return Ok(v);
+                }
+            }
+            Err(libc::ESTALE) => {
+                if !await_ver_change(tree, id, key.ver, deadline) {
+                    return Err(Errno::ESTALE);
+                }
+            }
+            Err(e) => return Err(en(e)),
+        }
+    }
+    Err(Errno::ESTALE)
+}
+
 impl Core {
+    // a file the host has not hashed yet is resolved first, so no caller acts on an unknown hash
+    pub fn version_of(&self, id: NodeId, deadline: Instant) -> Result<Version, Errno> {
+        resolve_node(&self.tree, id, deadline, |p, key, inline, d| {
+            self.cache.resolve(p, key, inline, d)
+        })
+    }
+
+    // None only for a file this guest made and the host has not reported: it has no host content to name
+    pub fn version_or_new(&self, id: NodeId, deadline: Instant) -> Result<Option<Version>, Errno> {
+        let new = self
+            .t()
+            .get(id)
+            .is_some_and(|n| n.meta.hash.is_none() && (n.ver == 0 || n.domain == GDomain::Local));
+        if new {
+            return Ok(None);
+        }
+        self.version_of(id, deadline).map(Some)
+    }
+
     // waits for any other step on this node's staged copy, so each one sees the state the last left
     pub fn stage_turn(&self, id: NodeId) -> StageTurn<'_> {
         let mut busy = lock(&self.staging_busy);
@@ -588,7 +699,12 @@ impl Core {
                         Some(m) => {
                             let mut fx = Vec::new();
                             if let Some(path) = t.rel_path(node) {
-                                t.apply(&Change::Upsert { path, meta: m }, &mut fx);
+                                let up = Change::Upsert {
+                                    path,
+                                    meta: m,
+                                    ver: 0,
+                                };
+                                t.apply(&up, &mut fx);
                             }
                             drop(t);
                             self.kick(fx);
@@ -751,9 +867,7 @@ impl Core {
 
     fn refresh_local(&self, id: NodeId) -> Result<(), Errno> {
         let path = self.t().rel_path(id).ok_or(Errno::ENOENT)?;
-        let fd = sys::open_beneath(self.overlay.as_fd(), &path, OFlags::PATH | OFlags::NOFOLLOW)
-            .map_err(|e| eio(&e))?;
-        let k = sys::stat_key(fd.as_fd()).map_err(|e| eio(&e))?;
+        let k = fsops::stat_key_beneath(self.overlay.as_fd(), &path).map_err(|e| eio(&e))?;
         let mut t = self.tw();
         if let Some(n) = t.get_mut(id) {
             let link = n.meta.link.take();
@@ -1153,6 +1267,14 @@ impl Core {
                     ),
                     _ => None,
                 };
+                // a host file still without a hash was never read here, so none of its bytes are cached
+                let unhashed = staged.is_none()
+                    && meta.size > 0
+                    && meta.hash.is_none()
+                    && self.t().get(id).is_some_and(|n| n.ver != 0);
+                if unhashed {
+                    return Err(libc::ENOENT);
+                }
                 let tmp = format!("{}dm{id}", crate::proto::path::TMP_PREFIX);
                 let flags = OFlags::CREATE
                     | OFlags::EXCL
@@ -1189,10 +1311,7 @@ impl Core {
     }
 
     fn read_local_link(&self, path: &RelPath) -> Option<LinkTarget> {
-        let fd =
-            sys::open_beneath(self.overlay.as_fd(), path, OFlags::PATH | OFlags::NOFOLLOW).ok()?;
-        let s = rustix::fs::readlinkat(&fd, "", Vec::new()).ok()?;
-        LinkTarget::new(s.to_str().ok()?).ok()
+        fsops::read_link_beneath(self.overlay.as_fd(), path)
     }
 }
 
@@ -1284,6 +1403,7 @@ struct Moved {
     up: Option<usize>,
     rel: String,
     meta: Meta,
+    expect: Expect,
     staging: Option<u32>,
     special: Special,
     local: bool,
@@ -1294,6 +1414,7 @@ fn under(base: &RelPath, rel: &str) -> Result<RelPath, Errno> {
     RelPath::new(&format!("{}/{rel}", base.as_str())).map_err(|_| Errno::ENAMETOOLONG)
 }
 
+// for what a host reply just described, which always carries a file's hash
 fn expect_of(m: &Meta) -> Expect {
     match m.kind {
         Kind::Dir => Expect::Dir,
@@ -1372,12 +1493,23 @@ fn read_into(len: usize, f: impl FnOnce(&mut [u8]) -> Result<usize, Errno>, repl
     });
 }
 
+#[cfg(target_os = "linux")]
 fn fopen(io: &Io) -> FopenFlags {
     match io {
         Io::Cached => FopenFlags::FOPEN_KEEP_CACHE,
         Io::Fresh => FopenFlags::empty(),
         Io::Direct => FopenFlags::FOPEN_DIRECT_IO,
         Io::None | Io::Pass(_) => FopenFlags::empty(),
+    }
+}
+
+// a page cache is only kept across opens where the backend is known to drop it on invalidation
+#[cfg(target_os = "macos")]
+fn fopen(io: &Io) -> FopenFlags {
+    match io {
+        Io::Cached if coherence::keep_cache() => FopenFlags::FOPEN_KEEP_CACHE,
+        Io::Direct => FopenFlags::FOPEN_DIRECT_IO,
+        Io::Cached | Io::Fresh | Io::None | Io::Pass(_) => FopenFlags::empty(),
     }
 }
 
@@ -1418,8 +1550,15 @@ impl GuestFs {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn is_inj(&self, req: &Request) -> bool {
         self.core.inj.get().is_some_and(|i| i.is_self(req.pid()))
+    }
+
+    // the startup self-test drives the mount from the injector thread and must be served as a user
+    #[cfg(target_os = "macos")]
+    fn is_inj(&self, req: &Request) -> bool {
+        !coherence::PROBE.active() && self.core.inj.get().is_some_and(|i| i.is_self(req.pid()))
     }
 
     fn add_handle(&self, h: Handle) -> u64 {
@@ -1716,25 +1855,33 @@ impl GuestFs {
         old: Version,
         at: &RelPath,
     ) -> Option<(Option<Version>, RelPath)> {
+        let deadline = Instant::now() + WAIT;
         for _ in 0..STALE_TRIES {
-            {
+            let (node, path, moved, held) = {
                 let t = self.core.t();
                 let n = t.get(id)?;
                 if n.meta.kind != Kind::File {
                     return None;
                 }
-                let v = n.meta.version();
-                let p = t.rel_path(id);
-                // replaced by another file: what is at the path now is all there is to read
-                if p.is_none() {
-                    let now = t.resolve(at).and_then(|r| t.get(r));
-                    let r = now.filter(|r| r.meta.kind == Kind::File)?;
-                    if r.meta.version() != Some(old) {
-                        return Some((r.meta.version(), at.clone()));
+                match t.rel_path(id) {
+                    // replaced by another file: what is at the path now is all there is to read
+                    None => {
+                        let rid = t.resolve(at)?;
+                        let r = t.get(rid).filter(|r| r.meta.kind == Kind::File)?;
+                        (rid, at.clone(), false, r.meta.version())
                     }
-                } else if v != Some(old) || p.as_ref() != Some(at) {
-                    return Some((v, p?));
+                    Some(p) => {
+                        let moved = p != *at;
+                        (id, p, moved, n.meta.version())
+                    }
                 }
+            };
+            let cur = match held {
+                Some(v) => Some(v),
+                None => self.core.version_or_new(node, deadline).ok()?,
+            };
+            if moved || cur != Some(old) {
+                return Some((cur, path));
             }
             std::thread::sleep(STALE_STEP);
         }
@@ -1802,27 +1949,56 @@ impl GuestFs {
         }
     }
 
+    // the host version a write starts from; a file the host has not hashed is resolved first
+    fn base_of(&self, id: NodeId, meta: &Meta) -> Result<Option<Version>, Errno> {
+        match meta.version() {
+            Some(v) => Ok(Some(v)),
+            None => self.core.version_or_new(id, Instant::now() + WAIT),
+        }
+    }
+
     fn open_staged(&self, id: NodeId, o: OpenW<'_>) -> Result<(u32, Arc<OwnedFd>), Errno> {
         let _turn = self.core.stage_turn(id);
         // a last close may have committed and dropped the copy since the caller looked: join or start from what is there now
-        let o = match self.core.t().get(id) {
-            Some(n) => OpenW {
-                base: n.meta.version(),
-                perm: n.meta.perm,
-                staging: n.staging,
-                ..o
-            },
+        let seen = {
+            let t = self.core.t();
+            t.get(id)
+                .map(|n| (n.meta.version(), n.meta.perm, n.staging))
+        };
+        let o = match seen {
+            Some((held, perm, staging)) => {
+                // the base of a write is a version the host has confirmed, so an unhashed file is resolved first
+                let base = match held {
+                    Some(v) => Some(v),
+                    None => match self.core.version_or_new(id, Instant::now() + WAIT) {
+                        Ok(v) => v,
+                        // a copy already staged is joined, and needs no base
+                        Err(_) if staging.is_some() => None,
+                        Err(e) => return Err(e),
+                    },
+                };
+                OpenW {
+                    base,
+                    perm,
+                    staging,
+                    ..o
+                }
+            }
             None => o,
         };
         let (path, trunc, staging, old) = (o.path, o.trunc, o.staging, o.base);
         let (sid, fd) = match self.core.writer.open_for_write(o) {
             Err(libc::ESTALE) if staging.is_none() => {
                 let m = self.newer_meta(id, old).ok_or(Errno::ESTALE)?;
+                let base = match m.version() {
+                    Some(v) => Some(v),
+                    None => self.core.version_or_new(id, Instant::now() + WAIT)?,
+                };
                 self.core
                     .writer
                     .open_for_write(OpenW {
                         path,
-                        base: m.version(),
+                        base,
                         perm: m.perm,
                         trunc,
                         staging,
@@ -1935,7 +2111,7 @@ impl GuestFs {
                     &d,
                     name.as_str(),
                     flags,
-                    Mode::from_bits_truncate(u32::from(perm)),
+                    Mode::from_bits_truncate(u32::from(perm) as _),
                 )
                 .map_err(erx)?;
                 if let Err(e) = fsops::fix_mode(fd.as_fd(), u32::from(perm)) {
@@ -2027,10 +2203,8 @@ impl GuestFs {
             _ => gitdir,
         };
         let cfg = RelPath::new(&format!("{base}/config")).ok()?;
-        let ver = {
-            let t = self.core.t();
-            t.get(t.resolve(&cfg)?)?.meta.version()?
-        };
+        let cfg_node = self.core.t().resolve(&cfg)?;
+        let ver = self.core.version_of(cfg_node, Instant::now() + WAIT).ok()?;
         let deadline = Instant::now() + WAIT;
         let b = self
             .core
@@ -2082,14 +2256,20 @@ impl GuestFs {
             }
             let mut next = None;
             for _ in 0..STALE_TRIES {
-                match self.core.t().get(id) {
-                    Some(n) if n.attached() && n.vis != Vis::PendingDelete => {
-                        if n.meta.version() != Some(ver) {
-                            next = n.meta.version();
-                            break;
-                        }
-                    }
+                let held = match self.core.t().get(id) {
+                    Some(n) if n.attached() && n.vis != Vis::PendingDelete => n.meta.version(),
                     _ => return Err(Errno::ENOENT),
+                };
+                let cur = match held {
+                    Some(v) => Some(v),
+                    None => match self.core.version_or_new(id, Instant::now() + WAIT) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    },
+                };
+                if cur != Some(ver) {
+                    next = cur;
+                    break;
                 }
                 std::thread::sleep(STALE_STEP);
             }
@@ -2205,7 +2385,7 @@ impl GuestFs {
         // a commit of this file still in flight decides which version the host is told to remove
         let found = self.core.t().lookup(parent, name).map(|(id, _)| id);
         let _turn = found.map(|id| self.core.stage_turn(id));
-        let (id, domain, kind, ver, path, vis, empty) = {
+        let (id, domain, kind, expect, path, vis, empty) = {
             let t = self.core.t();
             let (id, n) = t.lookup(parent, name).ok_or(Errno::ENOENT)?;
             let mut l = Vec::new();
@@ -2214,7 +2394,7 @@ impl GuestFs {
                 id,
                 n.domain,
                 n.meta.kind,
-                n.meta.version(),
+                node_expect(n, t.index_id()),
                 name_path(&t, id, n, parent, name).ok_or(Errno::ENOENT)?,
                 n.vis,
                 empty,
@@ -2245,11 +2425,6 @@ impl GuestFs {
             }
             GDomain::Synced if vis == Vis::PendingDelete => {}
             GDomain::Synced => {
-                let expect = match kind {
-                    Kind::Dir => Expect::Dir,
-                    Kind::File => ver.map_or(Expect::Any, Expect::Is),
-                    Kind::Symlink => Expect::Any,
-                };
                 match self.core.writer.remove(&path, expect) {
                     Ok(_) => {}
                     Err(e) if !e.refused && e.errno == libc::ENOENT => {}
@@ -2297,7 +2472,7 @@ impl GuestFs {
             sid: NodeId,
             skind: Kind,
             sdom: GDomain,
-            sver: Option<Version>,
+            sexpect: Expect,
             sperm: u16,
             staging: Option<u32>,
             link: Option<LinkTarget>,
@@ -2367,7 +2542,7 @@ impl GuestFs {
                 sid,
                 skind: s.meta.kind,
                 sdom: s.domain,
-                sver: s.meta.version(),
+                sexpect: node_expect(s, t.index_id()),
                 sperm: s.meta.perm,
                 staging: s.staging,
                 link: s.meta.link.clone(),
@@ -2375,7 +2550,7 @@ impl GuestFs {
                 to,
                 ddom,
                 dst: dst.map(|(i, _)| i),
-                to_expect: dest_expect(dst.map(|(_, d)| d)),
+                to_expect: dest_expect(dst.map(|(_, d)| d), t.index_id()),
             }
         };
         let p = plan;
@@ -2397,11 +2572,7 @@ impl GuestFs {
                 {
                     return Err(Errno::EPERM);
                 }
-                let from_expect = match p.skind {
-                    Kind::Dir => Expect::Dir,
-                    Kind::File => p.sver.map_or(Expect::Any, Expect::Is),
-                    Kind::Symlink => Expect::Any,
-                };
+                let from_expect = p.sexpect;
                 let own = p.skind == Kind::File && self.core.t().was_acked(p.sid);
                 let r = self.core.writer.rename(RenameReq {
                     from: &p.from,
@@ -2499,7 +2670,7 @@ impl GuestFs {
                 self.copy_out(
                     &p.from,
                     p.skind,
-                    p.sver,
+                    p.sid,
                     p.staging,
                     p.link.as_ref(),
                     p.sperm,
@@ -2507,7 +2678,7 @@ impl GuestFs {
                     tname,
                 )?;
                 let expect = match p.skind {
-                    Kind::File => p.sver.map_or(Expect::Any, Expect::Is),
+                    Kind::File => p.sexpect,
                     _ => Expect::Any,
                 };
                 match self.core.writer.remove(&p.from, expect) {
@@ -2563,7 +2734,7 @@ impl GuestFs {
         &self,
         from: &RelPath,
         kind: Kind,
-        ver: Option<Version>,
+        id: NodeId,
         staging: Option<u32>,
         link: Option<&LinkTarget>,
         perm: u16,
@@ -2585,22 +2756,24 @@ impl GuestFs {
             dd,
             tmp.as_str(),
             flags,
-            Mode::from_bits_truncate(u32::from(perm)),
+            Mode::from_bits_truncate(u32::from(perm) as _),
         )
         .map_err(erx)?;
         let staged = staging.and_then(|s| self.core.writer.staging_fd(s));
         let r = fsops::fix_mode(out.as_fd(), u32::from(perm)).map_err(en);
-        let r = r.and_then(|()| match (staged, ver) {
-            (Some(fd), _) => sys::clone_or_copy(fd.as_fd(), out.as_fd()).map_err(|e| eio(&e)),
-            (None, Some(v)) if v.size > 0 => {
-                let deadline = Instant::now() + WAIT + Duration::from_millis(v.size >> 12);
-                self.core
-                    .cache
-                    .fetch_whole(&v.hash, from, v.size, deadline)
-                    .map_err(en)
-                    .and_then(|b| sys::clone_or_copy(b.fd(), out.as_fd()).map_err(|e| eio(&e)))
-            }
-            _ => Ok(()),
+        let r = r.and_then(|()| match staged {
+            Some(fd) => sys::clone_or_copy(fd.as_fd(), out.as_fd()).map_err(|e| eio(&e)),
+            None => match self.core.version_or_new(id, Instant::now() + WAIT)? {
+                Some(v) if v.size > 0 => {
+                    let deadline = Instant::now() + WAIT + Duration::from_millis(v.size >> 12);
+                    self.core
+                        .cache
+                        .fetch_whole(&v.hash, from, v.size, deadline)
+                        .map_err(en)
+                        .and_then(|b| sys::clone_or_copy(b.fd(), out.as_fd()).map_err(|e| eio(&e)))
+                }
+                _ => Ok(()),
+            },
         });
         drop(out);
         let r = r.and_then(|()| rustix::fs::renameat(dd, tmp.as_str(), dd, tname).map_err(erx));
@@ -2651,6 +2824,7 @@ impl GuestFs {
                     up: at,
                     rel,
                     meta: n.meta.clone(),
+                    expect: node_expect(n, t.index_id()),
                     staging: n.staging,
                     special: n.special,
                     local: n.domain == GDomain::Local,
@@ -2695,16 +2869,15 @@ impl GuestFs {
                 Err(e) => Err(en(e)),
             },
             kind => {
-                let ver = m.meta.version();
                 let link = m.meta.link.as_ref();
-                self.copy_out(&src, kind, ver, m.staging, link, m.meta.perm, &d, nm)?;
+                self.copy_out(&src, kind, m.id, m.staging, link, m.meta.perm, &d, nm)?;
                 Ok(Some(dst))
             }
         }
     }
 
-    fn unhost(&self, p: &RelPath, meta: &Meta, left: &mut Vec<(RelPath, Meta)>) {
-        match self.core.writer.remove(p, expect_of(meta)) {
+    fn unhost(&self, p: &RelPath, expect: Expect, meta: &Meta, left: &mut Vec<(RelPath, Meta)>) {
+        match self.core.writer.remove(p, expect) {
             Ok(_) => {}
             Err(e) if !e.refused && e.errno == libc::ENOENT => {}
             Err(e) if e.refused => {
@@ -2786,12 +2959,16 @@ impl GuestFs {
         let mut left = Vec::new();
         for m in items.iter().rev().filter(|m| !m.local) {
             if let Ok(p) = under(mv.from, &m.rel) {
-                self.unhost(&p, &m.meta, &mut left);
+                self.unhost(&p, m.expect, &m.meta, &mut left);
             }
         }
-        let root = self.core.t().get(mv.sid).map(|n| n.meta.clone());
-        if let Some(m) = root {
-            self.unhost(mv.from, &m, &mut left);
+        let root = {
+            let t = self.core.t();
+            t.get(mv.sid)
+                .map(|n| (n.meta.clone(), node_expect(n, t.index_id())))
+        };
+        if let Some((m, expect)) = root {
+            self.unhost(mv.from, expect, &m, &mut left);
         }
         let mut fx = vec![Effect::InvalInode(mv.src.0), Effect::InvalInode(mv.dst.0)];
         {
@@ -3085,7 +3262,11 @@ impl GuestFs {
             )
         };
         let staged = staging.and_then(|s| self.core.writer.staging_fd(s));
-        let blob = match (&staged, meta.version()) {
+        let held = match (&staged, meta.version()) {
+            (None, None) => self.core.version_or_new(id, Instant::now() + WAIT)?,
+            (_, v) => v,
+        };
+        let blob = match (&staged, held) {
             (None, Some(v)) if v.size > 0 => {
                 let deadline = Instant::now() + WAIT + Duration::from_millis(v.size >> 12);
                 let b = self
@@ -3181,7 +3362,7 @@ impl GuestFs {
             rustix::fs::ftruncate(fd, sz).map_err(erx)?;
         }
         if let Some(m) = mode {
-            rustix::fs::fchmod(fd, Mode::from_bits_truncate(m & 0o7777)).map_err(erx)?;
+            rustix::fs::fchmod(fd, Mode::from_bits_truncate((m & 0o7777) as _)).map_err(erx)?;
         }
         if atime.is_some() || mtime.is_some() {
             let ts = Timestamps {
@@ -3281,7 +3462,7 @@ impl GuestFs {
                         None if sz == 0 => {
                             let o = OpenW {
                                 path: &path,
-                                base: meta.version(),
+                                base: self.base_of(id, &meta)?,
                                 perm: meta.perm,
                                 trunc: true,
                                 staging: None,
@@ -3298,7 +3479,7 @@ impl GuestFs {
                         None => {
                             let o = OpenW {
                                 path: &path,
-                                base: meta.version(),
+                                base: self.base_of(id, &meta)?,
                                 perm: meta.perm,
                                 trunc: false,
                                 staging: None,
@@ -3350,17 +3531,16 @@ impl GuestFs {
                         self.core.finish(id, self.core.writer.flush_ordered(sid))?;
                     }
                     // a size change above has committed a newer version than the one read on entry
-                    let ver = self.core.t().get(id).and_then(|n| n.meta.version());
+                    let expect = {
+                        let t = self.core.t();
+                        let n = t.get(id).ok_or(Errno::ENOENT)?;
+                        node_expect(n, t.index_id())
+                    };
                     let perm = mode.map(|m| (m & 0o7777) as u16);
                     let mt = mtime.map(|t| match t {
                         TimeOrNow::SpecificTime(s) => ns_of(s),
                         TimeOrNow::Now => now_ns(),
                     });
-                    let expect = match kind {
-                        Kind::Dir => Expect::Dir,
-                        Kind::File => ver.map_or(Expect::Any, Expect::Is),
-                        Kind::Symlink => Expect::Any,
-                    };
                     match self.core.writer.setattr(&path, expect, perm, mt) {
                         Ok(m) => {
                             if let Some(n) = self.core.tw().get_mut(id) {
@@ -3398,6 +3578,7 @@ impl GuestFs {
 impl Filesystem for GuestFs {
     fn init(&mut self, _req: &Request, cfg: &mut KernelConfig) -> io::Result<()> {
         let caps = cfg.capabilities();
+        #[cfg(target_os = "linux")]
         let base = InitFlags::FUSE_ASYNC_READ
             | InitFlags::FUSE_PARALLEL_DIROPS
             | InitFlags::FUSE_DO_READDIRPLUS
@@ -3405,21 +3586,39 @@ impl Filesystem for GuestFs {
             | InitFlags::FUSE_ATOMIC_O_TRUNC
             | InitFlags::FUSE_MAX_PAGES
             | InitFlags::FUSE_EXPLICIT_INVAL_DATA;
+        // flags that change how the kernel invalidates data or symlinks stay off where no notification is guaranteed
+        #[cfg(target_os = "macos")]
+        let base = InitFlags::FUSE_ASYNC_READ
+            | InitFlags::FUSE_PARALLEL_DIROPS
+            | InitFlags::FUSE_DO_READDIRPLUS
+            | InitFlags::FUSE_ATOMIC_O_TRUNC;
         let _ = cfg.add_capabilities(base & caps);
         // passthrough and writeback cache are mutually exclusive in the kernel
-        self.pass = caps.contains(InitFlags::FUSE_PASSTHROUGH)
-            && has_cap_sys_admin()
-            && cfg.set_max_stack_depth(1).is_ok()
-            && cfg.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
+        #[cfg(target_os = "linux")]
+        {
+            self.pass = caps.contains(InitFlags::FUSE_PASSTHROUGH)
+                && has_cap_sys_admin()
+                && cfg.set_max_stack_depth(1).is_ok()
+                && cfg.add_capabilities(InitFlags::FUSE_PASSTHROUGH).is_ok();
+        }
+        #[cfg(target_os = "linux")]
         let wb = !self.pass
             && caps.contains(InitFlags::FUSE_WRITEBACK_CACHE)
             && cfg
                 .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
                 .is_ok();
+        #[cfg(target_os = "macos")]
+        let wb = false;
         // without writeback cache a read-only handle never holds dirty pages
         self.noflush = !wb;
-        super::inject::SIZES_FROM_ATTRS.store(!wb, Relaxed);
-        self.no_opendir = caps.contains(InitFlags::FUSE_NO_OPENDIR_SUPPORT);
+        #[cfg(target_os = "linux")]
+        {
+            super::inject::SIZES_FROM_ATTRS.store(!wb, Relaxed);
+            self.no_opendir = caps.contains(InitFlags::FUSE_NO_OPENDIR_SUPPORT);
+        }
+        // sizes follow attribute replies only once the startup self-test has shown they do
+        #[cfg(target_os = "macos")]
+        super::inject::SIZES_FROM_ATTRS.store(false, Relaxed);
         self.core.passthrough.store(self.pass, Relaxed);
         let _ = cfg.set_max_write(IO_MAX).or_else(|n| cfg.set_max_write(n));
         let _ = cfg
@@ -3465,6 +3664,8 @@ impl Filesystem for GuestFs {
                 });
                 if let Some(id) = found {
                     t.add_lookup(id);
+                    #[cfg(target_os = "macos")]
+                    coherence::PROBE.lookup(id);
                     if let Some(n) = t.get(id) {
                         return reply.entry(
                             &ttl_of(n),
@@ -3510,7 +3711,7 @@ impl Filesystem for GuestFs {
         let ttl = if inj || gone || in_git {
             Duration::ZERO
         } else {
-            TTL
+            synced_ttl()
         };
         reply.entry(&ttl, &neg, Generation(0));
     }
@@ -3522,6 +3723,8 @@ impl Filesystem for GuestFs {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         self.core.ctr.op(Op::Getattr);
+        #[cfg(target_os = "macos")]
+        coherence::PROBE.getattr(ino.0);
         match self.core.live_attr(ino.0) {
             Ok((a, ttl, _)) => self.attr_reply(ino.0, &ttl, &a, reply),
             // an unlinked overlay file is still reachable through a descriptor that stays open
@@ -3552,9 +3755,12 @@ impl Filesystem for GuestFs {
         reply: ReplyAttr,
     ) {
         self.core.ctr.op(Op::Setattr);
-        if !self.is_inj(req)
-            && let Err(e) = self.do_setattr(ino.0, mode, uid, gid, size, atime, mtime, fh)
-        {
+        #[cfg(target_os = "linux")]
+        let inj = self.is_inj(req);
+        // the self-test's truncate is answered as an injected one: the reply, not a truncate, sets the size
+        #[cfg(target_os = "macos")]
+        let inj = self.is_inj(req) || coherence::PROBE.setattr(ino.0);
+        if !inj && let Err(e) = self.do_setattr(ino.0, mode, uid, gid, size, atime, mtime, fh) {
             return reply.error(e);
         }
         match self.core.live_attr(ino.0) {
@@ -3938,7 +4144,15 @@ impl Filesystem for GuestFs {
                 Err(e) => return reply.error(e),
             }
         } else {
-            let Some(ver) = meta.version() else {
+            let known = match meta.version() {
+                Some(v) => Some(v),
+                // resolving inline fills the cache for a small file in the same round trip
+                None => match self.core.version_or_new(id, Instant::now() + WAIT) {
+                    Ok(v) => v,
+                    Err(e) => return reply.error(e),
+                },
+            };
+            let Some(ver) = known else {
                 if meta.size != 0 {
                     return reply.error(Errno::EIO);
                 }
@@ -4102,6 +4316,13 @@ impl Filesystem for GuestFs {
         };
         let want = size.min(IO_MAX) as usize;
         if let Some((cur, path)) = self.moved_on(&h) {
+            let cur = match cur {
+                Some(v) => Some(v),
+                None => match self.core.version_or_new(h.node, Instant::now() + WAIT) {
+                    Ok(v) => v,
+                    Err(e) => return reply.error(e),
+                },
+            };
             return match cur {
                 Some(v) => self.read_version(h.node, v, &path, offset, want, reply, None),
                 None => reply.data(&[]),
@@ -4533,7 +4754,7 @@ impl Filesystem for GuestFs {
                 Some((id, a, g)) => {
                     t.add_lookup(id);
                     reply.created(
-                        &TTL,
+                        &synced_ttl(),
                         &a,
                         Generation(g),
                         FileHandle(INJ_FH),
@@ -4548,6 +4769,8 @@ impl Filesystem for GuestFs {
             Ok(x) => x,
             Err(e) => return reply.error(e),
         };
+        #[cfg(target_os = "macos")]
+        coherence::PROBE.created(name.as_str(), parent.0, id, req.pid(), req.uid(), req.gid());
         let io = self.choose_io(id, Self::src_key(&src), &|fd| reply.open_backing(fd));
         let fh = self.add_handle(Handle { node: id, io, src });
         let (a, ttl, g) = match self.core.live_attr(id) {
@@ -4598,13 +4821,13 @@ impl Filesystem for GuestFs {
     ) {
         self.core.ctr.op(Op::Other);
         // the injector's modify event: nothing to allocate
-        if self.is_inj(req) && fh.0 == INJ_FH && mode == libc::FALLOC_FL_KEEP_SIZE {
+        if self.is_inj(req) && fh.0 == INJ_FH && mode == KEEP_SIZE {
             return reply.ok();
         }
         let Some(h) = self.handle(fh.0) else {
             return reply.error(Errno::EBADF);
         };
-        let grows = mode & libc::FALLOC_FL_KEEP_SIZE == 0;
+        let grows = mode & KEEP_SIZE == 0;
         let r = match &h.src {
             Src::Local { fd } => fsops::fallocate(fd.as_fd(), mode, offset, length),
             Src::Staged { .. }
@@ -4688,6 +4911,7 @@ pub struct Mounted {
     path: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
 fn lazy_unmount(at: &Path) -> bool {
     Command::new("fusermount3")
         .arg("-uz")
@@ -4839,18 +5063,28 @@ impl Mounted {
         self.inval.clone()
     }
 
+    // the backend this mount ended up on, for the status line and doctor
+    #[cfg(target_os = "macos")]
+    pub fn backend(&self) -> Option<BackendKind> {
+        self.bg.as_ref().map(|b| b.backend().into())
+    }
+
     pub fn unmount(mut self) -> io::Result<()> {
         let Some(bg) = self.bg.take() else {
             return Ok(());
         };
         match bg.umount_and_join() {
             Ok(()) => Ok(()),
+            #[cfg(target_os = "linux")]
             Err(_) if lazy_unmount(&self.path) => Ok(()),
+            #[cfg(target_os = "macos")]
+            Err(_) if super::mount_mac::force_unmount(&self.path) => Ok(()),
             Err(e) => Err(e),
         }
     }
 }
 
+#[cfg(target_os = "linux")]
 fn unescape_mountinfo(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -4877,6 +5111,7 @@ fn unescape_mountinfo(s: &str) -> String {
 }
 
 // a csync mount listed in mountinfo at this path
+#[cfg(target_os = "linux")]
 fn csync_mounted_at(at: &Path) -> bool {
     let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else {
         return false;
@@ -4896,6 +5131,7 @@ fn csync_mounted_at(at: &Path) -> bool {
 
 // a killed session leaves a dead mount whose attributes the kernel still answers from cache; statfs always
 // reaches the daemon, so ENOTCONN there proves nobody serves it and the lazy unmount is safe
+#[cfg(target_os = "linux")]
 pub fn clear_stale(at: &Path) {
     let stale = match std::fs::metadata(at) {
         Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => true,
@@ -4909,6 +5145,12 @@ pub fn clear_stale(at: &Path) {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn clear_stale(at: &Path) {
+    super::mount_mac::clear_stale(at);
+}
+
+#[cfg(target_os = "linux")]
 pub fn mount(core: Arc<Core>, at: &Path, allow_other: bool) -> io::Result<Mounted> {
     clear_stale(at);
     let mut cfg = Config::default();
@@ -4936,4 +5178,193 @@ pub fn mount(core: Arc<Core>, at: &Path, allow_other: bool) -> io::Result<Mounte
         inval,
         path: at.to_path_buf(),
     })
+}
+
+// the volume is named for the project; the cache policy stays conservative until the self-test has run
+#[cfg(target_os = "macos")]
+pub fn mount(core: Arc<Core>, at: &Path, allow_other: bool, volname: &str) -> io::Result<Mounted> {
+    clear_stale(at);
+    fsops::init_umask();
+    let bg = super::mount_mac::attach(&core, at, volname, allow_other)?;
+    coherence::begin(bg.backend().into());
+    let inval = Inval(bg.notifier(), Arc::default());
+    let _ = core.inval.set(inval.clone());
+    Ok(Mounted {
+        bg: Some(bg),
+        inval,
+        path: at.to_path_buf(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const INDEX: u128 = 9;
+
+    fn pending_meta(size: u64) -> Meta {
+        Meta {
+            kind: Kind::File,
+            perm: 0o644,
+            size,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            hash: None,
+            link: None,
+            git_ro: false,
+        }
+    }
+
+    fn version(tag: u8, size: u64) -> Version {
+        Version {
+            hash: [tag; 32],
+            size,
+        }
+    }
+
+    fn path() -> RelPath {
+        RelPath::new("a.rs").unwrap()
+    }
+
+    fn host_entry(tree: &RwLock<GTree>, meta: Meta, ver: Seq) {
+        let up = Change::Upsert {
+            path: path(),
+            meta,
+            ver,
+        };
+        tree.write().unwrap().apply(&up, &mut Vec::new());
+    }
+
+    fn tree_with(meta: Meta, ver: Seq) -> (RwLock<GTree>, NodeId) {
+        let mut t = GTree::new();
+        t.set_version(INDEX, 1);
+        let tree = RwLock::new(t);
+        host_entry(&tree, meta, ver);
+        let id = tree.read().unwrap().resolve(&path()).unwrap();
+        (tree, id)
+    }
+
+    fn learned(tree: &RwLock<GTree>, id: NodeId) -> Option<Hash32> {
+        tree.read().unwrap().get(id).and_then(|n| n.meta.hash)
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn version_of_a_known_hash_asks_nobody() {
+        let mut m = pending_meta(7);
+        m.hash = Some([3; 32]);
+        let (tree, id) = tree_with(m, 5);
+        let got = resolve_node(&tree, id, soon(), |_, _, _, _| {
+            panic!("resolved a known hash")
+        });
+        assert_eq!(got, Ok(version(3, 7)));
+    }
+
+    #[test]
+    fn version_of_a_pending_file_resolves_then_learns() {
+        let (tree, id) = tree_with(pending_meta(7), 5);
+        let mut asked = Vec::new();
+        let got = resolve_node(&tree, id, soon(), |p, key, inline, _| {
+            asked.push((p.clone(), key, inline));
+            Ok(version(4, 7))
+        });
+        assert_eq!(got, Ok(version(4, 7)));
+        let key = VerKey {
+            index: INDEX,
+            ver: 5,
+            size: 7,
+        };
+        assert_eq!(asked, vec![(path(), key, true)]);
+        assert_eq!(learned(&tree, id), Some([4; 32]));
+        let again = resolve_node(&tree, id, soon(), |_, _, _, _| panic!("asked twice"));
+        assert_eq!(again, Ok(version(4, 7)));
+    }
+
+    #[test]
+    fn a_file_too_big_to_inline_is_resolved_without_its_bytes() {
+        let size = INLINE_MAX as u64 + 1;
+        let (tree, id) = tree_with(pending_meta(size), 5);
+        let mut inline = None;
+        let got = resolve_node(&tree, id, soon(), |_, _, i, _| {
+            inline = Some(i);
+            Ok(version(4, size))
+        });
+        assert_eq!(got, Ok(version(4, size)));
+        assert_eq!(inline, Some(false));
+    }
+
+    #[test]
+    fn version_of_retries_when_the_host_entry_changes_meanwhile() {
+        let (tree, id) = tree_with(pending_meta(7), 5);
+        let mut asked = Vec::new();
+        let got = resolve_node(&tree, id, soon(), |_, key, _, _| {
+            asked.push(key.ver);
+            if key.ver == 5 {
+                host_entry(&tree, pending_meta(8), 6);
+                return Ok(version(4, 7));
+            }
+            Ok(version(5, 8))
+        });
+        assert_eq!(got, Ok(version(5, 8)));
+        assert_eq!(asked, vec![5, 6]);
+        assert_eq!(learned(&tree, id), Some([5; 32]));
+    }
+
+    #[test]
+    fn version_of_gives_up_after_its_retry_bound() {
+        let (tree, id) = tree_with(pending_meta(7), 5);
+        let mut calls = 0;
+        let got = resolve_node(&tree, id, soon(), |_, key, _, _| {
+            calls += 1;
+            host_entry(&tree, pending_meta(7), key.ver + 1);
+            Ok(version(4, 7))
+        });
+        assert_eq!(got, Err(Errno::ESTALE));
+        assert_eq!(calls, RESOLVE_TRIES);
+        assert_eq!(learned(&tree, id), None);
+    }
+
+    #[test]
+    fn a_gone_answer_is_stale_unless_a_newer_entry_arrives() {
+        let (tree, id) = tree_with(pending_meta(7), 5);
+        let got = resolve_node(&tree, id, Instant::now(), |_, _, _, _| Err(libc::ESTALE));
+        assert_eq!(got, Err(Errno::ESTALE));
+
+        let mut asked = Vec::new();
+        let got = resolve_node(&tree, id, soon(), |_, key, _, _| {
+            asked.push(key.ver);
+            if key.ver == 5 {
+                host_entry(&tree, pending_meta(8), 6);
+                return Err(libc::ESTALE);
+            }
+            Ok(version(5, 8))
+        });
+        assert_eq!(got, Ok(version(5, 8)));
+        assert_eq!(asked, vec![5, 6]);
+    }
+
+    #[test]
+    fn other_resolve_errors_pass_through() {
+        let (tree, id) = tree_with(pending_meta(7), 5);
+        let got = resolve_node(&tree, id, soon(), |_, _, _, _| Err(libc::EIO));
+        assert_eq!(got, Err(Errno::EIO));
+        assert_eq!(learned(&tree, id), None);
+    }
+
+    #[test]
+    fn a_file_the_host_has_not_reported_has_no_version_to_resolve() {
+        let (tree, id) = tree_with(pending_meta(0), 0);
+        let got = resolve_node(&tree, id, soon(), |_, _, _, _| panic!("asked the host"));
+        assert_eq!(got, Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn a_directory_has_no_version() {
+        let (tree, id) = tree_with(dir_meta(0o755), 5);
+        let got = resolve_node(&tree, id, soon(), |_, _, _, _| panic!("asked the host"));
+        assert_eq!(got, Err(Errno::EINVAL));
+    }
 }

@@ -24,9 +24,23 @@ pub const QUEUE_MAX: usize = 4_096;
 const BACK_MAX: usize = 1_024;
 const OFFER_WAIT: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "linux")]
+const ROOT_FLAGS: OFlags = OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
+#[cfg(target_os = "macos")]
+const ROOT_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC);
+
+// runs on the injector thread before its first event with the mount root, if it could be opened;
+// false when events must not be replayed through the mount
+#[cfg(target_os = "macos")]
+pub type Boot = Box<dyn FnOnce(Option<&OwnedFd>) -> bool + Send>;
+
 struct Shared {
     tid: AtomicI32,
     stalled: AtomicBool,
+    #[cfg(target_os = "macos")]
+    off: AtomicBool,
     queued: Mutex<FxHashSet<(bool, NodeId)>>,
 }
 
@@ -61,9 +75,28 @@ impl Drop for InjectorThread {
 
 impl Injector {
     // the returned receiver carries settle effects for events that could not be replayed
+    #[cfg(target_os = "linux")]
     pub fn start(
         mount: &Path,
         tree: Arc<RwLock<GTree>>,
+    ) -> io::Result<(Arc<Injector>, InjectorThread, Receiver<Vec<Effect>>)> {
+        Self::spawn(mount, tree)
+    }
+
+    // as start, with the startup self-test run on the injector thread before any event
+    #[cfg(target_os = "macos")]
+    pub fn start_probed(
+        mount: &Path,
+        tree: Arc<RwLock<GTree>>,
+        boot: Boot,
+    ) -> io::Result<(Arc<Injector>, InjectorThread, Receiver<Vec<Effect>>)> {
+        Self::spawn(mount, tree, boot)
+    }
+
+    fn spawn(
+        mount: &Path,
+        tree: Arc<RwLock<GTree>>,
+        #[cfg(target_os = "macos")] boot: Boot,
     ) -> io::Result<(Arc<Injector>, InjectorThread, Receiver<Vec<Effect>>)> {
         let (tx, rx) = bounded(QUEUE_MAX);
         let (stop_tx, stop_rx) = bounded(1);
@@ -71,6 +104,8 @@ impl Injector {
         let sh = Arc::new(Shared {
             tid: AtomicI32::new(0),
             stalled: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            off: AtomicBool::new(false),
             queued: Mutex::new(FxHashSet::default()),
         });
         let w = Worker {
@@ -81,9 +116,13 @@ impl Injector {
             tree,
             back: back_tx,
         };
+        #[cfg(target_os = "linux")]
+        let job = move || w.run();
+        #[cfg(target_os = "macos")]
+        let job = move || w.run(boot);
         let join = thread::Builder::new()
             .name("csync-inject".into())
-            .spawn(move || w.run())?;
+            .spawn(job)?;
         Ok((
             Arc::new(Injector { tx, sh }),
             InjectorThread {
@@ -97,6 +136,10 @@ impl Injector {
     // a full queue applies backpressure, so a burst reaches watchers as events or as their own queue
     // overflow; false (settle without an event) only once the injector has been stuck for OFFER_WAIT
     pub fn offer(&self, s: Synth) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.sh.off.load(Ordering::Acquire) {
+            return false;
+        }
         let key = match &s {
             Synth::Modify { node } => Some((true, *node)),
             Synth::Attrib { node } => Some((false, *node)),
@@ -155,15 +198,31 @@ fn push_name(path: &mut String, name: &Name) {
 }
 
 fn mode(perm: u16) -> Mode {
-    Mode::from_bits_truncate(u32::from(perm) & 0o7777)
+    Mode::from_bits_truncate((u32::from(perm) & 0o7777) as _)
+}
+
+fn open_root(mount: &Path) -> Option<OwnedFd> {
+    rustix::fs::open(mount, ROOT_FLAGS, Mode::empty()).ok()
 }
 
 impl Worker {
-    fn run(self) {
-        self.sh
-            .tid
-            .store(rustix::thread::gettid().as_raw_pid(), Ordering::Release);
+    fn run(self, #[cfg(target_os = "macos")] boot: Boot) {
+        #[cfg(target_os = "linux")]
+        let me = rustix::thread::gettid().as_raw_pid();
+        // requests carry the process id here, so this must stay the only csync thread that touches the mount
+        #[cfg(target_os = "macos")]
+        let me = i32::try_from(std::process::id()).unwrap_or(0);
+        self.sh.tid.store(me, Ordering::Release);
+        #[cfg(target_os = "linux")]
         let mut root: Option<OwnedFd> = None;
+        #[cfg(target_os = "macos")]
+        let mut root = open_root(&self.mount);
+        #[cfg(target_os = "macos")]
+        let replay = boot(root.as_ref());
+        #[cfg(target_os = "macos")]
+        if !replay {
+            self.sh.off.store(true, Ordering::Release);
+        }
         let (mut a, mut b) = (String::new(), String::new());
         loop {
             let next = select_biased! {
@@ -178,12 +237,7 @@ impl Worker {
                 lock(&self.sh.queued).remove(&(matches!(s, Synth::Modify { .. }), *node));
             }
             if root.is_none() {
-                root = rustix::fs::open(
-                    self.mount.as_path(),
-                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )
-                .ok();
+                root = open_root(&self.mount);
             }
             let begun = match &s {
                 Synth::Modify { node } => {
@@ -192,7 +246,12 @@ impl Worker {
                 }
                 _ => None,
             };
-            if let Some(r) = &root {
+            #[cfg(target_os = "linux")]
+            let target = root.as_ref();
+            // events that cannot be told from a user's requests are settled without touching the mount
+            #[cfg(target_os = "macos")]
+            let target = root.as_ref().filter(|_| replay);
+            if let Some(r) = target {
                 let _ = self.inject(r, &s, &mut a, &mut b);
             }
             let mut fx = Vec::new();
@@ -269,6 +328,8 @@ impl Worker {
                         OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                         Mode::empty(),
                     ) {
+                        // macos has no fallocate, so a modify there is always the truncate
+                        #[cfg(target_os = "linux")]
                         Ok(fd) if SIZES_FROM_ATTRS.load(Ordering::Relaxed) => {
                             let keep = rustix::fs::FallocateFlags::KEEP_SIZE;
                             return Ok(rustix::fs::fallocate(&fd, keep, 0, 1)?);

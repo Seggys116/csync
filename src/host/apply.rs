@@ -1071,6 +1071,24 @@ mod tests {
         RelPath::new(s).unwrap()
     }
 
+    // fills every pending hash from the file's own bytes, the way the background hasher does
+    fn learn_pending(core: &Core) {
+        let mut jobs = Vec::new();
+        let mut cursor = 0;
+        loop {
+            cursor = core
+                .tree()
+                .pending_from(cursor, usize::MAX, &|_, _| true, &mut jobs);
+            if cursor == 0 {
+                break;
+            }
+        }
+        for j in jobs {
+            let data = std::fs::read(core.root_path.join(j.path.as_str())).unwrap();
+            core.learn_hash(&j.path, j.ver, &j.stat, *blake3::hash(&data).as_bytes());
+        }
+    }
+
     fn ev(p: &str, flags: u32, cookie: u32) -> WatchEvent {
         WatchEvent {
             path: rp(p),
@@ -1371,6 +1389,7 @@ mod tests {
         let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
         let core =
             Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        learn_pending(&core);
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let mut app = Applier::new(
             core.clone(),
@@ -1533,6 +1552,13 @@ mod tests {
             rescan_all: false,
         });
         assert!(app.excludes.is_empty());
+        let indexed = core.tree().get(&rp("scratch/h.txt")).map(|e| e.meta.size);
+        assert_eq!(
+            indexed,
+            Some(9),
+            "a write made as the watch armed was never indexed"
+        );
+        learn_pending(&core);
         assert_eq!(
             core.tree()
                 .get(&rp("scratch/h.txt"))
@@ -1583,6 +1609,7 @@ mod tests {
         let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
         let core =
             Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        learn_pending(&core);
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let mut app = Applier::new(
             core.clone(),

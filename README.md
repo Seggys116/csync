@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-2dd4bf.svg)](https://github.com/Seggys116/csync/blob/main/LICENSE)
 [![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-a78bfa.svg)](https://www.rust-lang.org)
 ![Host](https://img.shields.io/badge/host-macOS%20%7C%20Linux-30363d.svg)
-![Guest](https://img.shields.io/badge/guest-Linux%20(FUSE)-30363d.svg)
+![Guest](https://img.shields.io/badge/guest-Linux%20(FUSE)%20%7C%20macOS%20(experimental)-30363d.svg)
 
 [Install](#install) · [Use](#use) · [How it works](#how-it-works) · [Conflicts](#conflicts) · [Speed](#speed) · [Security](#security) · [Docs](#docs)
 
@@ -47,14 +47,34 @@ The script downloads the latest release for your machine, checks its SHA-256 and
 (`CSYNC_INSTALL_DIR` changes that, `CSYNC_VERSION` pins a release). Prebuilt binaries cover macOS (Apple silicon and
 Intel) and Linux (x86_64 and arm64, static).
 
+**Update**
+
+```sh
+csync update
+```
+
+This installs the latest release over the running binary with the same checks as the install script: HTTPS from the
+GitHub release only, the archive verified against its published SHA-256, and the new binary run once before it replaces
+the old one. `csync update --check` prints the current and latest versions and exits with 10 when an update is
+available; `csync update --version X` installs a specific release, older ones included. It needs `curl` and `tar`.
+Running host and join sessions keep the old version until you restart them. A binary that a package manager owns, or
+in a directory you cannot write, is left alone with a message.
+
 **From source**
 
 ```sh
 cargo install --git https://github.com/Seggys116/csync
 ```
 
-The guest needs `fuse3` (`fusermount3`). On Debian or Ubuntu: `sudo apt install fuse3`. Run `csync doctor` on each
-machine to check the setup; it prints a fix for anything missing.
+A Linux guest needs `fuse3` (`fusermount3`). On Debian or Ubuntu: `sudo apt install fuse3`.
+
+A macOS guest is experimental and has not been verified against a real macFUSE mount yet. It needs macFUSE 5.5 or
+later (https://macfuse.github.io) and one of two backends, tried in this order: the FSKit extension, which needs macOS
+15.4 or later and must be enabled in System Settings > General > Login Items & Extensions > File System Extensions, or
+the kernel extension, which must be allowed in System Settings > Privacy & Security (Reduced Security on Apple
+silicon). `csync join` loads macFUSE's `libfuse3` at run time and prints what is missing if it cannot.
+
+Run `csync doctor` on each machine to check the setup; it prints a fix for anything missing.
 
 ## Use
 
@@ -95,7 +115,9 @@ every synced file. The guest receives that index when it joins, so `stat`, `read
 from memory without a network round trip. File contents are fetched on first read, checked against their hash and
 kept in an on-disk cache. When a file changes on the host, the host pushes an invalidation, and the guest drops the
 stale data and raises the matching inotify event. Paths that gitignore excludes live in a plain directory on the
-guest's own disk and never cross the link.
+guest's own disk and never cross the link. Neither the cache nor that directory outlives the session: quitting the
+guest unmounts and then deletes both, so every join starts from a fresh snapshot of the host and a file the host
+deleted on purpose can never come back. Pairing is not affected.
 
 `.git` is read-only on the guest: you can run `git log`, `git diff` and `git status` there, but only the host changes
 history. `git status` on the guest is fast with no extra git settings.
@@ -113,7 +135,8 @@ nothing else is written anywhere. Editors that save through a temporary file and
 
 Measured end to end with a real host and a real FUSE guest on one machine (Docker, Linux arm64, loopback), on a
 checkout of 17,403 files. "Native" is the same command run directly on the host's directory. Medians of three runs,
-taken while unrelated work was loading the machine, so treat them as conservative.
+taken while unrelated work was loading the machine, so treat them as conservative. Every join starts with an empty
+cache, so "first run" is what a new session sees and "repeat" is a repeat inside the same session.
 
 | What | Native | csync guest |
 |---|---|---|
@@ -149,7 +172,9 @@ in [SECURITY.md](SECURITY.md). Report problems privately through GitHub security
 
 ## Limits
 
-- The guest is Linux only. A Linux host works, mainly so the tests can run host and guest on one machine.
+- The guest runs on Linux, and experimentally on macOS through macFUSE 5.5 or later; the macOS guest has not been
+  verified against a real mount, and everything measured here is from a Linux guest. A Linux host works, mainly so the
+  tests can run host and guest on one machine.
 - One project per `csync host` process.
 - Paths deeper than 128 directories, and symlinks that would point outside the project root, are refused.
 - Kernel passthrough, used for ignored files and for synced files while a guest writes them, needs `CAP_SYS_ADMIN`
@@ -158,6 +183,9 @@ in [SECURITY.md](SECURITY.md). Report problems privately through GitHub security
   and `flock` and `fcntl` locks are not shared with the host. FIFOs and sockets can live only in ignored directories.
 - Writes need the host to be reachable. Cached files stay readable if the link drops, and uncommitted guest writes
   are retried when it comes back.
+- Nothing is kept between guest sessions. Quitting deletes the blob cache and the ignored-path overlay (build
+  outputs, `node_modules`, virtual environments), so the next join downloads the project again and rebuilds them. A
+  guest that was killed or lost power is cleaned up the next time it joins that host.
 
 ## Docs
 
