@@ -294,6 +294,54 @@
    "sleep": 3
   },
   {
+   "sleep": 1
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf '# orbit\\n\\nA small job scheduler.\\nIt keeps retries and timers.\\n' > README.md"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "mark": "d0"
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\u001b[A"
+   }
+  },
+  {
+   "sleep": 1
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\r"
+   }
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\u001b"
+   }
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "mark": "d1"
+  },
+  {
    "print": "host"
   },
   {
@@ -362,6 +410,19 @@
    "title": "csync join",
    "pause": 3,
    "label": "csync join screen with a live session: link latency, cache, edit counters and the activity list"
+  },
+  {
+   "file": "${CAP_OUT}/tui-guest-diff.svg",
+   "pane": "guest",
+   "from": "d0",
+   "from_offset": -0.5,
+   "to": "d1",
+   "to_offset": 0.5,
+   "title": "csync join",
+   "pause": 3,
+   "label": "csync join screen with the activity list and a diff of a host edit opened from it",
+   "still": "d0",
+   "still_offset": 4.0
   }
  ]
 }
