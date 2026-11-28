@@ -4524,10 +4524,21 @@ impl Filesystem for GuestFs {
             let known = match meta.version() {
                 Some(v) => Some(v),
                 // resolving inline fills the cache for a small file in the same round trip
-                None => match self.core.version_or_new(id, Instant::now() + WAIT) {
-                    Ok(v) => v,
-                    Err(e) => return reply.error(e),
-                },
+                None => {
+                    if domain == GDomain::Synced
+                        && !settled
+                        && !seen
+                        && meta.size <= INLINE_MAX as u64
+                    {
+                        self.core
+                            .prefetch
+                            .open_batch(parent, id, Instant::now() + WAIT);
+                    }
+                    match self.core.version_or_new(id, Instant::now() + WAIT) {
+                        Ok(v) => v,
+                        Err(e) => return reply.error(e),
+                    }
+                }
             };
             let Some(ver) = known else {
                 if meta.size != 0 {
@@ -4573,6 +4584,11 @@ impl Filesystem for GuestFs {
             // a file read here before gets a direct handle below, which can still move to a replacement
             let first = domain == GDomain::Synced && !settled && !seen && !cached(Some(ver));
             let (ver, path) = if first {
+                if ver.size <= INLINE_MAX as u64 {
+                    self.core
+                        .prefetch
+                        .open_batch(parent, id, Instant::now() + WAIT);
+                }
                 match self.core.fetch_for_open(id, ver, &path) {
                     Ok(r) => r,
                     Err(e) => return reply.error(e),

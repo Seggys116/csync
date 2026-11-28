@@ -8,13 +8,15 @@ use rustc_hash::FxHashSet;
 use std::collections::VecDeque;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const WARM_MAX: u64 = 1 << 20;
 const SIBLING_MAX: u64 = 256 << 10;
 const SIBLING_TOTAL: u64 = 4 << 20;
+// what a cold open waits for: one FetchMany part, the rest of the directory follows from the prefetch thread
+const OPEN_BATCH_BYTES: u64 = BATCH_BYTES;
 // a FetchMany reply is one frame the host builds before sending, so batches stay small and several fly at once
 const BATCH_BYTES: u64 = 1 << 20;
 const BATCH_ITEMS: usize = 512;
@@ -89,6 +91,7 @@ pub enum Hint {
 
 // skip: Local overlay or pending delete, never fetched from the host
 // ver: set only for a pending file (no hash yet), naming the host version to fetch
+// used: open now or read before, so a new version of it is wanted soon
 #[derive(Clone, Debug)]
 pub struct Item {
     pub node: NodeId,
@@ -98,6 +101,7 @@ pub struct Item {
     pub ver: Option<VerKey>,
     pub size: u64,
     pub skip: bool,
+    pub used: bool,
 }
 
 // the prefetcher's view of the guest tree; implemented for the usual lock wrappers of GTree
@@ -128,6 +132,7 @@ fn gtree_item(t: &GTree, id: NodeId, path: RelPath) -> Option<Item> {
         },
         size: n.meta.size,
         skip: n.domain == GDomain::Local || n.vis == Vis::PendingDelete,
+        used: n.open.load(Relaxed) > 0 || n.read_ver.is_some(),
     })
 }
 
@@ -258,11 +263,42 @@ enum Job {
     Ver(Vec<PendingWant>),
 }
 
+// a batch reply for the worker to store, or the count a lander left once it stored one
+enum Landed {
+    Reply(Batch, Result<Reply, RpcError>),
+    Stored { n: u64, closed: bool },
+}
+
 struct State {
     hints: VecDeque<(Instant, Hint)>,
-    landed: Vec<(Batch, Result<Reply, RpcError>)>,
+    landed: Vec<Landed>,
     stop: bool,
     idle: bool,
+}
+
+fn lower_priority() {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = rustix::process::setpriority_process(Some(rustix::thread::gettid()), NICE);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        crate::sys::fs_unix::lower_thread_priority();
+    }
+}
+
+// verifies and writes a batch's blobs; (items asked, whether the link closed)
+fn store(cache: &BlobCache, b: Batch, r: Result<Reply, RpcError>) -> (u64, bool) {
+    let n = b.len() as u64;
+    match r {
+        Ok(Reply::Blobs { items }) => {
+            b.land(items);
+            cache.evict();
+            (n, false)
+        }
+        Err(RpcError::Closed) => (n, true),
+        _ => (n, false),
+    }
 }
 
 impl PShared {
@@ -272,6 +308,12 @@ impl PShared {
         if w {
             self.cv.notify_one();
         }
+    }
+
+    fn landed(&self, l: Landed) {
+        let mut st = lock(&self.st);
+        st.landed.push(l);
+        self.wake(st);
     }
 }
 
@@ -318,6 +360,8 @@ struct Walk {
     sibs: FxHashSet<NodeId>,
     // a burst of cold opens means a scan wants everything: background batches use the wide window until then
     scan_until: Option<Instant>,
+    // the walk has reached the git object stores, which no working-tree scan reads
+    objects: bool,
     urgent: bool,
     saved: bool,
 }
@@ -387,6 +431,7 @@ impl Walk {
         self.bytes = 0;
         self.vbytes = 0;
         self.urgent = false;
+        self.objects = false;
     }
 }
 
@@ -403,6 +448,8 @@ pub struct Prefetch {
     sh: Arc<PShared>,
     join: Mutex<Option<JoinHandle<()>>>,
     pub progress: Arc<Progress>,
+    cache: Arc<BlobCache>,
+    tree: Arc<dyn TreeView>,
 }
 
 impl Prefetch {
@@ -423,8 +470,8 @@ impl Prefetch {
         let progress = Arc::new(Progress::default());
         let w = Worker {
             sh: sh.clone(),
-            cache,
-            tree,
+            cache: cache.clone(),
+            tree: tree.clone(),
             walk: Walk::default(),
             inflight: 0,
             prog: progress.clone(),
@@ -436,7 +483,83 @@ impl Prefetch {
             sh,
             join: Mutex::new(Some(join)),
             progress,
+            cache,
+            tree,
         })
+    }
+
+    // a cold open fetches its small siblings with its own bytes and lands them, so their readers wait on one burst
+    pub fn open_batch(&self, dir: NodeId, node: NodeId, deadline: Instant) {
+        let Some(own) = self.tree.item(node) else {
+            return;
+        };
+        if own.size == 0 || own.size > SIBLING_MAX || own.hash.is_some_and(|h| self.cache.held(&h))
+        {
+            return;
+        }
+        let mut items = Vec::new();
+        if !self.tree.list_fetchable(dir, node, SIBLING_MAX, &mut items) {
+            return;
+        }
+        let (mut hashed, mut pending, mut total) = (Vec::new(), Vec::new(), 0u64);
+        let siblings = items
+            .into_iter()
+            .filter(|i| i.node != node && !i.dir && !i.skip);
+        for i in std::iter::once(own).chain(siblings) {
+            if hashed.len() + pending.len() >= BATCH_ITEMS.min(BATCH_MAX) {
+                break;
+            }
+            if i.size == 0 || total + i.size > OPEN_BATCH_BYTES {
+                continue;
+            }
+            match (i.hash, i.ver) {
+                (Some(h), _) if !self.cache.contains(&h) => hashed.push((i.path, h, i.size)),
+                (None, Some(k)) => pending.push((i.node, i.path, k)),
+                _ => continue,
+            }
+            total += i.size;
+        }
+        if hashed.len() + pending.len() < 2 {
+            return;
+        }
+        let (used, cap) = self.cache.usage();
+        if used.saturating_add(total) > cap / 10 * 9 {
+            return;
+        }
+        let Some(remote) = self.cache.remote().current() else {
+            return;
+        };
+        let _busy = self.cache.gate().enter();
+        let batch = self.cache.begin_batch(&hashed);
+        let (tx, rx) = mpsc::sync_channel(1);
+        // a batch dropped unsent fails its fills, and their readers fetch on their own
+        let sent = !batch.is_empty() && {
+            let op = Op::FetchMany {
+                items: batch.request(),
+            };
+            let done = Box::new(move |r| {
+                let _ = tx.send(r);
+            });
+            remote.submit(op, done).is_ok()
+        };
+        // files the host has not hashed yet come by version in the same burst and the tree learns their hashes
+        if !pending.is_empty() {
+            let want: Vec<(RelPath, VerKey)> =
+                pending.iter().map(|(_, p, k)| (p.clone(), *k)).collect();
+            let got = self.cache.fetch_many_ver(&want, deadline);
+            for ((node, path, k), (p, r)) in pending.iter().zip(got) {
+                if *path == p
+                    && let Ok(v) = r
+                {
+                    self.tree.learn(*node, k.ver, v.hash);
+                }
+            }
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if sent && let Ok(Ok(Reply::Blobs { items })) = rx.recv_timeout(wait) {
+            batch.land(items);
+        }
+        self.cache.evict();
     }
 
     // never blocks the caller; the worker is only woken when it is parked
@@ -466,14 +589,7 @@ impl Drop for Prefetch {
 
 impl Worker {
     fn run(mut self) {
-        #[cfg(target_os = "linux")]
-        {
-            let _ = rustix::process::setpriority_process(Some(rustix::thread::gettid()), NICE);
-        }
-        #[cfg(target_os = "macos")]
-        {
-            crate::sys::fs_unix::lower_thread_priority();
-        }
+        lower_priority();
         let mut items = Vec::new();
         loop {
             let (hints, landed) = {
@@ -503,8 +619,8 @@ impl Worker {
                     st = self.sh.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                 }
             };
-            for (b, r) in landed {
-                self.land(b, r);
+            for l in landed {
+                self.land(l);
             }
             for (t, h) in hints {
                 self.on_hint(t, h, &mut items);
@@ -524,7 +640,7 @@ impl Worker {
             None => true,
             Some((_, true)) => self.inflight < HOT_DEPTH,
             Some((_, false)) => {
-                if self.walk.scan_until.is_some_and(|t| Instant::now() < t) {
+                if !self.walk.objects && self.walk.scan_until.is_some_and(|t| Instant::now() < t) {
                     return self.inflight < HOT_DEPTH;
                 }
                 self.inflight < DEPTH && self.cache.gate().idle_or_arm()
@@ -532,16 +648,14 @@ impl Worker {
         }
     }
 
-    fn land(&mut self, b: Batch, r: Result<Reply, RpcError>) {
+    fn land(&mut self, l: Landed) {
         self.inflight = self.inflight.saturating_sub(1);
-        let n = b.len() as u64;
-        match r {
-            Ok(Reply::Blobs { items }) => {
-                b.land(items);
-                self.cache.evict();
-            }
-            Err(RpcError::Closed) => self.walk.halt(),
-            _ => {}
+        let (n, closed) = match l {
+            Landed::Reply(b, r) => store(&self.cache, b, r),
+            Landed::Stored { n, closed } => (n, closed),
+        };
+        if closed {
+            self.walk.halt();
         }
         if self.walk.phase == Phase::Warm {
             self.prog.done.fetch_add(n, Relaxed);
@@ -565,8 +679,8 @@ impl Worker {
                     st.idle = false;
                 }
             };
-            for (b, r) in landed {
-                self.land(b, r);
+            for l in landed {
+                self.land(l);
             }
         }
         true
@@ -597,8 +711,13 @@ impl Worker {
                 if let Some(i) = self.tree.item(node)
                     && i.hash == Some(h)
                 {
-                    let _ = self.add(i, WARM_MAX, true);
-                    self.walk.urgent = true;
+                    // a pushed hash of a file nobody reads only labels it: the walk fetches it in its turn
+                    if i.used {
+                        let _ = self.add(i, WARM_MAX, true);
+                        self.walk.urgent = true;
+                    } else if self.walk.phase == Phase::Idle {
+                        let _ = self.add(i, WARM_MAX, false);
+                    }
                 }
             }
             Hint::WarmPending(node) => {
@@ -726,12 +845,12 @@ impl Worker {
             batch.push((i.path, h, i.size));
             if bytes >= BATCH_BYTES || batch.len() >= BATCH_ITEMS.min(BATCH_MAX) {
                 bytes = 0;
-                if !self.issue(std::mem::take(&mut batch)) {
+                if !self.issue(std::mem::take(&mut batch), true) {
                     return self.walk.halt();
                 }
             }
         }
-        if !self.issue(batch) {
+        if !self.issue(batch, true) {
             return self.walk.halt();
         }
         // step seals and sends urgent batches without waiting for a window
@@ -792,7 +911,11 @@ impl Worker {
                 *items = found;
             }
         }
-        if self.walk.queue.is_empty() && self.walk.phase == Phase::Warm {
+        if self.walk.queue.is_empty()
+            && self.walk.phase == Phase::Warm
+            && !self.walk.later.is_empty()
+        {
+            self.walk.objects = true;
             self.walk.queue.extend(self.walk.later.drain(..));
         }
         let exhausted = self.walk.queue.is_empty() && self.walk.hot.is_empty();
@@ -801,11 +924,11 @@ impl Worker {
             self.walk.seal();
         }
         while self.can_step() {
-            let Some((job, _)) = self.walk.ready.pop_front() else {
+            let Some((job, hot)) = self.walk.ready.pop_front() else {
                 break;
             };
             let sent = match job {
-                Job::Hash(batch) => self.issue(batch),
+                Job::Hash(batch) => self.issue(batch, hot),
                 Job::Ver(first) => {
                     let mut group = vec![first];
                     while group.len() < VER_PAR
@@ -959,8 +1082,8 @@ impl Worker {
         })
     }
 
-    // false only when disconnected; the reply is landed by this thread, never on the network reader
-    fn issue(&mut self, items: Vec<Want>) -> bool {
+    // false only when disconnected; a lander stores the reply, at the readers' priority when hot
+    fn issue(&mut self, items: Vec<Want>, hot: bool) -> bool {
         if items.is_empty() {
             return true;
         }
@@ -985,11 +1108,27 @@ impl Worker {
         let op = Op::FetchMany {
             items: batch.request(),
         };
-        let sh = self.sh.clone();
+        let (sh, cache) = (self.sh.clone(), self.cache.clone());
         let done = Box::new(move |r: Result<Reply, RpcError>| {
-            let mut st = lock(&sh.st);
-            st.landed.push((batch, r));
-            sh.wake(st);
+            // readers may wait on this batch, so it is stored off the network reader and the prefetch thread
+            let job = Arc::new(Mutex::new(Some((batch, r))));
+            let (lsh, ljob) = (sh.clone(), job.clone());
+            let spawned = std::thread::Builder::new()
+                .name("csync-land".into())
+                .spawn(move || {
+                    if !hot {
+                        lower_priority();
+                    }
+                    if let Some((b, r)) = lock(&ljob).take() {
+                        let (n, closed) = store(&cache, b, r);
+                        lsh.landed(Landed::Stored { n, closed });
+                    }
+                });
+            if spawned.is_err()
+                && let Some((b, r)) = lock(&job).take()
+            {
+                sh.landed(Landed::Reply(b, r));
+            }
         });
         match remote.submit(op, done) {
             Ok(_) => {
@@ -1155,6 +1294,7 @@ mod tests {
             }),
             size: data.len() as u64,
             skip: false,
+            used: false,
         }
     }
 
@@ -1225,10 +1365,7 @@ mod tests {
     }
 
     fn land_all(w: &mut Worker) {
-        let landed = std::mem::take(&mut lock(&w.sh.st).landed);
-        for (b, r) in landed {
-            w.land(b, r);
-        }
+        assert!(w.drain());
     }
 
     #[test]
@@ -1439,5 +1576,73 @@ mod tests {
         land_all(&mut r.w);
         assert_eq!(r.host.hash_rounds.load(Relaxed), 0);
         assert!(lock(&r.host.ver_rounds).is_empty());
+    }
+
+    #[test]
+    fn a_pushed_hash_of_an_unread_file_is_left_to_the_running_walk() {
+        let (a, b) = (&b"alpha"[..], &b"bravo"[..]);
+        let read = Item {
+            used: true,
+            ..known(3, "b.txt", b)
+        };
+        let mut r = rig(vec![known(2, "a.txt", a), read], &[(1, a), (2, b)]);
+        let mut items = Vec::new();
+        r.w.on_hint(Instant::now(), Hint::Start, &mut items);
+        r.w.on_hint(Instant::now(), Hint::Warm(2, hash_of(a)), &mut items);
+        assert!(r.w.walk.batch.is_empty());
+        assert!(!r.w.walk.urgent);
+        // a file a reader has seen is wanted again soon, so its new hash still jumps the queue
+        r.w.on_hint(Instant::now(), Hint::Warm(3, hash_of(b)), &mut items);
+        assert_eq!(r.w.walk.batch.len(), 1);
+        assert!(r.w.walk.urgent && r.w.walk.hot_batch);
+    }
+
+    #[test]
+    fn the_git_object_tail_never_takes_the_scan_window() {
+        let a = &b"alpha"[..];
+        let mut r = rig(vec![known(2, "a.txt", a)], &[(1, a)]);
+        r.w.walk.phase = Phase::Warm;
+        r.w.walk.ready.push_back((
+            Job::Hash(vec![(RelPath::new("a.txt").unwrap(), hash_of(a), 5)]),
+            false,
+        ));
+        r.w.walk.scan_until = Some(Instant::now() + Duration::from_secs(60));
+        r.w.inflight = DEPTH;
+        assert!(r.w.can_step());
+        r.w.walk.objects = true;
+        assert!(!r.w.can_step());
+    }
+
+    #[test]
+    fn a_cold_open_lands_its_hashed_and_pending_siblings_in_one_burst() {
+        let (a, b, c) = (&b"alpha"[..], &b"bravo"[..], &b"charlie"[..]);
+        let items = vec![
+            known(2, "a.txt", a),
+            known(3, "b.txt", b),
+            pending(4, "c.txt", 5, c),
+        ];
+        let r = rig(items, &[(1, a), (2, b), (5, c)]);
+        let p = Prefetch::start(r.w.cache.clone(), r.tree.clone()).unwrap();
+        p.open_batch(ROOT, 2, Instant::now() + Duration::from_secs(30));
+
+        assert_eq!(r.host.hash_rounds.load(Relaxed), 1);
+        assert_eq!(
+            *lock(&r.host.ver_rounds),
+            vec![vec![RelPath::new("c.txt").unwrap()]]
+        );
+        for d in [a, b, c] {
+            assert!(r.w.cache.contains(&hash_of(d)));
+        }
+        assert_eq!(*lock(&r.tree.learned), vec![(4, 5, hash_of(c))]);
+    }
+
+    #[test]
+    fn a_cold_open_with_nothing_to_share_leaves_its_file_to_the_read() {
+        let a = &b"alpha"[..];
+        let r = rig(vec![known(2, "a.txt", a)], &[(1, a)]);
+        let p = Prefetch::start(r.w.cache.clone(), r.tree.clone()).unwrap();
+        p.open_batch(ROOT, 2, Instant::now() + Duration::from_secs(30));
+        assert_eq!(r.host.hash_rounds.load(Relaxed), 0);
+        assert!(!r.w.cache.contains(&hash_of(a)));
     }
 }

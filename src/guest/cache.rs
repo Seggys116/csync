@@ -2162,6 +2162,12 @@ impl BlobCache {
         lock(&self.s.inner).slots.contains_key(h)
     }
 
+    // cached, or a fill for it is already on its way
+    pub fn held(&self, h: &Hash32) -> bool {
+        let g = lock(&self.s.inner);
+        g.slots.contains_key(h) || g.fills.contains_key(h)
+    }
+
     pub fn insert_bytes(&self, h: &Hash32, data: &[u8], path: Option<&RelPath>) -> Result<(), i32> {
         self.s.insert_bytes(h, data, path)
     }
