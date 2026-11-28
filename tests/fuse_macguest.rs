@@ -17,7 +17,7 @@ mod mac {
         io::{BufRead, BufReader, Write},
         net::TcpListener,
         path::{Path, PathBuf},
-        process::{Child, ChildStdin, Command, Stdio},
+        process::{Child, ChildStdin, Command, Output, Stdio},
         sync::{
             Arc, Mutex,
             mpsc::{self, Receiver},
@@ -270,6 +270,152 @@ mod mac {
         if b { "yes" } else { "no" }
     }
 
+    fn git_present() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn git_run(dir: &Path, args: &[&str]) -> Output {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "safe.directory=*",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("LC_ALL", "C")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    }
+
+    fn git_describe(args: &[&str], o: &Output) -> String {
+        format!(
+            "git {args:?}: exit {:?}\nstdout: {}\nstderr: {}",
+            o.status.code(),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    }
+
+    // turns the fixture's bare .git skeleton into a repository with two commits, before the host indexes it
+    fn git_fixture(proj: &Path) {
+        for (args, note) in [
+            (vec!["init", "-q", "-b", "main"], None),
+            (vec!["add", "-A"], None),
+            (vec!["commit", "-qm", "first commit"], None),
+            (vec!["add", "-A"], Some("notes.txt")),
+            (vec!["commit", "-qm", "second commit"], None),
+        ] {
+            if let Some(name) = note {
+                fs::write(proj.join(name), "second commit adds this\n").unwrap();
+            }
+            let o = git_run(proj, &args);
+            assert!(o.status.success(), "fixture {}", git_describe(&args, &o));
+        }
+    }
+
+    // every file and directory under `dir` with its size, sorted, for a before and after comparison
+    fn dir_listing(dir: &Path) -> Vec<(String, u64)> {
+        let mut found = Vec::new();
+        let mut stack = vec![(dir.to_path_buf(), String::new())];
+        while let Some((d, rel)) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else {
+                found.push((format!("{rel}/<unreadable>"), 0));
+                continue;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let r = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                let Ok(md) = fs::symlink_metadata(e.path()) else {
+                    found.push((format!("{r}<unreadable>"), 0));
+                    continue;
+                };
+                if md.is_dir() {
+                    stack.push((e.path(), r.clone()));
+                }
+                found.push((r, md.len()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    // git on the mount against the host's two-commit repository; returns what went wrong, one entry per failure
+    fn git_block(mnt: &Path, proj: &Path) -> Vec<String> {
+        let mut bad = Vec::new();
+
+        let args = ["status", "--porcelain"];
+        let o = git_run(mnt, &args);
+        let clean = o.status.success() && o.stdout.is_empty();
+        if !clean {
+            bad.push(git_describe(&args, &o));
+        }
+        eprintln!("git status --porcelain clean={}", yn(clean));
+
+        let args = ["log", "--format=%s"];
+        let o = git_run(mnt, &args);
+        let subjects = String::from_utf8_lossy(&o.stdout).into_owned();
+        let both = o.status.success()
+            && subjects.lines().collect::<Vec<_>>() == ["second commit", "first commit"];
+        if !both {
+            bad.push(git_describe(&args, &o));
+        }
+        eprintln!("git log --oneline shows both commits={}", yn(both));
+
+        let args = ["fsck", "--full"];
+        let o = git_run(mnt, &args);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let healthy = o.status.success() && !text.contains("corrupt");
+        if !healthy {
+            bad.push(git_describe(&args, &o));
+        }
+        eprintln!("git fsck --full healthy={}", yn(healthy));
+
+        let before = dir_listing(&proj.join(".git"));
+        let args = ["commit", "--allow-empty", "-m", "x"];
+        let o = git_run(mnt, &args);
+        let refused = !o.status.success() && o.status.code().is_some();
+        if !refused {
+            bad.push(format!(
+                "a commit on the read-only .git was not refused: {}",
+                git_describe(&args, &o)
+            ));
+        }
+        eprintln!("git commit --allow-empty refused={}", yn(refused));
+
+        let after = dir_listing(&proj.join(".git"));
+        let same = before == after;
+        if !same {
+            bad.push(format!(
+                "the host .git changed under the refused commit: before {before:?}, after {after:?}"
+            ));
+        }
+        eprintln!("git host .git unchanged={}", yn(same));
+        bad
+    }
+
     pub fn run() {
         let Some(bin) = std::env::var_os("CSYNC_BIN").map(PathBuf::from) else {
             eprintln!("skip: set CSYNC_BIN to the macos csync build");
@@ -300,6 +446,10 @@ mod mac {
         fs::write(proj.join(".gitignore"), "target/\n").unwrap();
         fs::write(proj.join("hello.txt"), "hello from host\n").unwrap();
         fs::write(proj.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+        let have_git = git_present();
+        if have_git {
+            git_fixture(&proj);
+        }
         let _unmount = Unmount(mnt.clone());
 
         let hk = csync(&bin, &hh, &["key", "show"]);
@@ -382,6 +532,13 @@ mod mac {
             fs::read_to_string(mnt.join("src/lib.rs")).unwrap(),
             "pub fn f() {}\n"
         );
+
+        let git_failures = if have_git {
+            git_block(&mnt, &proj)
+        } else {
+            eprintln!("skip: git is not installed, no git checks on the mount");
+            Vec::new()
+        };
 
         // host changes show on the mount inside the attribute lifetime plus slack; each shape is timed on its own
         // and all are asserted at the end of the test
@@ -485,6 +642,12 @@ mod mac {
             "the host project changed on unmount"
         );
         host.say("quit");
+
+        assert!(
+            git_failures.is_empty(),
+            "git on the mount failed:\n{}",
+            git_failures.join("\n---\n")
+        );
 
         // asserted last so a host change that never shows does not hide the other results
         for (what, t) in shapes {

@@ -120,20 +120,22 @@ jobs:
           path: ${{ runner.temp }}/csync-bin
       # artifacts drop the executable bit
       - run: chmod 755 "$RUNNER_TEMP/csync-bin/csync"
-      - name: fuse_it
+      - name: fuse suites
         shell: bash
         env:
           CSYNC_BIN: ${{ runner.temp }}/csync-bin/csync
         run: |
-          if [ "$CSYNC_IT_PRIV" = root ]; then
-            # build as the runner user so target/ stays user-owned, then run only the test binary as root
-            bin="$(cargo test --locked --test fuse_it --no-run --message-format=json \
-              | jq -r 'select(.reason == "compiler-artifact" and .target.name == "fuse_it" and .executable != null) | .executable')"
-            test -x "$bin"
-            sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
-          else
-            cargo test --locked --test fuse_it -- --test-threads=1
-          fi
+          for suite in fuse_it fuse_git; do
+            if [ "$CSYNC_IT_PRIV" = root ]; then
+              # build as the runner user so target/ stays user-owned, then run only the test binary as root
+              bin="$(cargo test --locked --test "$suite" --no-run --message-format=json \
+                | jq -r --arg suite "$suite" 'select(.reason == "compiler-artifact" and .target.name == $suite and .executable != null) | .executable')"
+              test -x "$bin"
+              sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
+            else
+              cargo test --locked --test "$suite" -- --test-threads=1
+            fi
+          done
 
   # experimental: whether macFUSE (FSKit backend) can run on a hosted macOS runner; never blocks merging, not in ci-ok
   macfuse:
