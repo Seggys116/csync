@@ -96,6 +96,10 @@ pub enum PushError {
     Closed,
 }
 
+// a message that could not be queued without waiting: the bulk queue is full or the link is closed
+#[derive(Debug, PartialEq, Eq)]
+pub struct Full;
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -268,6 +272,17 @@ impl Link {
             u.push_back(*seq);
         }
         self.send(Msg::Push(p)).map_err(|_| PushError::Closed)
+    }
+
+    // queues behind file data and never waits, so the caller may drop what is not essential
+    pub fn try_send_bulk(&self, m: Msg) -> Result<(), Full> {
+        if self.is_closed() {
+            return Err(Full);
+        }
+        self.inner
+            .bulk
+            .try_send(Out::Msg(Prio::Bulk, m))
+            .map_err(|_| Full)
     }
 
     pub fn unacked_pushes(&self) -> usize {
@@ -829,6 +844,8 @@ fn op_ok(op: &Op) -> bool {
                 && range.is_none_or(|(_, l)| l <= RANGE_UNIT)
         }
         Op::FetchMany { items } => items.len() <= BATCH_MAX,
+        Op::Hashes { items, .. } => items.len() <= BATCH_MAX,
+        Op::Resolve { .. } => true,
         Op::Commit { new, body, .. } => new.size <= FILE_MAX && body_ok(body),
         Op::Rename { body, .. } => body
             .as_ref()
@@ -841,6 +858,7 @@ fn reply_ok(r: &Reply) -> bool {
     match r {
         Reply::Blob { meta, body } => meta_ok(meta) && body_ok(body),
         Reply::Blobs { items } => items.len() <= BATCH_MAX,
+        Reply::Hashes { items } => items.len() <= BATCH_MAX,
         Reply::Done { meta } => meta_ok(meta),
         Reply::Conflict { current, .. } => current.as_ref().is_none_or(meta_ok),
     }
@@ -860,6 +878,7 @@ fn check_msg(m: &Msg) -> Result<(), &'static str> {
                     Change::Remove { .. } | Change::Rename { .. } => true,
                 })
         }
+        Msg::Push(Push::Hashes { items, .. }) => items.len() <= BATCH_MAX,
         Msg::Welcome(w) => {
             w.repos.len() <= BATCH_MAX
                 && w.excludes.len() <= BATCH_MAX
@@ -1633,6 +1652,31 @@ pub(crate) mod tests {
                 break;
             }
         }
+    }
+
+    #[test]
+    fn bulk_messages_are_delivered_without_waiting_and_refused_once_closed() {
+        let (g, h) = test_pair();
+        let items = vec![(RelPath::new("a/b").unwrap(), 4, [7u8; 32])];
+        h.link
+            .try_send_bulk(Msg::Push(Push::Hashes {
+                index: 9,
+                items: items.clone(),
+            }))
+            .unwrap();
+        match recv(&g) {
+            In::Msg(Msg::Push(Push::Hashes {
+                index: 9,
+                items: got,
+            })) => assert_eq!(got, items),
+            _ => panic!("expected pushed hashes"),
+        }
+        h.link.close(CloseReason::Local);
+        assert_eq!(
+            h.link
+                .try_send_bulk(Msg::Push(Push::HashesDone { index: 9 })),
+            Err(Full)
+        );
     }
 
     fn expect_protocol_close(g: &Session) {

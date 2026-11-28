@@ -3,12 +3,27 @@ use crate::crypto::trust::{IDENTITY_FILE, PEERS_FILE};
 use crate::ctl::{self, CtlReq};
 use crate::tui::{json_str, unescape};
 use std::{
+    ffi::{OsStr, OsString},
     fmt::Write as _,
     fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
+#[cfg(target_os = "macos")]
+const MACFUSE_BUNDLE: &str = "/Library/Filesystems/macfuse.fs";
+#[cfg(target_os = "macos")]
+const MACFUSE_MIN: (u32, u32) = (5, 5);
+// darwin 24.4 is macos 15.4
+#[cfg(target_os = "macos")]
+const FSKIT_DARWIN_MIN: (u32, u32) = (24, 4);
+#[cfg(target_os = "macos")]
+const FSKIT_MODULE_ID: &str = "io.macfuse.app.fsmodule.macfuse";
+#[cfg(target_os = "macos")]
+const KEXT_ID: &str = "io.macfuse.filesystems.macfuse";
+#[cfg(target_os = "macos")]
+const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const FINDER_LITTER: &str = ".DS_Store";
 const KERNEL_MIN: (u32, u32) = (5, 15);
 const PASSTHROUGH_MIN: (u32, u32) = (6, 9);
 const WATCHES_MIN: u64 = 524_288;
@@ -74,7 +89,9 @@ pub fn run(dirs: &Dirs, o: &Opts) -> Vec<Check> {
         out.push(cap_sys_admin(kernel));
         out.push(fuse_conf(o.allow_other));
     }
-    if cfg!(target_os = "linux") {
+    #[cfg(target_os = "macos")]
+    out.extend(macos_guest(o));
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         out.push(mount_point(o.mount.as_deref()));
         out.push(stale_mounts());
     }
@@ -85,6 +102,8 @@ pub fn run(dirs: &Dirs, o: &Opts) -> Vec<Check> {
     out.push(cache_space(&dirs.cache));
     #[cfg(target_os = "linux")]
     out.push(reflink(&dirs.cache));
+    #[cfg(target_os = "macos")]
+    out.push(clonefile(&dirs.cache));
     if cfg!(target_os = "linux") {
         out.push(inotify_watches());
     }
@@ -339,15 +358,50 @@ pub fn is_enotconn(e: &io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENOTCONN)
 }
 
+// a mount whose daemon is gone: linux reports ENOTCONN, macfuse also reports ENXIO (device not configured)
+pub fn is_dead_mount(e: &io::Error) -> bool {
+    is_enotconn(e) || (cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::ENXIO))
+}
+
+fn unmount_hint(p: &Path) -> String {
+    if cfg!(target_os = "macos") {
+        format!("diskutil unmount force '{}'", p.display())
+    } else {
+        format!("fusermount3 -uz '{}'", p.display())
+    }
+}
+
+fn first_entries(p: &Path) -> io::Result<Vec<OsString>> {
+    fs::read_dir(p)?
+        .take(2)
+        .map(|e| e.map(|e| e.file_name()))
+        .collect()
+}
+
+// Finder creates a .DS_Store in any directory it has shown
+pub fn only_finder_litter(names: &[OsString]) -> bool {
+    matches!(names, [n] if n.as_os_str() == OsStr::new(FINDER_LITTER))
+}
+
+pub fn remove_finder_litter(p: &Path) {
+    if cfg!(target_os = "macos") && first_entries(p).is_ok_and(|n| only_finder_litter(&n)) {
+        let _ = fs::remove_file(p.join(FINDER_LITTER));
+    }
+}
+
 // the same rules join applies before mounting
 pub fn mount_point_problem(p: &Path) -> Option<(Level, String, Option<String>)> {
     use std::os::unix::fs::MetadataExt;
     match fs::symlink_metadata(p) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) if is_enotconn(&e) => Some((
+        Err(e) if is_dead_mount(&e) => Some((
             Level::Fail,
-            "stale csync mount (transport endpoint is not connected)".into(),
-            Some(format!("fusermount3 -uz '{}'", p.display())),
+            if cfg!(target_os = "macos") {
+                "stale csync mount (its daemon is gone)".into()
+            } else {
+                "stale csync mount (transport endpoint is not connected)".into()
+            },
+            Some(unmount_hint(p)),
         )),
         Err(e) => Some((Level::Fail, format!("cannot inspect: {e}"), None)),
         Ok(m) if !m.is_dir() => Some((
@@ -360,9 +414,10 @@ pub fn mount_point_problem(p: &Path) -> Option<(Level, String, Option<String>)> 
             "is owned by another user".into(),
             Some("choose a directory you own".into()),
         )),
-        Ok(_) => match fs::read_dir(p).map(|mut rd| rd.next().is_none()) {
-            Ok(true) => None,
-            Ok(false) => Some((
+        Ok(_) => match first_entries(p) {
+            Ok(names) if names.is_empty() => None,
+            Ok(names) if cfg!(target_os = "macos") && only_finder_litter(&names) => None,
+            Ok(_) => Some((
                 Level::Fail,
                 "is not empty".into(),
                 Some("choose an empty directory; csync never mounts over files".into()),
@@ -455,15 +510,24 @@ pub fn csync_mounts(mountinfo: &str) -> Vec<PathBuf> {
     out
 }
 
-fn stale_mounts() -> Check {
+// mount points of csync mounts in `mount` output, lines shaped `source on /path (type, options)`
+pub fn csync_mounts_bsd(listing: &str) -> Vec<PathBuf> {
+    listing
+        .lines()
+        .filter_map(|l| {
+            let (source, rest) = l.split_once(" on ")?;
+            let at = rest.rfind(" (")?;
+            let named = source == "csync" || source.starts_with("csync@");
+            named.then(|| PathBuf::from(&rest[..at]))
+        })
+        .collect()
+}
+
+fn stale_mounts_report(mounts: Vec<PathBuf>) -> Check {
     const N: &str = "stale mounts";
-    let Ok(info) = read_small(Path::new("/proc/self/mountinfo")) else {
-        return check(N, Level::Warn, "cannot read /proc/self/mountinfo", None);
-    };
-    let mounts = csync_mounts(&info);
     let stale: Vec<&PathBuf> = mounts
         .iter()
-        .filter(|p| fs::metadata(p).is_err_and(|e| is_enotconn(&e)))
+        .filter(|p| fs::metadata(p).is_err_and(|e| is_dead_mount(&e)))
         .collect();
     if let Some(first) = stale.first() {
         let list = stale
@@ -475,12 +539,244 @@ fn stale_mounts() -> Check {
             N,
             Level::Fail,
             format!("not connected: {list}"),
-            Some(format!("fusermount3 -uz '{}'", first.display())),
+            Some(unmount_hint(first)),
         );
     }
     match mounts.len() {
         0 => check(N, Level::Pass, "none", None),
         n => check(N, Level::Pass, format!("{n} healthy csync mount(s)"), None),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stale_mounts() -> Check {
+    let Ok(info) = read_small(Path::new("/proc/self/mountinfo")) else {
+        return check(
+            "stale mounts",
+            Level::Warn,
+            "cannot read /proc/self/mountinfo",
+            None,
+        );
+    };
+    stale_mounts_report(csync_mounts(&info))
+}
+
+#[cfg(target_os = "macos")]
+fn stale_mounts() -> Check {
+    match run_timeout("/sbin/mount", &[], TOOL_TIMEOUT) {
+        Some((true, listing)) => stale_mounts_report(csync_mounts_bsd(&listing)),
+        _ => check(
+            "stale mounts",
+            Level::Warn,
+            "cannot list mounts with mount(8)",
+            None,
+        ),
+    }
+}
+
+// stdout of a system tool, or None when it cannot start or outlives the limit
+#[cfg(target_os = "macos")]
+fn run_timeout(prog: &str, args: &[&str], limit: std::time::Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = (&mut stdout).take(PROC_MAX).read_to_end(&mut buf);
+        buf
+    });
+    let end = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => break None,
+        }
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let out = reader.join().unwrap_or_default();
+    Some((
+        status?.success(),
+        String::from_utf8_lossy(&out).into_owned(),
+    ))
+}
+
+// the text of the string element that follows a key in an xml property list
+pub fn plist_string(plist: &str, key: &str) -> Option<String> {
+    let tag = format!("<key>{key}</key>");
+    let after = plist[plist.find(&tag)? + tag.len()..]
+        .trim_start()
+        .strip_prefix("<string>")?;
+    Some(after[..after.find("</string>")?].trim().to_owned())
+}
+
+// pluginkit -m marks an enabled extension with a leading plus
+pub fn pluginkit_enabled(listing: &str, id: &str) -> bool {
+    listing
+        .lines()
+        .any(|l| l.trim_start().starts_with('+') && l.contains(id))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_guest(o: &Opts) -> Vec<Check> {
+    let mut out = Vec::with_capacity(5);
+    let installed = Path::new(MACFUSE_BUNDLE).is_dir();
+    out.push(macfuse(installed, o.mount.is_some()));
+    if installed {
+        out.push(libfuse3());
+        out.push(fskit_module());
+        out.push(kernel_extension());
+    }
+    out.push(macos_version());
+    out
+}
+
+// without --mount a missing macfuse is only informational: a mac that just runs csync host does not need it
+#[cfg(target_os = "macos")]
+fn macfuse(installed: bool, wanted: bool) -> Check {
+    const N: &str = "macFUSE";
+    const GET: &str = "install macFUSE 5.5 or later from https://macfuse.github.io";
+    if !installed {
+        let (level, detail) = if wanted {
+            (Level::Fail, "not installed")
+        } else {
+            (Level::Info, "not installed (only csync join needs it)")
+        };
+        return check(N, level, detail, Some(GET.into()));
+    }
+    let plist = read_small(&Path::new(MACFUSE_BUNDLE).join("Contents/Info.plist")).ok();
+    let version = plist
+        .as_deref()
+        .and_then(|p| plist_string(p, "CFBundleShortVersionString"));
+    match version {
+        None => check(
+            N,
+            Level::Warn,
+            "installed, but its version could not be read from Contents/Info.plist",
+            None,
+        ),
+        Some(v) => match parse_kernel(&v) {
+            Some(n) if n < MACFUSE_MIN => check(
+                N,
+                Level::Warn,
+                format!("{v} is older than {}.{}", MACFUSE_MIN.0, MACFUSE_MIN.1),
+                Some("upgrade macFUSE to 5.5 or later from https://macfuse.github.io".into()),
+            ),
+            Some(_) => check(N, Level::Pass, v, None),
+            None => check(N, Level::Warn, format!("unrecognized version {v}"), None),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn libfuse3() -> Check {
+    const N: &str = "libfuse3";
+    match crate::sys::macos::fuse3::probe() {
+        Ok(()) => check(N, Level::Pass, "loads and provides what csync needs", None),
+        Err(e) => check(N, Level::Fail, e.to_string(), None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fskit_module() -> Check {
+    const N: &str = "FSKit module";
+    match run_timeout("/usr/bin/pluginkit", &["-m", "-i", FSKIT_MODULE_ID], TOOL_TIMEOUT) {
+        None => check(N, Level::Info, "cannot query pluginkit", None),
+        Some((_, listing)) if pluginkit_enabled(&listing, FSKIT_MODULE_ID) => {
+            check(N, Level::Pass, "enabled", None)
+        }
+        Some(_) => check(
+            N,
+            Level::Warn,
+            "not enabled: csync falls back to the kernel extension",
+            Some("enable it in System Settings > General > Login Items & Extensions > File System Extensions".into()),
+        ),
+    }
+}
+
+// informational because the FSKit backend is tried first
+#[cfg(target_os = "macos")]
+fn kernel_extension() -> Check {
+    const N: &str = "kernel extension";
+    match run_timeout(
+        "/usr/bin/kmutil",
+        &["showloaded", "--bundle-identifier", KEXT_ID],
+        TOOL_TIMEOUT,
+    ) {
+        Some((true, listing)) if listing.contains(KEXT_ID) => check(
+            N,
+            Level::Info,
+            "loaded: used when the FSKit backend cannot mount",
+            None,
+        ),
+        Some((true, _)) => check(
+            N,
+            Level::Info,
+            "not loaded: only needed without FSKit (allow it in System Settings > Privacy & Security, with Reduced Security on Apple silicon)",
+            None,
+        ),
+        _ => check(N, Level::Info, "cannot query kmutil", None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_version() -> Check {
+    const N: &str = "macOS";
+    let darwin = run_timeout("/usr/sbin/sysctl", &["-n", "kern.osrelease"], TOOL_TIMEOUT)
+        .filter(|(ok, _)| *ok)
+        .and_then(|(_, s)| parse_kernel(&s));
+    match darwin {
+        None => check(N, Level::Info, "cannot read kern.osrelease", None),
+        Some(v) if v < FSKIT_DARWIN_MIN => check(
+            N,
+            Level::Warn,
+            format!(
+                "Darwin {}.{}: the FSKit backend needs macOS 15.4 or later, so csync uses the kernel extension",
+                v.0, v.1
+            ),
+            Some("upgrade to macOS 15.4 or later, or allow the macFUSE kernel extension".into()),
+        ),
+        Some(v) => check(N, Level::Pass, format!("Darwin {}.{}", v.0, v.1), None),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clonefile(cache: &Path) -> Check {
+    const N: &str = "clonefile";
+    if let Err(e) = config::ensure_private_dir(cache) {
+        return check(N, Level::Warn, format!("cache dir unusable: {e}"), None);
+    }
+    match crate::sys::volume_of(cache) {
+        Ok((ty, _, _)) if ty == "apfs" => check(
+            N,
+            Level::Pass,
+            "the cache volume is apfs: staging copies are clones and cost no space",
+            None,
+        ),
+        Ok((ty, _, _)) => check(
+            N,
+            Level::Info,
+            format!(
+                "no clonefile on {ty}: staging files are copied, which costs disk and time for large files"
+            ),
+            None,
+        ),
+        Err(e) => check(
+            N,
+            Level::Warn,
+            format!("cannot inspect the cache volume: {e}"),
+            None,
+        ),
     }
 }
 
@@ -692,6 +988,83 @@ mod tests {
             vec![PathBuf::from("/home/u/my proj"), PathBuf::from("/mnt/c")]
         );
         assert_eq!(unescape_mountinfo("a\\134b\\9"), "a\\b\\9");
+    }
+
+    #[test]
+    fn reads_the_macfuse_version_from_a_plist() {
+        let plist = "<plist version=\"1.0\"><dict>\n\
+            \t<key>CFBundleVersion</key>\n\t<string>5500</string>\n\
+            \t<key>CFBundleShortVersionString</key>\n\t<string> 5.5.1 </string>\n\
+            </dict></plist>";
+        assert_eq!(
+            plist_string(plist, "CFBundleShortVersionString").as_deref(),
+            Some("5.5.1")
+        );
+        assert_eq!(
+            plist_string(plist, "CFBundleVersion").as_deref(),
+            Some("5500")
+        );
+        assert_eq!(plist_string(plist, "Missing"), None);
+        assert_eq!(plist_string("<key>K</key><true/>", "K"), None);
+        assert_eq!(plist_string("<key>K</key><string>open", "K"), None);
+        assert_eq!(parse_kernel("5.5.1"), Some((5, 5)));
+        assert!(parse_kernel("5.4.2") < Some((5, 5)));
+    }
+
+    #[test]
+    fn pluginkit_marks_enabled_extensions_with_a_plus() {
+        let id = "io.macfuse.app.fsmodule.macfuse";
+        assert!(pluginkit_enabled(&format!("+    {id}(5.5.0)\n"), id));
+        assert!(pluginkit_enabled(
+            &format!("-    other(1)\n+    {id}(5.5.0)\n"),
+            id
+        ));
+        assert!(!pluginkit_enabled(&format!("-    {id}(5.5.0)\n"), id));
+        assert!(!pluginkit_enabled(&format!("     {id}(5.5.0)\n"), id));
+        assert!(!pluginkit_enabled("+    com.example.other(1)\n", id));
+        assert!(!pluginkit_enabled("", id));
+    }
+
+    #[test]
+    fn finds_csync_mounts_in_bsd_mount_output() {
+        let out = "/dev/disk3s1 on / (apfs, sealed, local, journaled)\n\
+                   csync on /Users/u/my proj (macfuse, nodev, nosuid, mounted by u)\n\
+                   csync@macfuse0 on /Volumes/c (macfuse, nodev)\n\
+                   sshfs on /Volumes/s (macfuse, nodev)\n";
+        assert_eq!(
+            csync_mounts_bsd(out),
+            vec![
+                PathBuf::from("/Users/u/my proj"),
+                PathBuf::from("/Volumes/c")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_ds_store_is_not_a_reason_to_refuse_a_mount_point() {
+        let names = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(only_finder_litter(&names(&[".DS_Store"])));
+        assert!(!only_finder_litter(&names(&[])));
+        assert!(!only_finder_litter(&names(&["notes.txt"])));
+        assert!(!only_finder_litter(&names(&[".DS_Store", "notes.txt"])));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mount_point_with_only_a_ds_store_is_usable_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("csync-doctor-ds-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(FINDER_LITTER), b"x").unwrap();
+        assert!(mount_point_problem(&dir).is_none());
+        remove_finder_litter(&dir);
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
+        fs::write(dir.join(FINDER_LITTER), b"x").unwrap();
+        fs::write(dir.join("keep"), b"x").unwrap();
+        assert!(mount_point_problem(&dir).is_some());
+        remove_finder_litter(&dir);
+        assert!(dir.join(FINDER_LITTER).exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -1,68 +1,84 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 370" width="960" height="370" role="img" aria-labelledby="t d" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
-<title id="t">How fast csync is</title>
-<desc id="d">Two panels of measured medians. Reading a 17,403-file project through the mount, each command on its own scale: find -type f takes 20 ms native, 115 ms on the first csync run and 14 ms on a repeat; git status takes 23 ms native, 44 ms first run, 18 ms repeat; rg over the tree takes 47 ms native, 469 ms first run, 123 ms repeat. Latency: host edit to guest inotify event 2.2 ms; write and close on the guest 0.66 ms; save via temp file and rename 1.1 ms; join to a usable mount 85 ms; idle uses 0 CPU and 0 wakeups. Measured in Docker, Linux arm64, over loopback; medians of three runs; native is the same command on the host directory.</desc>
-<style>@media (prefers-reduced-motion: reduce){.m{display:none}}</style>
-<rect width="960" height="370" rx="18" fill="#0d1117"/>
-<rect x="1" y="1" width="958" height="368" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
-<text x="24" y="34" font-size="13" font-weight="700" fill="#c9d1d9">how fast it is</text>
-<text x="936" y="34" text-anchor="end" font-size="12" fill="#8b949e">milliseconds, lower is better</text>
-<rect x="24" y="52" width="592" height="280" fill="#0d1117" stroke="#30363d" stroke-width="4" shape-rendering="crispEdges"/>
-<text x="40" y="80" font-size="13" font-weight="700" fill="#c9d1d9">reading a 17,403-file project through the mount</text>
-<text x="40" y="98" font-size="11" fill="#8b949e">each command has its own scale: bars compare within a group only</text>
-<text x="40" y="124" font-size="12" font-weight="700" fill="#c9d1d9">find -type f</text>
-<text x="600" y="124" text-anchor="end" font-size="10" fill="#8b949e">scale 0-115 ms</text>
-<g shape-rendering="crispEdges">
-<text x="52" y="142" font-size="11" fill="#8b949e">native</text>
-<rect x="128" y="133" width="66.1" height="11" fill="#6e7681"/>
-<text x="202.1" y="142" font-size="11" fill="#c9d1d9">20 ms</text>
-<text x="52" y="158" font-size="11" fill="#8b949e">first run</text>
-<rect x="128" y="149" width="380.0" height="11" fill="#a78bfa"/>
-<text x="516.0" y="158" font-size="11" fill="#c9d1d9">115 ms</text>
-<text x="52" y="174" font-size="11" fill="#8b949e">repeat</text>
-<rect x="128" y="165" width="46.3" height="11" fill="#2dd4bf"/>
-<text x="182.3" y="174" font-size="11" fill="#c9d1d9">14 ms</text>
-<rect class="m" x="580" y="132" width="0" height="48" fill="#0d1117"><animate attributeName="x" values="128;580" dur="0.9s" fill="freeze"/><animate attributeName="width" values="452;0" dur="0.9s" fill="freeze"/></rect>
-</g>
-<text x="40" y="192" font-size="12" font-weight="700" fill="#c9d1d9">git status</text>
-<text x="600" y="192" text-anchor="end" font-size="10" fill="#8b949e">scale 0-44 ms</text>
-<g shape-rendering="crispEdges">
-<text x="52" y="210" font-size="11" fill="#8b949e">native</text>
-<rect x="128" y="201" width="198.6" height="11" fill="#6e7681"/>
-<text x="334.6" y="210" font-size="11" fill="#c9d1d9">23 ms</text>
-<text x="52" y="226" font-size="11" fill="#8b949e">first run</text>
-<rect x="128" y="217" width="380.0" height="11" fill="#a78bfa"/>
-<text x="516.0" y="226" font-size="11" fill="#c9d1d9">44 ms</text>
-<text x="52" y="242" font-size="11" fill="#8b949e">repeat</text>
-<rect x="128" y="233" width="155.5" height="11" fill="#2dd4bf"/>
-<text x="291.5" y="242" font-size="11" fill="#c9d1d9">18 ms</text>
-<rect class="m" x="580" y="200" width="0" height="48" fill="#0d1117"><animate attributeName="x" values="128;580" dur="0.9s" fill="freeze"/><animate attributeName="width" values="452;0" dur="0.9s" fill="freeze"/></rect>
-</g>
-<text x="40" y="260" font-size="12" font-weight="700" fill="#c9d1d9">rg over the tree</text>
-<text x="600" y="260" text-anchor="end" font-size="10" fill="#8b949e">scale 0-469 ms</text>
-<g shape-rendering="crispEdges">
-<text x="52" y="278" font-size="11" fill="#8b949e">native</text>
-<rect x="128" y="269" width="38.1" height="11" fill="#6e7681"/>
-<text x="174.1" y="278" font-size="11" fill="#c9d1d9">47 ms</text>
-<text x="52" y="294" font-size="11" fill="#8b949e">first run</text>
-<rect x="128" y="285" width="380.0" height="11" fill="#a78bfa"/>
-<text x="516.0" y="294" font-size="11" fill="#c9d1d9">469 ms</text>
-<text x="52" y="310" font-size="11" fill="#8b949e">repeat</text>
-<rect x="128" y="301" width="99.7" height="11" fill="#2dd4bf"/>
-<text x="235.7" y="310" font-size="11" fill="#c9d1d9">123 ms</text>
-<rect class="m" x="580" y="268" width="0" height="48" fill="#0d1117"><animate attributeName="x" values="128;580" dur="0.9s" fill="freeze"/><animate attributeName="width" values="452;0" dur="0.9s" fill="freeze"/></rect>
-</g>
-<rect x="636" y="52" width="300" height="280" fill="#0d1117" stroke="#30363d" stroke-width="4" shape-rendering="crispEdges"/>
-<text x="652" y="80" font-size="13" font-weight="700" fill="#c9d1d9">latency</text>
-<text x="652" y="98" font-size="11" fill="#8b949e">medians</text>
-<text x="652" y="128" font-size="20" font-weight="700" fill="#2dd4bf">2.2 ms</text>
-<text x="652" y="144" font-size="11" fill="#8b949e">host edit -&gt; guest inotify event</text>
-<text x="652" y="172" font-size="20" font-weight="700" fill="#2dd4bf">0.66 ms</text>
-<text x="652" y="188" font-size="11" fill="#8b949e">write and close on the guest</text>
-<text x="652" y="216" font-size="20" font-weight="700" fill="#2dd4bf">1.1 ms</text>
-<text x="652" y="232" font-size="11" fill="#8b949e">save via temp file and rename</text>
-<text x="652" y="260" font-size="20" font-weight="700" fill="#2dd4bf">85 ms</text>
-<text x="652" y="276" font-size="11" fill="#8b949e">join to a usable mount</text>
-<text x="652" y="304" font-size="20" font-weight="700" fill="#2dd4bf">0 CPU, 0 wakeups</text>
-<text x="652" y="320" font-size="11" fill="#8b949e">when idle</text>
-<text x="24" y="354" font-size="11" fill="#8b949e">Docker, Linux arm64, loopback; medians of three runs; native = same command on the host directory</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 548" width="960" height="548" role="img" aria-labelledby="t d" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono','DejaVu Sans Mono',monospace">
+<title id="t">csync speed</title>
+<desc id="d">Medians of three runs on a GitHub-hosted runner with a real host and a real FUSE guest in one container, 15,959 files. find over the tree: native 31 ms, first run 829 ms, repeat 315 ms. git status: native 37 ms, first run 405 ms, repeat 131 ms. rg over the tree: native 77 ms, first run 738 ms, repeat 174 ms. Host edit to guest inotify event 1.5 ms median and 5.7 ms p90. Write and close on the guest 1.0 ms, save through a temp file and rename 2.0 ms, join to a usable mount 120 ms, idle 0 CPU and 0 wakeups. 3,000 host files changed and seen by the guest in 104 ms, 2,000 small guest files all on the host in 298 ms, first read of 512 MiB in 734 ms, writing 512 MiB to the host in 7.9 s.</desc>
+<rect width="960" height="548" rx="18" fill="#0d1117"/><rect x="1" y="1" width="958" height="546" rx="17" fill="none" stroke="#30363d" stroke-width="2"/>
+<text x="32" y="38" font-size="13" font-weight="700" fill="#c9d1d9">how fast it is</text>
+<text x="928" y="38" text-anchor="end" font-size="11" fill="#8b949e">milliseconds, lower is better</text>
+<rect x="32" y="56" width="600" height="336" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<text x="52" y="82" font-size="13" font-weight="700" fill="#c9d1d9">reading a 15,959-file project through the mount</text>
+<text x="52" y="100" font-size="10" fill="#8b949e">each command has its own scale; bars are medians, whiskers the fastest to slowest run</text>
+<text x="52" y="126" font-size="12" font-weight="700" fill="#c9d1d9">find -type f</text>
+<text x="612" y="126" text-anchor="end" font-size="10" fill="#8b949e">scale 0-1033 ms</text>
+<text x="52" y="148" font-size="11" fill="#8b949e">native</text>
+<rect x="130" y="138" width="11.4" height="14" fill="#6e7681" shape-rendering="crispEdges"/>
+<text x="149.4" y="149" font-size="11" fill="#c9d1d9">31 ms</text>
+<text x="52" y="170" font-size="11" fill="#8b949e">first run</text>
+<rect x="130" y="160" width="305.0" height="14" fill="#a78bfa" shape-rendering="crispEdges"/>
+<path d="M248.1 167H510.0M248.1 163V171M510.0 163V171" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="518.0" y="171" font-size="11" fill="#c9d1d9">829 ms</text>
+<text x="52" y="192" font-size="11" fill="#8b949e">repeat</text>
+<rect x="130" y="182" width="115.9" height="14" fill="#2dd4bf" shape-rendering="crispEdges"/>
+<path d="M156.5 189H479.8M156.5 185V193M479.8 185V193" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="487.8" y="193" font-size="11" fill="#c9d1d9">315 ms</text>
+<text x="52" y="214" font-size="12" font-weight="700" fill="#c9d1d9">git status</text>
+<text x="612" y="214" text-anchor="end" font-size="10" fill="#8b949e">scale 0-476 ms</text>
+<text x="52" y="236" font-size="11" fill="#8b949e">native</text>
+<rect x="130" y="226" width="29.5" height="14" fill="#6e7681" shape-rendering="crispEdges"/>
+<text x="167.5" y="237" font-size="11" fill="#c9d1d9">37 ms</text>
+<text x="52" y="258" font-size="11" fill="#8b949e">first run</text>
+<rect x="130" y="248" width="323.3" height="14" fill="#a78bfa" shape-rendering="crispEdges"/>
+<path d="M340.0 255H510.0M340.0 251V259M510.0 251V259" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="518.0" y="259" font-size="11" fill="#c9d1d9">405 ms</text>
+<text x="52" y="280" font-size="11" fill="#8b949e">repeat</text>
+<rect x="130" y="270" width="104.6" height="14" fill="#2dd4bf" shape-rendering="crispEdges"/>
+<path d="M179.5 277H256.9M179.5 273V281M256.9 273V281" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="264.9" y="281" font-size="11" fill="#c9d1d9">131 ms</text>
+<text x="52" y="302" font-size="12" font-weight="700" fill="#c9d1d9">rg over the tree</text>
+<text x="612" y="302" text-anchor="end" font-size="10" fill="#8b949e">scale 0-829 ms</text>
+<text x="52" y="324" font-size="11" fill="#8b949e">native</text>
+<rect x="130" y="314" width="35.3" height="14" fill="#6e7681" shape-rendering="crispEdges"/>
+<text x="173.3" y="325" font-size="11" fill="#c9d1d9">77 ms</text>
+<text x="52" y="346" font-size="11" fill="#8b949e">first run</text>
+<rect x="130" y="336" width="338.3" height="14" fill="#a78bfa" shape-rendering="crispEdges"/>
+<path d="M395.4 343H510.0M395.4 339V347M510.0 339V347" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="518.0" y="347" font-size="11" fill="#c9d1d9">738 ms</text>
+<text x="52" y="368" font-size="11" fill="#8b949e">repeat</text>
+<rect x="130" y="358" width="79.8" height="14" fill="#2dd4bf" shape-rendering="crispEdges"/>
+<path d="M203.8 365H253.3M203.8 361V369M253.3 361V369" stroke="#c9d1d9" stroke-width="1.2" fill="none" shape-rendering="crispEdges"/>
+<text x="261.3" y="369" font-size="11" fill="#c9d1d9">174 ms</text>
+<rect x="652" y="56" width="276" height="336" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<text x="672" y="82" font-size="13" font-weight="700" fill="#c9d1d9">latency</text>
+<text x="672" y="100" font-size="10" fill="#8b949e">medians</text>
+<text x="672" y="132" font-size="22" font-weight="700" fill="#2dd4bf">1.5 ms</text>
+<text x="672" y="149" font-size="10" fill="#8b949e">host edit to guest inotify, p90 5.7 ms</text>
+<text x="672" y="184" font-size="22" font-weight="700" fill="#2dd4bf">1.0 ms</text>
+<text x="672" y="201" font-size="10" fill="#8b949e">write and close a file on the guest</text>
+<text x="672" y="236" font-size="22" font-weight="700" fill="#2dd4bf">2.0 ms</text>
+<text x="672" y="253" font-size="10" fill="#8b949e">save through a temp file and rename</text>
+<text x="672" y="288" font-size="22" font-weight="700" fill="#2dd4bf">120 ms</text>
+<text x="672" y="305" font-size="10" fill="#8b949e">join to a usable mount</text>
+<text x="672" y="340" font-size="22" font-weight="700" fill="#2dd4bf">0 CPU</text>
+<text x="672" y="357" font-size="10" fill="#8b949e">and 0 wakeups per second when idle</text>
+<rect x="32" y="410" width="218" height="76" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<rect x="32" y="410" width="4" height="76" fill="#a78bfa" shape-rendering="crispEdges"/>
+<text x="48" y="436" font-size="16" font-weight="700" fill="#c9d1d9">104 ms</text>
+<text x="48" y="456" font-size="10" fill="#8b949e">3,000 files changed on the host,</text>
+<text x="48" y="470" font-size="10" fill="#8b949e">guest converged</text>
+<rect x="258" y="410" width="218" height="76" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<rect x="258" y="410" width="4" height="76" fill="#a78bfa" shape-rendering="crispEdges"/>
+<text x="274" y="436" font-size="16" font-weight="700" fill="#c9d1d9">298 ms</text>
+<text x="274" y="456" font-size="10" fill="#8b949e">2,000 small files written on</text>
+<text x="274" y="470" font-size="10" fill="#8b949e">the guest, all on the host</text>
+<rect x="484" y="410" width="218" height="76" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<rect x="484" y="410" width="4" height="76" fill="#a78bfa" shape-rendering="crispEdges"/>
+<text x="500" y="436" font-size="16" font-weight="700" fill="#c9d1d9">734 ms</text>
+<text x="500" y="456" font-size="10" fill="#8b949e">first read of a 512 MiB file,</text>
+<text x="500" y="470" font-size="10" fill="#8b949e">698 MiB/s</text>
+<rect x="710" y="410" width="218" height="76" fill="#161b22" stroke="#30363d" stroke-width="2" shape-rendering="crispEdges"/>
+<rect x="710" y="410" width="4" height="76" fill="#a78bfa" shape-rendering="crispEdges"/>
+<text x="726" y="436" font-size="16" font-weight="700" fill="#c9d1d9">7.9 s</text>
+<text x="726" y="456" font-size="10" fill="#8b949e">write a 512 MiB file to the</text>
+<text x="726" y="470" font-size="10" fill="#8b949e">host, 65 MiB/s</text>
+<text x="32" y="508" font-size="10" fill="#8b949e">a GitHub-hosted ubuntu-24.04 runner, host and guest in one container over loopback; every join starts with an empty cache,</text>
+<text x="32" y="524" font-size="10" fill="#8b949e">so first run is what a new session sees and repeat is a repeat in the same session; native is the same command on the host directory</text>
 </svg>

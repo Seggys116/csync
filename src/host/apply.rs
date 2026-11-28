@@ -346,12 +346,21 @@ fn look_dir(root: BorrowedFd<'_>, probes: &[Probe], vol: Vol) -> Vec<Seen> {
         .first()
         .and_then(|p| p.path.split_last())
         .and_then(|(d, _)| RelPath::new(d).ok());
-    let dfd = match dir.map(|d| sys::open_beneath(root, &d, OFlags::RDONLY | OFlags::DIRECTORY)) {
+    let dfd = match dir
+        .as_ref()
+        .map(|d| sys::open_beneath(root, d, OFlags::RDONLY | OFlags::DIRECTORY))
+    {
         Some(Ok(fd)) => fd,
         Some(Err(e)) if gone_err(&e) => return probes.iter().map(|_| Seen::Absent).collect(),
         Some(Err(e)) => return probes.iter().map(|_| skip(&e)).collect(),
         None => return probes.iter().map(|_| Seen::Skip).collect(),
     };
+    if vol.folds
+        && probes.iter().any(may_be_respelled)
+        && dir.as_ref().is_some_and(|d| !dir_spelled(root, d))
+    {
+        return probes.iter().map(|_| Seen::Absent).collect();
+    }
     probes
         .iter()
         .map(|p| {
@@ -371,14 +380,37 @@ fn look_dir(root: BorrowedFd<'_>, probes: &[Probe], vol: Vol) -> Vec<Seen> {
 }
 
 // on folding volumes a name that changed only in case or normalisation still resolves; only a rename can cause that
+fn may_be_respelled(p: &Probe) -> bool {
+    p.prior.is_none() || p.flags & (wflag::CREATED | wflag::RENAMED | wflag::REMOVED) != 0
+}
+
 fn respelled(dfd: BorrowedFd<'_>, p: &Probe) -> bool {
-    if p.prior.is_some() && p.flags & (wflag::CREATED | wflag::RENAMED | wflag::REMOVED) == 0 {
+    if !may_be_respelled(p) {
         return false;
     }
     let Some((_, name)) = p.path.split_last() else {
         return false;
     };
     matches!(sys::spelled_at(dfd, name), Ok(false))
+}
+
+// the same holds for each directory above it: a late event or retry under a renamed parent's old spelling
+fn dir_spelled(root: BorrowedFd<'_>, dir: &RelPath) -> bool {
+    let mut cur: Option<rustix::fd::OwnedFd> = None;
+    for c in dir.components() {
+        let at = cur.as_ref().map_or(root, AsFd::as_fd);
+        if matches!(sys::spelled_at(at, c), Ok(false)) {
+            return false;
+        }
+        let next = RelPath::new(c)
+            .ok()
+            .and_then(|r| sys::open_beneath(at, &r, OFlags::RDONLY | OFlags::DIRECTORY).ok());
+        match next {
+            Some(fd) => cur = Some(fd),
+            None => return true,
+        }
+    }
+    true
 }
 
 // fd or memory exhaustion and interrupted calls pass; anything else (permissions) leaves the path unsynced
@@ -610,8 +642,8 @@ impl Applier {
             return;
         }
         let token = self.watcher.resume_token();
-        let tree = self.core.tree();
-        if persist::save_index(&self.index_path, &tree, token).is_err() {
+        let snap = persist::snapshot_index(&self.core.tree(), token);
+        if persist::write_index(&self.index_path, &snap).is_err() {
             self.core.dirty.store(true, Ordering::Release);
         }
     }
@@ -1071,6 +1103,24 @@ mod tests {
         RelPath::new(s).unwrap()
     }
 
+    // fills every pending hash from the file's own bytes, the way the background hasher does
+    fn learn_pending(core: &Core) {
+        let mut jobs = Vec::new();
+        let mut cursor = 0;
+        loop {
+            cursor = core
+                .tree()
+                .pending_from(cursor, usize::MAX, &|_, _| true, &mut jobs);
+            if cursor == 0 {
+                break;
+            }
+        }
+        for j in jobs {
+            let data = std::fs::read(core.root_path.join(j.path.as_str())).unwrap();
+            core.learn_hash(&j.path, j.ver, &j.stat, *blake3::hash(&data).as_bytes());
+        }
+    }
+
     fn ev(p: &str, flags: u32, cookie: u32) -> WatchEvent {
         WatchEvent {
             path: rp(p),
@@ -1216,6 +1266,9 @@ mod tests {
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let idx = root.with_extension("index");
         let _clean_idx = Clean(idx.clone());
+        let mut mark = idx.clone().into_os_string();
+        mark.push(".clean");
+        let _clean_mark = Clean(mark.into());
         let app = Applier::new(core.clone(), watcher, rx, stop_rx, idx);
         let h = std::thread::spawn(move || app.run());
         fs::rename(root.join("foo.txt"), root.join("FOO.txt")).unwrap();
@@ -1253,6 +1306,83 @@ mod tests {
         drop(t);
         let _ = stop_tx.send(());
         h.join().unwrap();
+    }
+
+    // a late event or retry under a directory's old spelling still resolves on a folding volume
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stale_spelling_of_a_parent_does_not_bring_it_back() {
+        use std::fs;
+        struct NoWatch;
+        impl Watcher for NoWatch {
+            fn set_excludes(&mut self, _: &[RelPath]) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn watch_dir(&mut self, _: &RelPath) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn unwatch_dir(&mut self, _: &RelPath) {}
+            fn resume_token(&self) -> Option<sys::ResumeToken> {
+                None
+            }
+        }
+        struct Clean(PathBuf);
+        impl Drop for Clean {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csync-respell-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        fs::create_dir_all(root.join("Src/deep")).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let _clean = Clean(root.clone());
+        fs::write(root.join("Src/main.c"), "m\n").unwrap();
+        fs::write(root.join("Src/deep/x.c"), "x\n").unwrap();
+        let rules = Arc::new(std::sync::RwLock::new(Rules::new(&[])));
+        let (tx, rx) = crossbeam_channel::bounded(16);
+        let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
+        let core =
+            Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        if !core.fs.case_fold {
+            return;
+        }
+        let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let mut app = Applier::new(
+            core.clone(),
+            Box::new(NoWatch),
+            rx,
+            stop_rx,
+            root.join("index"),
+        );
+        let batch = |paths: &[(&str, u32)]| Batch {
+            paths: paths.iter().map(|&(p, f)| (rp(p), f)).collect(),
+            pairs: Vec::new(),
+            rescans: Vec::new(),
+            rescan_all: false,
+        };
+        fs::rename(root.join("Src"), root.join("SRC")).unwrap();
+        app.process(batch(&[
+            ("SRC", wflag::RENAMED | wflag::IS_DIR),
+            ("Src", wflag::RENAMED | wflag::IS_DIR),
+        ]));
+        app.process(batch(&[
+            ("Src/deep/x.c", wflag::MODIFIED),
+            ("Src/main.c", wflag::MODIFIED),
+        ]));
+        let t = core.tree();
+        assert!(t.get(&rp("SRC/main.c")).is_some() && t.get(&rp("SRC/deep/x.c")).is_some());
+        for p in ["Src", "Src/main.c", "Src/deep", "Src/deep/x.c"] {
+            assert!(
+                t.get(&rp(p)).is_none(),
+                "{p} came back under its old spelling"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1371,6 +1501,7 @@ mod tests {
         let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
         let core =
             Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        learn_pending(&core);
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let mut app = Applier::new(
             core.clone(),
@@ -1533,6 +1664,13 @@ mod tests {
             rescan_all: false,
         });
         assert!(app.excludes.is_empty());
+        let indexed = core.tree().get(&rp("scratch/h.txt")).map(|e| e.meta.size);
+        assert_eq!(
+            indexed,
+            Some(9),
+            "a write made as the watch armed was never indexed"
+        );
+        learn_pending(&core);
         assert_eq!(
             core.tree()
                 .get(&rp("scratch/h.txt"))
@@ -1583,6 +1721,7 @@ mod tests {
         let tree = scan::scan(&root, &mut rules.write().unwrap()).unwrap();
         let core =
             Arc::new(Core::new(root.clone(), Name::new("t").unwrap(), tree, rules, tx).unwrap());
+        learn_pending(&core);
         let (_stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let mut app = Applier::new(
             core.clone(),

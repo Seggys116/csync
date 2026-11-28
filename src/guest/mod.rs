@@ -1,57 +1,78 @@
 pub mod tree;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cache;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod coherence;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fsops;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod fuse;
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub mod gitindex;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod inject;
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+mod mount_mac;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod peek;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod pipe;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod prefetch;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod wipe;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod write;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use live::run;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod live {
     use super::cache::{BlobCache, CacheConfig, Remote, RemoteSlot, lock};
+    #[cfg(target_os = "macos")]
+    use super::coherence::{self, BackendKind, Env};
     use super::fs::{self, Core, Counters, Mounted};
+    #[cfg(target_os = "macos")]
+    use super::inject::Boot;
     use super::inject::{Injector, InjectorThread};
+    use super::peek::{self, GuestPeek};
+    use super::pipe::Pipe;
     use super::prefetch::{Hint, Prefetch, TreeView};
-    use super::tree::{Effect, GDomain, GTree, NodeId, ROOT, Vis};
-    use super::write::{NoticeFn, Writer};
-    use crate::config::{GUEST_TREE_FILE, GuestCfg, ensure_private_dir};
+    use super::tree::{Effect, GDomain, GNode, GTree, NodeId, ROOT, Vis};
+    use super::wipe::{self, HostPaths};
+    use super::write::{FeedFn, NoticeFn, Writer};
+    use crate::config::{GuestCfg, ensure_private_dir};
     use crate::crypto::noise::Reject;
     use crate::crypto::trust::{Identity, PeerKey, TrustEntry, now_unix};
+    use crate::host::peek::rows_dropped;
     use crate::ignore::rules::{Class, Rules};
-    use crate::index::persist;
     use crate::net::conn::{self, CloseReason, Dial, In, Link, NetError, Session};
     use crate::net::rpc::Rpc;
     use crate::proto::{
-        BATCH_MAX, Bye, Change, ExcludeSrc, Hash32, Hello, Kind, Msg, Name, Notice, NoticeKind, Op,
-        PROTO, Push, RelPath, Reply, TEXT_MAX, Welcome,
+        BATCH_MAX, Bye, Change, ExcludeSrc, Hash32, Hello, IndexId, Kind, Msg, Name, Notice,
+        NoticeKind, Op, PROTO, Push, RelPath, Reply, TEXT_MAX, VerKey, Want, Welcome,
         hs::{HsHello, PAIR_TIMEOUT_S, PairStep, Role},
     };
+    use crate::tui::feed::Entry;
     use crate::tui::{ConnState, PeerView, UiBus, UiCmd, now_ms};
     use crossbeam_channel::{
         Receiver, RecvTimeoutError, Sender, after, bounded, never, select, unbounded,
     };
     use rustc_hash::{FxHashMap, FxHashSet};
     use rustix::fs::{Mode, OFlags};
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsFd;
     use std::{
         collections::VecDeque,
         io,
         net::SocketAddr,
-        path::{Path, PathBuf},
         sync::{
             Arc, Condvar, Mutex, OnceLock, RwLock,
-            atomic::{AtomicBool, Ordering::Relaxed},
+            atomic::{AtomicBool, AtomicU32, Ordering::Relaxed},
         },
         thread::{self, JoinHandle},
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -65,14 +86,33 @@ mod live {
     const UNVERIFIED_HINT: &str =
         "reconnect refused by an unverified response from host; still retrying";
     const STOP_POLL: Duration = Duration::from_millis(100);
-    const SAVE_EVERY: Duration = Duration::from_secs(60);
     const UI_EVERY: Duration = Duration::from_millis(250);
     const PING_EVERY: Duration = Duration::from_secs(30);
+    // a live host answers every ping, so this long without anything from it means the link is dead
+    const SILENT_AFTER: Duration = PING_EVERY.saturating_mul(3);
+    // a session must stay up this long after its first synced batch before it counts as healthy
+    const HEALTHY_AFTER: Duration = Duration::from_secs(30);
+    // the cap on the wait before redialing after sessions that keep dying young
+    const SHORT_SESSION_BACKOFF_MAX: Duration = Duration::from_secs(30);
     const RULE_JOBS: usize = 1_024;
     const RULE_WAIT: Duration = Duration::from_secs(30);
+    const HASH_WAIT: Duration = Duration::from_secs(5);
+    // how long shutdown lets closed new files finish their commits before the write pipe stops
+    const SETTLE_WAIT: Duration = Duration::from_secs(10);
     // a FetchMany reply is one frame, so rule-file batches stay under FRAME_MAX
     const RULE_BATCH_BYTES: u64 = 3 << 20;
+    #[cfg(target_os = "linux")]
     const OVERLAY_DIR: &str = "overlay";
+    // spotlight skips directories named *.noindex
+    #[cfg(target_os = "macos")]
+    const OVERLAY_DIR: &str = "overlay.noindex";
+    // how long shutdown waits for the last thread holding the session core to let go of it
+    const CORE_WAIT: Duration = Duration::from_secs(3);
+    const CRASH_HINT: &str =
+        "an earlier session ended without cleaning up; its local state was wiped before this one";
+    const WIPE_MOUNTED_HINT: &str = "the mount could not be released, so the local guest state was kept; the next join of this host wipes it";
+    const WIPE_BUSY_HINT: &str = "the local guest state is still in use, so it was kept; the next join of this host wipes it";
+    const WIPE_PARTIAL_HINT: &str = "some local guest state could not be wiped; the next join of this host retries and will not start until it is gone";
 
     enum Fail {
         Retry,
@@ -270,6 +310,48 @@ mod live {
         }
     }
 
+    // the wait before the first dial after a lost session, and the backoff carried to the next loss; only a healthy
+    // session clears it, so one that dies right after its snapshot cannot loop at full speed
+    fn redial_policy(carried: Duration, healthy: bool) -> (Duration, Duration) {
+        if healthy {
+            return (Duration::ZERO, Duration::ZERO);
+        }
+        let next = if carried.is_zero() {
+            BACKOFF_MIN
+        } else {
+            (carried * 2).min(SHORT_SESSION_BACKOFF_MAX)
+        };
+        (carried, next)
+    }
+
+    fn link_silent(heard: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(heard) >= SILENT_AFTER
+    }
+
+    // one short line for the ui saying what ended the link
+    fn close_text(why: &CloseReason) -> String {
+        match why {
+            CloseReason::Eof => "host closed the connection".to_owned(),
+            CloseReason::Io(io::ErrorKind::TimedOut) => "connection timed out".to_owned(),
+            CloseReason::Io(io::ErrorKind::ConnectionReset) => {
+                "connection reset by the host".to_owned()
+            }
+            CloseReason::Io(io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe) => {
+                "connection lost".to_owned()
+            }
+            CloseReason::Io(k) => format!("network error: {k}"),
+            CloseReason::Protocol(m) => format!("protocol error: {m}"),
+            CloseReason::Revoked => "the host revoked this guest".to_owned(),
+            CloseReason::Local => "connection closed locally".to_owned(),
+        }
+    }
+
+    fn wait_or_stop(stop: &AtomicBool, until: Instant) {
+        while !stop.load(Relaxed) && Instant::now() < until {
+            thread::sleep(STOP_POLL.min(until.saturating_duration_since(Instant::now())));
+        }
+    }
+
     // false when the user asked to quit while waiting
     fn backoff_wait(cmds: &Receiver<UiCmd>, backoff: &mut Duration) -> bool {
         let wait = *backoff;
@@ -287,17 +369,49 @@ mod live {
         }
     }
 
-    fn load_tree(path: &Path) -> GTree {
-        let mut t = GTree::new();
-        if let Some((index, seq, entries)) = persist::load_guest_tree(path) {
-            let mut fx = Vec::new();
-            if t.apply_snapshot_part(&entries, true, &mut fx).is_ok() {
-                t.set_version(index, seq);
-            } else {
-                t = GTree::new();
+    // whatever an earlier session left for this host is removed before anything is loaded, so a join always starts clean
+    fn clear_previous(paths: &HostPaths, bus: &UiBus) -> io::Result<()> {
+        let crashed = wipe::marker_present(paths.state());
+        let sum = paths.wipe()?;
+        if let Some(p) = sum.problem() {
+            return Err(io::Error::other(format!(
+                "cannot clear the guest state an earlier session left behind: {p}"
+            )));
+        }
+        if crashed {
+            bus.update(|s| s.hint(CRASH_HINT));
+        }
+        Ok(())
+    }
+
+    fn finish_wipe(paths: &HostPaths, bus: &UiBus, blocker: Option<&'static str>) {
+        let hint = match blocker {
+            Some(h) => h,
+            None => match paths.wipe() {
+                Ok(sum) if sum.is_clean() => return,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => WIPE_BUSY_HINT,
+                Ok(_) | Err(_) => WIPE_PARTIAL_HINT,
+            },
+        };
+        bus.update(|s| s.hint(hint));
+    }
+
+    // true once this was the last holder of the core, which frees the blob cache and its directory lock
+    fn release(mut core: Arc<Core>) -> bool {
+        let end = Instant::now() + CORE_WAIT;
+        loop {
+            match Arc::try_unwrap(core) {
+                Ok(c) => {
+                    drop(c);
+                    return true;
+                }
+                Err(c) if Instant::now() < end => {
+                    core = c;
+                    thread::sleep(STOP_POLL / 5);
+                }
+                Err(_) => return false,
             }
         }
-        t
     }
 
     fn notice_fn(bus: Arc<UiBus>, link: Arc<Mutex<Option<Link>>>, ctr: Arc<Counters>) -> NoticeFn {
@@ -314,8 +428,12 @@ mod live {
             if let Some(l) = lock(&link).as_ref() {
                 let _ = l.send(Msg::Push(Push::Notice(n.clone())));
             }
-            bus.update(|s| s.push_notice(now_ms(), n));
+            bus.notice(now_ms(), n);
         })
+    }
+
+    fn feed_fn(bus: Arc<UiBus>) -> FeedFn {
+        Arc::new(move |e: Entry| bus.feed().push_batch([e]))
     }
 
     pub fn run(cfg: GuestCfg, bus: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Result<()> {
@@ -350,16 +468,60 @@ mod live {
             }
         };
         let key = sess.link.peer();
-        let state = cfg.dirs.host_state_dir(&key);
-        ensure_private_dir(&state)?;
+        let paths = HostPaths::new(&cfg.dirs, &key);
+        clear_previous(&paths, &bus)?;
+        let (res, blocker) = session(cfg, bus.clone(), cmds, sess, key, &paths);
+        finish_wipe(&paths, &bus, blocker);
+        res
+    }
+
+    // the second value is why the local state must stay, or None when the session left nothing in use and it can be wiped
+    fn session(
+        cfg: GuestCfg,
+        bus: Arc<UiBus>,
+        cmds: Receiver<UiCmd>,
+        sess: Session,
+        key: PeerKey,
+        paths: &HostPaths,
+    ) -> (io::Result<()>, Option<&'static str>) {
+        let mut g = match open(cfg, bus, cmds, key, sess.hello.name.clone(), paths) {
+            Ok(g) => g,
+            Err(e) => return (Err(e), None),
+        };
+        let res = match hello(&sess, &g.core.tree) {
+            Ok(w) => {
+                g.install(sess, w);
+                g.event_loop()
+            }
+            Err(Fail::Fatal(e)) => Err(e),
+            Err(Fail::Quit) => Ok(()),
+            Err(Fail::Retry | Fail::Unverified) => {
+                drop(sess);
+                g.offline("could not complete the handshake with the host".to_owned())
+                    .and_then(|()| g.event_loop())
+            }
+        };
+        (res, g.shutdown())
+    }
+
+    fn open(
+        cfg: GuestCfg,
+        bus: Arc<UiBus>,
+        cmds: Receiver<UiCmd>,
+        key: PeerKey,
+        host_name: Name,
+        paths: &HostPaths,
+    ) -> io::Result<Guest> {
+        let state = paths.state();
+        ensure_private_dir(state)?;
+        wipe::mark_live(state)?;
         let overlay_path = state.join(OVERLAY_DIR);
         ensure_private_dir(&overlay_path)?;
-        let tree_path = state.join(GUEST_TREE_FILE);
-        let tree = Arc::new(RwLock::new(load_tree(&tree_path)));
+        let tree = Arc::new(RwLock::new(GTree::new()));
         let remote = RemoteSlot::new();
         let cache = Arc::new(BlobCache::open(
             &CacheConfig {
-                dir: cfg.dirs.blob_cache_dir(&key),
+                dir: paths.cache().to_path_buf(),
                 cap: Some(cfg.cache_cap),
             },
             remote.clone(),
@@ -367,7 +529,12 @@ mod live {
         let link_slot: Arc<Mutex<Option<Link>>> = Arc::new(Mutex::new(None));
         let ctr = Arc::new(Counters::default());
         let notice = notice_fn(bus.clone(), link_slot.clone(), ctr.clone());
-        let writer = Writer::new(cache.clone(), notice.clone());
+        let (landed, _) = unbounded();
+        let pipe = Pipe::new(remote.clone(), landed)?;
+        let writer = Writer::new(cache.clone(), pipe.clone(), notice.clone())
+            .with_feed(feed_fn(bus.clone()));
+        bus.feed()
+            .set_source(Arc::new(GuestPeek::new(&cache, &tree)));
         let view: Arc<dyn TreeView> = tree.clone();
         let prefetch = Prefetch::start(cache.clone(), view)?;
         let overlay = rustix::fs::open(
@@ -394,6 +561,7 @@ mod live {
             norm_fold: AtomicBool::new(false),
             passthrough: AtomicBool::new(false),
             notice,
+            werrs: AtomicU32::new(0),
             staging_busy: Mutex::new(FxHashSet::default()),
             staging_done: Condvar::new(),
             promote_later: Mutex::new(FxHashSet::default()),
@@ -409,27 +577,40 @@ mod live {
                 .name("csync-rules".into())
                 .spawn(move || rules_worker(&c, &st, &rules_rx))?
         };
+        // last: a failed spawn here drops rules_tx, which ends the rules worker
+        let settle_join = {
+            let (c, jobs) = (core.clone(), core.writer.jobs());
+            thread::Builder::new()
+                .name("csync-settle".into())
+                .spawn(move || fs::settle_loop(&c, &jobs))?
+        };
         let (dial_tx, dial_rx) = bounded(1);
-        let host_name = sess.hello.name.clone();
-        let mut g = Guest {
+        Ok(Guest {
+            hash_run: Arc::new(AtomicBool::new(false)),
+            hash_stop: Arc::new(AtomicBool::new(false)),
+            hash_join: None,
             bus,
             cmds,
             core,
             remote,
+            pipe,
             key,
             host_name,
-            tree_path,
             link_slot,
             link: None,
             rpc: None,
             inbox: never(),
+            #[cfg(target_os = "macos")]
+            project: None,
             mounted: None,
+            mount_dev: None,
             inj: None,
             back: never(),
             kick_rx,
             rules,
             rules_tx: Some(rules_tx),
             rules_join: Some(rules_join),
+            settle_join: Some(settle_join),
             dial_tx,
             dial_rx,
             dial_stop: Arc::new(AtomicBool::new(false)),
@@ -437,32 +618,20 @@ mod live {
             synced: false,
             snap_next: None,
             synced_entries: 0,
-            dirty: false,
-            last_save: Instant::now(),
             last_ui: Instant::now(),
             ui_due: None,
             last_ping: Instant::now(),
+            heard: Instant::now(),
+            synced_at: None,
+            redial: Duration::ZERO,
+            redial_wait: Duration::ZERO,
             rtt_us: 0,
             skew_ms: 0,
             notify: None,
             rule_paths: Vec::new(),
             bye: CloseReason::Local,
             cfg,
-        };
-        let res = match hello(&sess, &g.core.tree) {
-            Ok(w) => {
-                g.install(sess, w);
-                g.event_loop()
-            }
-            Err(Fail::Fatal(e)) => Err(e),
-            Err(Fail::Quit) => Ok(()),
-            Err(Fail::Retry | Fail::Unverified) => {
-                drop(sess);
-                g.lost(CloseReason::Eof).and_then(|()| g.event_loop())
-            }
-        };
-        g.shutdown();
-        res
+        })
     }
 
     struct Guest {
@@ -471,20 +640,31 @@ mod live {
         cmds: Receiver<UiCmd>,
         core: Arc<Core>,
         remote: Arc<RemoteSlot>,
+        pipe: Arc<Pipe>,
         key: PeerKey,
         host_name: Name,
-        tree_path: PathBuf,
         link_slot: Arc<Mutex<Option<Link>>>,
         link: Option<Link>,
         rpc: Option<Arc<Rpc>>,
         inbox: Receiver<In>,
+        // names the volume the mount shows in finder
+        #[cfg(target_os = "macos")]
+        project: Option<Name>,
         mounted: Option<Mounted>,
+        // the device under the mount point before this session mounted over it
+        mount_dev: Option<u64>,
         inj: Option<InjectorThread>,
         back: Receiver<Vec<Effect>>,
         kick_rx: Receiver<()>,
         rules: Arc<RuleState>,
         rules_tx: Option<Sender<RuleJob>>,
         rules_join: Option<JoinHandle<()>>,
+        // finishes the closes that did not wait for the host, as its answers arrive
+        settle_join: Option<JoinHandle<()>>,
+        // the short-lived thread pulling the hashes of pending files once the host has hashed them all
+        hash_run: Arc<AtomicBool>,
+        hash_stop: Arc<AtomicBool>,
+        hash_join: Option<JoinHandle<()>>,
         dial_tx: Sender<Result<(Session, Welcome), Fail>>,
         dial_rx: Receiver<Result<(Session, Welcome), Fail>>,
         dial_stop: Arc<AtomicBool>,
@@ -492,17 +672,43 @@ mod live {
         synced: bool,
         snap_next: Option<u32>,
         synced_entries: u64,
-        dirty: bool,
-        last_save: Instant,
         last_ui: Instant,
         ui_due: Option<Instant>,
         last_ping: Instant,
+        // when anything last came off the inbox
+        heard: Instant,
+        // when the current session applied its first batch
+        synced_at: Option<Instant>,
+        // the backoff carried across sessions that died young, and the wait the next dialer starts with
+        redial: Duration,
+        redial_wait: Duration,
         rtt_us: u32,
         skew_ms: i64,
         notify: Option<Notify>,
         rule_paths: Vec<RelPath>,
         // what the host is told when the link closes at shutdown
         bye: CloseReason,
+    }
+
+    // small sets are cheaper to scan than to probe once per ancestor
+    const SCOPE_SCAN_MAX: usize = 32;
+
+    // true when path is a scope or lies under one
+    fn under_scope(own: &FxHashSet<RelPath>, path: &RelPath) -> bool {
+        if own.len() <= SCOPE_SCAN_MAX {
+            return own.iter().any(|s| path.starts_with(s));
+        }
+        if own.contains(path) {
+            return true;
+        }
+        let mut up = path.parent();
+        while let Some(p) = up {
+            if own.contains(&p) {
+                return true;
+            }
+            up = p.parent();
+        }
+        false
     }
 
     fn earliest(a: Option<Instant>, b: Instant) -> Option<Instant> {
@@ -512,6 +718,26 @@ mod live {
     struct Notify {
         tx: Sender<Vec<Effect>>,
         join: JoinHandle<()>,
+    }
+
+    // the startup self-test, run by the injector thread once the root is verified to be on the mounted volume: the
+    // identification it decides is how requests are told from injected ones, and Claim keeps events from being replayed
+    #[cfg(target_os = "macos")]
+    fn probe_boot(core: Arc<Core>, inval: fs::Inval, backend: BackendKind) -> Boot {
+        Box::new(move |root| {
+            let done = match root {
+                Some(r) => {
+                    let env = Env {
+                        root: r.as_fd(),
+                        core: &core,
+                        inval: &inval,
+                    };
+                    coherence::run(&env, backend)
+                }
+                None => coherence::run_unverified(backend),
+            };
+            done.ident
+        })
     }
 
     // a kernel notification can wait on a page or directory lock held by a request that is itself
@@ -578,6 +804,7 @@ mod live {
                     }
                 }
                 Effect::Warm(id, h) => core.prefetch.hint(Hint::Warm(id, h)),
+                Effect::WarmPending(id) => core.prefetch.hint(Hint::WarmPending(id)),
                 Effect::ConflictPending(id) => {
                     let h = core.t().get(id).and_then(|n| n.meta.hash);
                     if let Some(h) = h {
@@ -618,7 +845,10 @@ mod live {
                 );
                 select! {
                     recv(inbox) -> m => match m {
-                        Ok(i) => self.on_in(i)?,
+                        Ok(i) => {
+                            self.heard = Instant::now();
+                            self.on_in(i)?
+                        }
                         Err(_) => self.lost(CloseReason::Eof)?,
                     },
                     recv(back) -> fx => match fx {
@@ -648,14 +878,12 @@ mod live {
             }
         }
 
-        // nothing wakes this thread unless there is pending ui, an unsaved tree or a live link to ping
+        // nothing wakes this thread unless there is pending ui or a live link to ping
         fn timer(&self) -> Receiver<Instant> {
             let mut due = self.ui_due;
-            if self.dirty && self.snap_next.is_none() {
-                due = earliest(due, self.last_save + SAVE_EVERY);
-            }
             if self.link.is_some() {
                 due = earliest(due, self.last_ping + PING_EVERY);
+                due = earliest(due, self.heard + SILENT_AFTER);
             }
             match due {
                 Some(d) => after(d.saturating_duration_since(Instant::now())),
@@ -668,11 +896,15 @@ mod live {
             if self.ui_due.is_some_and(|d| d <= now) {
                 self.ui();
             }
-            if self.dirty && self.snap_next.is_none() && now >= self.last_save + SAVE_EVERY {
-                self.save_tree();
-            }
             if self.link.is_some() && now >= self.last_ping + PING_EVERY {
                 self.ping();
+            }
+            // queued input still counts as heard: the loop may only be late in reading it
+            if self.link.is_some() && link_silent(self.heard, now) && self.inbox.is_empty() {
+                self.heard = now;
+                if let Some(l) = &self.link {
+                    l.close(CloseReason::Io(io::ErrorKind::TimedOut));
+                }
             }
         }
 
@@ -695,12 +927,18 @@ mod live {
             self.link = Some(link);
             self.rpc = Some(rpc);
             self.inbox = inbox;
+            self.heard = Instant::now();
+            self.synced_at = None;
             self.dialing = false;
             self.snap_next = None;
             self.synced_entries = 0;
             self.core.case_fold.store(w.fs.case_fold, Relaxed);
             self.core.norm_fold.store(w.fs.norm_fold, Relaxed);
             let project = w.project.clone();
+            #[cfg(target_os = "macos")]
+            {
+                self.project = Some(project.clone());
+            }
             self.bus.update(|s| s.project = Some(project));
             rules_reset(&self.core, &self.rules, &w.excludes, &w.repos);
             self.set_peer(ConnState::Syncing { done: 0, total: 0 });
@@ -718,13 +956,25 @@ mod live {
             if matches!(why, CloseReason::Revoked) {
                 return Err(denied("the host revoked this guest"));
             }
+            self.offline(close_text(&why))
+        }
+
+        fn offline(&mut self, reason: String) -> io::Result<()> {
             self.remote.set(None);
             *lock(&self.link_slot) = None;
             self.link = None;
             self.rpc = None;
             self.inbox = never();
             self.abort_snapshot();
-            self.set_peer(ConnState::Disconnected { since_ms: now_ms() });
+            let healthy = self
+                .synced_at
+                .take()
+                .is_some_and(|t| t.elapsed() >= HEALTHY_AFTER);
+            (self.redial_wait, self.redial) = redial_policy(self.redial, healthy);
+            self.set_peer(ConnState::Disconnected {
+                since_ms: now_ms(),
+                reason: Some(reason),
+            });
             self.spawn_dialer();
             Ok(())
         }
@@ -746,6 +996,7 @@ mod live {
         }
 
         fn spawn_dialer(&mut self) {
+            let first_wait = std::mem::take(&mut self.redial_wait);
             if self.dialing {
                 return;
             }
@@ -766,6 +1017,7 @@ mod live {
                 .name("csync-dial".into())
                 .spawn(move || {
                     let mut backoff = BACKOFF_MIN;
+                    wait_or_stop(&stop, Instant::now() + first_wait);
                     while !stop.load(Relaxed) {
                         match dial(addr, &id, Dial::Resume(key), &hs, false)
                             .and_then(|s| hello(&s, &tree).map(|w| (s, w)))
@@ -784,12 +1036,7 @@ mod live {
                                 };
                                 let until = Instant::now() + backoff;
                                 backoff = (backoff * 2).min(max);
-                                while !stop.load(Relaxed) && Instant::now() < until {
-                                    thread::sleep(
-                                        STOP_POLL
-                                            .min(until.saturating_duration_since(Instant::now())),
-                                    );
-                                }
+                                wait_or_stop(&stop, until);
                             }
                             Err(e) => {
                                 let _ = tx.send(Err(e));
@@ -900,9 +1147,7 @@ mod live {
                         changes
                             .iter()
                             .filter_map(|c| match c {
-                                Change::Remove { path }
-                                    if own.iter().any(|s| path.starts_with(s)) =>
-                                {
+                                Change::Remove { path } if under_scope(&own, path) => {
                                     let n = t.resolve(path).and_then(|id| t.get(id))?;
                                     (n.domain == GDomain::Synced
                                         && r.classify(path, n.is_dir()) == Class::Ignored)
@@ -913,9 +1158,19 @@ mod live {
                             .collect()
                     };
                     let kept = |p: &RelPath| demote.iter().any(|d| p.starts_with(d));
+                    // only the newest changes are read for the feed, so a huge batch stays cheap under the lock
+                    let feed_from = self.bus.feed().is_on().then(|| rows_dropped(changes.len()));
+                    let mut prior = Vec::new();
                     {
                         let mut t = self.core.tw();
-                        for c in &changes {
+                        for (i, c) in changes.iter().enumerate() {
+                            if feed_from.is_some_and(|f| i >= f) {
+                                let was = t
+                                    .resolve(peek::prior_path(c))
+                                    .and_then(|id| t.get(id))
+                                    .map(|n| n.meta.clone());
+                                prior.push((i, was));
+                            }
                             if let Change::Remove { path } = c
                                 && kept(path)
                             {
@@ -925,6 +1180,12 @@ mod live {
                         }
                         let index = t.index_id();
                         t.set_version(index, seq);
+                    }
+                    if let Some(first) = feed_from {
+                        let rows = peek::remote_rows(&changes, first, &prior, now_ms(), seq);
+                        if !rows.is_empty() {
+                            self.bus.feed().push_batch(rows);
+                        }
                     }
                     {
                         let r = self.core.rules();
@@ -952,17 +1213,83 @@ mod live {
                     self.queue(fx);
                     self.synced(seq, false)?;
                 }
-                Push::Notice(n) => self.bus.update(|s| s.push_notice(now_ms(), n)),
+                Push::Notice(n) => self.bus.notice(now_ms(), n),
+                // a pushed hash only labels a node: bytes fetched by it are verified before they are stored
+                Push::Hashes { index, items } => {
+                    let applied: Vec<(RelPath, NodeId, Hash32)> = {
+                        let mut t = self.core.tw();
+                        if t.index_id() != index {
+                            return Ok(());
+                        }
+                        items
+                            .into_iter()
+                            .filter_map(|(path, ver, h)| {
+                                let id = t.resolve(&path)?;
+                                t.learn_hash(id, ver, h).then_some((path, id, h))
+                            })
+                            .collect()
+                    };
+                    let rule_files: Vec<RelPath> = {
+                        let r = self.core.rules();
+                        applied
+                            .iter()
+                            .filter(|(p, _, _)| r.is_rule_file(p))
+                            .map(|(p, _, _)| p.clone())
+                            .collect()
+                    };
+                    if !rule_files.is_empty() {
+                        self.rule_job(RuleJob::Paths(rule_files));
+                    }
+                    for (_, id, h) in applied {
+                        self.core.prefetch.hint(Hint::Warm(id, h));
+                    }
+                }
+                Push::HashesDone { index } => {
+                    if index == self.core.t().index_id() {
+                        self.pull_hashes();
+                    }
+                }
             }
             Ok(())
         }
 
+        // the round trips run on their own thread, never on the one reading the network
+        fn pull_hashes(&mut self) {
+            if self.hash_stop.load(Relaxed) || self.hash_run.swap(true, Relaxed) {
+                return;
+            }
+            if let Some(j) = self.hash_join.take() {
+                let _ = j.join();
+            }
+            let (core, stop, run, rules_tx) = (
+                self.core.clone(),
+                self.hash_stop.clone(),
+                self.hash_run.clone(),
+                self.rules_tx.clone(),
+            );
+            let spawned = thread::Builder::new()
+                .name("csync-hashes".into())
+                .spawn(move || {
+                    let _run = PullRun(run);
+                    let rule_files = pull_pending(&core, &stop);
+                    if !rule_files.is_empty()
+                        && let Some(tx) = &rules_tx
+                    {
+                        send_rule_job(tx, RuleJob::Paths(rule_files));
+                    }
+                });
+            match spawned {
+                Ok(j) => self.hash_join = Some(j),
+                Err(_) => self.hash_run.store(false, Relaxed),
+            }
+        }
+
         // a batch is fully applied: ack it, refresh ignore rules, and mount on the first one
         fn synced(&mut self, seq: u64, snapshot: bool) -> io::Result<()> {
+            self.synced_at.get_or_insert_with(Instant::now);
             if let Some(l) = &self.link {
                 let _ = l.send(Msg::Ack { seq });
             }
-            self.dirty = true;
             if !self.synced {
                 self.rule_paths.clear();
                 rules_scan(&self.core, &self.rules);
@@ -983,16 +1310,37 @@ mod live {
         }
 
         fn rule_job(&self, j: RuleJob) {
-            if let Some(tx) = &self.rules_tx
-                && tx.try_send(j).is_err()
-            {
-                let _ = tx.try_send(RuleJob::Scan);
+            if let Some(tx) = &self.rules_tx {
+                send_rule_job(tx, j);
             }
         }
 
         fn mount(&mut self) -> io::Result<()> {
+            self.mount_dev = wipe::device_of(&self.cfg.mount);
+            #[cfg(target_os = "linux")]
             let m = fs::mount(self.core.clone(), &self.cfg.mount, self.cfg.allow_other)?;
+            #[cfg(target_os = "linux")]
             let (inj, thread, back) = Injector::start(&self.cfg.mount, self.core.tree.clone())?;
+            #[cfg(target_os = "macos")]
+            let volname = self.project.as_ref().map_or("csync", Name::as_str);
+            #[cfg(target_os = "macos")]
+            let m = fs::mount(
+                self.core.clone(),
+                &self.cfg.mount,
+                self.cfg.allow_other,
+                volname,
+            )?;
+            #[cfg(target_os = "macos")]
+            let backend = m
+                .backend()
+                .ok_or_else(|| io::Error::other("the mount ended before it began"))?;
+            #[cfg(target_os = "macos")]
+            let (inj, thread, back) = Injector::start_probed(
+                &self.cfg.mount,
+                self.core.tree.clone(),
+                self.mount_dev,
+                probe_boot(self.core.clone(), m.inval(), backend),
+            )?;
             let _ = self.core.inj.set(inj);
             self.inj = Some(thread);
             self.back = back;
@@ -1064,7 +1412,19 @@ mod live {
             let pg = &self.core.prefetch.progress;
             let (pf_total, pf_done) = (pg.total.load(Relaxed), pg.done.load(Relaxed));
             let (mounted, skew, rtt) = (self.mounted.is_some(), self.skew_ms, self.rtt_us);
+            #[cfg(target_os = "macos")]
+            let (backend, inval) = coherence::status().unwrap_or_default();
+            #[cfg(target_os = "macos")]
+            let fault = self.core.inj.get().and_then(|i| i.fault());
             self.bus.update(|s| {
+                #[cfg(target_os = "macos")]
+                {
+                    s.guest.backend = backend;
+                    s.guest.inval = inval;
+                    if let Some(h) = fault {
+                        s.hint(h);
+                    }
+                }
                 s.stats.files = files;
                 s.stats.cached_bytes = cached;
                 s.stats.cache_cap = cap;
@@ -1087,26 +1447,14 @@ mod live {
             });
         }
 
-        fn save_tree(&mut self) {
-            self.last_save = Instant::now();
-            if self.snap_next.is_some() {
-                return;
-            }
-            let (index, seq, entries) = {
-                let t = self.core.t();
-                let mut v = Vec::with_capacity(usize::try_from(t.files()).unwrap_or(0));
-                t.export(&mut |e| v.push(e));
-                (t.index_id(), t.seq(), v)
-            };
-            if index != 0 && persist::save_guest_tree(&self.tree_path, index, seq, &entries).is_ok()
-            {
-                self.dirty = false;
-            }
-        }
-
-        // the injector stops before the unmount; the link closes after it so final commits can land
-        fn shutdown(&mut self) {
+        // the injector stops before the unmount; closes still waiting on the host settle next, then the write pipe and
+        // the link close so final commits can land, and the settler stops once the pipe has failed what it never sent.
+        // nothing is saved: the caller wipes the local state unless the returned reason says it is still in use
+        fn shutdown(mut self) -> Option<&'static str> {
             self.dial_stop.store(true, Relaxed);
+            // handlers the unmount waits on must not wait for a link the stopped dialer never brings
+            self.remote.close();
+            self.hash_stop.store(true, Relaxed);
             if let Some(t) = self.inj.take() {
                 t.stop();
             }
@@ -1115,24 +1463,40 @@ mod live {
                 drop(n.tx);
                 let _ = n.join.join();
             }
-            if let Some(m) = self.mounted.take() {
-                let _ = m.unmount();
-            }
+            let had_mount = self.mounted.is_some();
+            let unmounted = self.mounted.take().is_none_or(|m| m.unmount().is_ok());
             self.bus.update(|s| s.mounted = false);
+            self.core.writer.drain(Instant::now() + SETTLE_WAIT);
+            self.pipe.close();
+            self.core.writer.stop_settler();
+            if let Some(j) = self.settle_join.take() {
+                let _ = j.join();
+            }
             if let Some(l) = self.link.take() {
                 l.close(self.bye.clone());
             }
             *lock(&self.link_slot) = None;
             self.remote.set(None);
+            // before the rules queue closes: the pull thread holds a sender and a hold on the core
+            if let Some(j) = self.hash_join.take() {
+                let _ = j.join();
+            }
             self.core.prefetch.stop();
             self.rules_tx = None;
             if let Some(j) = self.rules_join.take() {
                 let _ = j.join();
             }
-            if self.dirty {
-                self.save_tree();
+            let still_mounted =
+                had_mount && (!unmounted || wipe::is_mounted_over(&self.cfg.mount, self.mount_dev));
+            let Guest { core, .. } = self;
+            let freed = release(core);
+            if still_mounted {
+                Some(WIPE_MOUNTED_HINT)
+            } else if !freed {
+                Some(WIPE_BUSY_HINT)
+            } else {
+                None
             }
-            let _ = self.core.cache.save();
         }
     }
 
@@ -1148,6 +1512,59 @@ mod live {
         Paths(Vec<RelPath>),
         Promote(Vec<RelPath>),
         Demote(Vec<RelPath>),
+    }
+
+    fn send_rule_job(tx: &Sender<RuleJob>, j: RuleJob) {
+        if tx.try_send(j).is_err() {
+            let _ = tx.try_send(RuleJob::Scan);
+        }
+    }
+
+    // clears the running flag however the pull thread ends
+    struct PullRun(Arc<AtomicBool>);
+
+    impl Drop for PullRun {
+        fn drop(&mut self) {
+            self.0.store(false, Relaxed);
+        }
+    }
+
+    // returns the rule files it labelled, so their rules can be applied
+    fn pull_pending(core: &Core, stop: &AtomicBool) -> Vec<RelPath> {
+        let mut rule_files = Vec::new();
+        while !stop.load(Relaxed) && core.cache.remote().current().is_some() {
+            let (index, list) = {
+                let t = core.t();
+                (t.index_id(), t.pending_list(BATCH_MAX))
+            };
+            if list.is_empty() {
+                break;
+            }
+            let asked: Vec<(RelPath, _)> = list.iter().map(|(_, p, v)| (p.clone(), *v)).collect();
+            let Ok(got) = core
+                .cache
+                .pull_hashes(index, &asked, Instant::now() + HASH_WAIT)
+            else {
+                break;
+            };
+            let mut applied = Vec::new();
+            {
+                let mut t = core.tw();
+                for ((id, p, v), h) in list.into_iter().zip(got) {
+                    if let Some(h) = h
+                        && t.learn_hash(id, v, h)
+                    {
+                        applied.push(p);
+                    }
+                }
+            }
+            if applied.is_empty() {
+                break;
+            }
+            let r = core.rules();
+            rule_files.extend(applied.into_iter().filter(|p| r.is_rule_file(p)));
+        }
+        rule_files
     }
 
     fn rules_worker(core: &Core, st: &RuleState, rx: &Receiver<RuleJob>) {
@@ -1193,12 +1610,30 @@ mod live {
         *core.rules_mut() = r;
     }
 
+    // pending: the node and host version to fetch the file by while the host has not hashed it yet
+    struct RuleFile {
+        path: RelPath,
+        hash: Option<Hash32>,
+        size: u64,
+        pending: Option<(NodeId, VerKey)>,
+    }
+
+    fn rule_file(id: NodeId, n: &GNode, path: RelPath, index: IndexId) -> RuleFile {
+        RuleFile {
+            path,
+            hash: n.meta.hash,
+            size: n.meta.size,
+            pending: n.ver_key(index).map(|k| (id, k)),
+        }
+    }
+
     // every rule file in the host tree; inside .git only the gitdir and its info directory are walked
-    type Found = Vec<(RelPath, Option<Hash32>, u64)>;
+    type Found = Vec<RuleFile>;
 
     // second list: guest-only rule files directly inside a synced directory
     fn collect_rule_files(core: &Core) -> (Found, Vec<RelPath>) {
         let t = core.t();
+        let index = t.index_id();
         let rules = core.rules();
         let mut out = Vec::new();
         let mut local = Vec::new();
@@ -1228,7 +1663,7 @@ mod live {
                         stack.push((c, p));
                     }
                 } else if n.meta.kind == Kind::File && rules.is_rule_file(&p) {
-                    out.push((p, n.meta.hash, n.meta.size));
+                    out.push(rule_file(c, n, p, index));
                 }
             }
         }
@@ -1240,7 +1675,7 @@ mod live {
         let gone: Vec<RelPath> = {
             let k = lock(&st.known);
             k.keys()
-                .filter(|p| !found.iter().any(|(f, _, _)| f == *p))
+                .filter(|p| !found.iter().any(|f| f.path == **p))
                 .cloned()
                 .collect()
         };
@@ -1265,12 +1700,12 @@ mod live {
             let cur = {
                 let t = core.t();
                 t.resolve(&p)
-                    .and_then(|id| t.get(id))
-                    .filter(|n| n.meta.kind == Kind::File && n.domain != GDomain::Local)
-                    .map(|n| (n.meta.hash, n.meta.size))
+                    .and_then(|id| t.get(id).map(|n| (id, n)))
+                    .filter(|(_, n)| n.meta.kind == Kind::File && n.domain != GDomain::Local)
+                    .map(|(id, n)| rule_file(id, n, p.clone(), t.index_id()))
             };
             match cur {
-                Some((h, size)) => found.push((p, h, size)),
+                Some(f) => found.push(f),
                 None => {
                     lock(&st.known).remove(&p);
                     if let Some(s) = core.rules_mut().update_rule_file(&p, None) {
@@ -1298,17 +1733,18 @@ mod live {
     fn rules_apply(
         core: &Core,
         st: &RuleState,
-        found: Vec<(RelPath, Option<Hash32>, u64)>,
+        mut found: Vec<RuleFile>,
         scopes: &mut Vec<RelPath>,
     ) {
+        resolve_pending(&core.cache, &core.tree, &mut found);
         let todo: Vec<(RelPath, Hash32, u64)> = {
             let k = lock(&st.known);
             found
                 .into_iter()
-                .filter_map(|(p, h, size)| {
-                    let h = h?;
-                    (size <= TEXT_MAX as u64 && k.get(&p).is_none_or(|(kh, _)| *kh != h))
-                        .then_some((p, h, size))
+                .filter_map(|f| {
+                    let h = f.hash?;
+                    (f.size <= TEXT_MAX as u64 && k.get(&f.path).is_none_or(|(kh, _)| *kh != h))
+                        .then_some((f.path, h, f.size))
                 })
                 .collect()
         };
@@ -1331,18 +1767,69 @@ mod live {
         }
     }
 
+    // a pending rule file is fetched by version, which also yields its hash; the second round retries replaced ones
+    fn resolve_pending(cache: &BlobCache, tree: &RwLock<GTree>, found: &mut [RuleFile]) {
+        for _ in 0..2 {
+            let asked: Vec<(usize, NodeId, VerKey)> = found
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.size <= TEXT_MAX as u64)
+                .filter_map(|(i, f)| f.pending.map(|(id, k)| (i, id, k)))
+                .collect();
+            if asked.is_empty() {
+                return;
+            }
+            let items: Vec<(RelPath, VerKey)> = asked
+                .iter()
+                .map(|&(i, _, k)| (found[i].path.clone(), k))
+                .collect();
+            let got = cache.fetch_many_ver(&items, Instant::now() + RULE_WAIT);
+            let mut t = tree.write().unwrap_or_else(|e| e.into_inner());
+            for (&(i, id, k), (_, r)) in asked.iter().zip(got) {
+                let f = &mut found[i];
+                match r {
+                    Ok(v) => {
+                        t.learn_hash(id, k.ver, v.hash);
+                        f.hash = Some(v.hash);
+                        f.pending = None;
+                    }
+                    Err(_) => {
+                        let index = t.index_id();
+                        let fresh = t
+                            .resolve(&f.path)
+                            .and_then(|nid| t.get(nid).map(|n| (nid, n)))
+                            .filter(|(_, n)| {
+                                n.meta.kind == Kind::File && n.domain != GDomain::Local
+                            })
+                            .map(|(nid, n)| rule_file(nid, n, f.path.clone(), index));
+                        match fresh {
+                            Some(fresh) if fresh.pending.map(|p| p.1) != Some(k) => *f = fresh,
+                            _ => f.pending = None,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // uncached rule files come back in as few FetchMany round trips as possible
     fn prefetch_rules(core: &Core, todo: &[(RelPath, Hash32, u64)]) {
         let Some(remote) = core.cache.remote().current() else {
             return;
         };
-        let mut batch: Vec<(RelPath, Hash32)> = Vec::new();
+        let mut batch: Vec<(RelPath, Want)> = Vec::new();
         let mut bytes = 0u64;
-        let flush = |batch: &mut Vec<(RelPath, Hash32)>| {
+        let flush = |batch: &mut Vec<(RelPath, Want)>| {
             if batch.is_empty() {
                 return;
             }
-            let want: FxHashMap<RelPath, Hash32> = batch.iter().cloned().collect();
+            let want: FxHashMap<RelPath, Hash32> = batch
+                .iter()
+                .filter_map(|(p, w)| match w {
+                    Want::Hash(h) => Some((p.clone(), *h)),
+                    Want::Ver(_) => None,
+                })
+                .collect();
             if let Ok(Reply::Blobs { items }) = remote.call(
                 Op::FetchMany {
                     items: std::mem::take(batch),
@@ -1350,7 +1837,9 @@ mod live {
                 Instant::now() + RULE_WAIT,
             ) {
                 for (p, r) in items {
-                    if let (Ok(b), Some(h)) = (r, want.get(&p)) {
+                    if let (Ok((got, b)), Some(h)) = (r, want.get(&p))
+                        && got == *h
+                    {
                         let _ = core.cache.insert_bytes(h, &b.0, Some(&p));
                     }
                 }
@@ -1365,7 +1854,7 @@ mod live {
                 bytes = 0;
             }
             bytes += size;
-            batch.push((p.clone(), *h));
+            batch.push((p.clone(), Want::Hash(*h)));
         }
         flush(&mut batch);
     }
@@ -1380,6 +1869,36 @@ mod live {
             Reject::PairingDisabled,
             Reject::Refused,
         ];
+
+        #[test]
+        fn every_close_reason_reads_as_one_short_line() {
+            let all = [
+                CloseReason::Eof,
+                CloseReason::Io(io::ErrorKind::TimedOut),
+                CloseReason::Io(io::ErrorKind::ConnectionReset),
+                CloseReason::Io(io::ErrorKind::BrokenPipe),
+                CloseReason::Io(io::ErrorKind::PermissionDenied),
+                CloseReason::Protocol("snapshot parts out of order"),
+                CloseReason::Revoked,
+                CloseReason::Local,
+            ];
+            for why in &all {
+                let t = close_text(why);
+                assert!(!t.is_empty() && t.len() <= 60, "{t}");
+                assert!(!t.chars().any(char::is_control), "{t}");
+            }
+            assert_eq!(close_text(&CloseReason::Eof), "host closed the connection");
+            assert_eq!(
+                close_text(&CloseReason::Io(io::ErrorKind::TimedOut)),
+                "connection timed out"
+            );
+            assert_eq!(
+                close_text(&CloseReason::Protocol("snapshot parts out of order")),
+                "protocol error: snapshot parts out of order"
+            );
+            let other = close_text(&CloseReason::Io(io::ErrorKind::PermissionDenied));
+            assert!(other.starts_with("network error: "), "{other}");
+        }
 
         #[test]
         fn forged_rejects_never_end_the_reconnect_loop() {
@@ -1426,6 +1945,312 @@ mod live {
                     Fail::Fatal(_)
                 ));
             }
+        }
+
+        #[test]
+        fn sessions_dying_young_back_off_and_a_healthy_one_dials_at_once() {
+            let (wait, mut carried) = redial_policy(Duration::ZERO, false);
+            assert_eq!(wait, Duration::ZERO, "the first loss dials at once");
+            assert_eq!(carried, BACKOFF_MIN);
+            let mut waits = Vec::new();
+            for _ in 0..20 {
+                let (w, c) = redial_policy(carried, false);
+                waits.push(w);
+                carried = c;
+            }
+            assert_eq!(waits[0], BACKOFF_MIN);
+            assert!(waits.windows(2).all(|p| p[0] <= p[1]));
+            assert!(waits.iter().all(|&w| w <= SHORT_SESSION_BACKOFF_MAX));
+            assert_eq!(waits[19], SHORT_SESSION_BACKOFF_MAX);
+            assert_eq!(
+                redial_policy(carried, true),
+                (Duration::ZERO, Duration::ZERO)
+            );
+            assert_eq!(
+                redial_policy(Duration::ZERO, true),
+                (Duration::ZERO, Duration::ZERO)
+            );
+        }
+
+        #[test]
+        fn a_link_is_silent_after_three_missed_pings() {
+            let t0 = Instant::now();
+            assert_eq!(SILENT_AFTER, PING_EVERY * 3);
+            assert!(!link_silent(
+                t0,
+                t0 + SILENT_AFTER - Duration::from_millis(1)
+            ));
+            assert!(link_silent(t0, t0 + SILENT_AFTER));
+            assert!(!link_silent(t0 + SILENT_AFTER, t0));
+        }
+
+        #[test]
+        fn scopes_match_by_ancestor_the_same_as_by_scan() {
+            let rp = |s: &str| RelPath::new(s).unwrap();
+            let paths = ["a", "a/b", "a/b/c.txt", "ab/c", "x/y/z", "q"].map(rp);
+            let mut own: FxHashSet<RelPath> = FxHashSet::default();
+            for i in 0..SCOPE_SCAN_MAX + 8 {
+                own.insert(rp(&format!("pad{i}/inner")));
+            }
+            let check = |own: &FxHashSet<RelPath>| {
+                for p in &paths {
+                    assert_eq!(
+                        under_scope(own, p),
+                        own.iter().any(|s| p.starts_with(s)),
+                        "{}",
+                        p.as_str()
+                    );
+                }
+            };
+            check(&own);
+            assert!(!under_scope(&own, &rp("pad1")));
+            assert!(under_scope(&own, &rp("pad1/inner/deep/file")));
+            own.insert(rp("a/b"));
+            check(&own);
+            assert!(under_scope(&own, &rp("a/b")) && under_scope(&own, &rp("a/b/c.txt")));
+            assert!(!under_scope(&own, &rp("a")) && !under_scope(&own, &rp("ab/c")));
+            own.insert(RelPath::root());
+            check(&own);
+            assert!(under_scope(&own, &rp("q")));
+            assert!(!under_scope(&FxHashSet::default(), &rp("q")));
+        }
+
+        use crate::proto::Meta;
+
+        struct Dir(std::path::PathBuf);
+        impl Drop for Dir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn pending_meta(size: u64) -> Meta {
+            Meta {
+                kind: Kind::File,
+                perm: 0o644,
+                size,
+                mtime_ns: 0,
+                ctime_ns: 0,
+                hash: None,
+                link: None,
+                git_ro: false,
+            }
+        }
+
+        fn upsert(name: &str, size: u64, ver: u64) -> Change {
+            Change::Upsert {
+                path: RelPath::new(name).unwrap(),
+                meta: pending_meta(size),
+                ver,
+            }
+        }
+
+        fn hash_of(data: &[u8]) -> Hash32 {
+            *blake3::hash(data).as_bytes()
+        }
+
+        // a host holding rule file contents by version; the first request also applies `bump` to the tree
+        struct Host {
+            files: Mutex<FxHashMap<u64, Vec<u8>>>,
+            rounds: std::sync::atomic::AtomicUsize,
+            tree: Arc<RwLock<GTree>>,
+            bump: Mutex<Option<Change>>,
+        }
+
+        impl Remote for Host {
+            fn call(&self, op: Op, _d: Instant) -> Result<Reply, crate::net::rpc::RpcError> {
+                use crate::net::rpc::RpcError;
+                self.rounds.fetch_add(1, Relaxed);
+                if let Some(c) = lock(&self.bump).take() {
+                    self.tree.write().unwrap().apply(&c, &mut Vec::new());
+                }
+                let Op::FetchMany { items } = op else {
+                    return Err(RpcError::Closed);
+                };
+                let files = lock(&self.files);
+                let items = items
+                    .into_iter()
+                    .map(|(p, w)| match w {
+                        Want::Ver(k) => match files.get(&k.ver) {
+                            Some(b) => (p, Ok((hash_of(b), crate::proto::Bytes(b.clone())))),
+                            None => (p, Err(crate::proto::WireErr::Gone)),
+                        },
+                        Want::Hash(_) => (p, Err(crate::proto::WireErr::NotFound)),
+                    })
+                    .collect();
+                Ok(Reply::Blobs { items })
+            }
+            fn call_stream(
+                &self,
+                _op: Op,
+                _sink: Box<dyn crate::net::rpc::ChunkSink>,
+                _d: Instant,
+            ) -> Result<Reply, crate::net::rpc::RpcError> {
+                Err(crate::net::rpc::RpcError::Closed)
+            }
+            fn submit(
+                &self,
+                _op: Op,
+                _done: super::super::cache::Done,
+            ) -> Result<crate::proto::ReqId, crate::net::rpc::RpcError> {
+                Err(crate::net::rpc::RpcError::Closed)
+            }
+            fn submit_stream(
+                &self,
+                _op: Op,
+                _sink: Box<dyn crate::net::rpc::ChunkSink>,
+                _done: super::super::cache::Done,
+            ) -> Result<crate::proto::ReqId, crate::net::rpc::RpcError> {
+                Err(crate::net::rpc::RpcError::Closed)
+            }
+            fn send_chunk(
+                &self,
+                _id: crate::proto::ReqId,
+                _off: u64,
+                _last: bool,
+                _data: Vec<u8>,
+            ) -> Result<(), crate::net::rpc::RpcError> {
+                Ok(())
+            }
+            fn cancel(&self, _id: crate::proto::ReqId) {}
+        }
+
+        struct Rig {
+            cache: BlobCache,
+            tree: Arc<RwLock<GTree>>,
+            host: Arc<Host>,
+            _dir: Dir,
+        }
+
+        fn rig(files: &[(u64, &[u8])], nodes: &[(&str, u64, u64)]) -> Rig {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = Dir(std::env::temp_dir().join(format!(
+                "csync-rules-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Relaxed)
+            )));
+            let _ = std::fs::remove_dir_all(&dir.0);
+            let tree = Arc::new(RwLock::new(GTree::new()));
+            {
+                let mut t = tree.write().unwrap();
+                for (name, size, ver) in nodes {
+                    t.apply(&upsert(name, *size, *ver), &mut Vec::new());
+                }
+                t.set_version(9, 1);
+            }
+            let host = Arc::new(Host {
+                files: Mutex::new(files.iter().map(|(v, b)| (*v, b.to_vec())).collect()),
+                rounds: std::sync::atomic::AtomicUsize::new(0),
+                tree: tree.clone(),
+                bump: Mutex::new(None),
+            });
+            let slot = RemoteSlot::new();
+            slot.set(Some(host.clone() as Arc<dyn Remote>));
+            let cache = BlobCache::open(
+                &CacheConfig {
+                    dir: dir.0.clone(),
+                    cap: Some(1 << 30),
+                },
+                slot,
+            )
+            .unwrap();
+            Rig {
+                cache,
+                tree,
+                host,
+                _dir: dir,
+            }
+        }
+
+        fn found_at(r: &Rig, name: &str) -> RuleFile {
+            let t = r.tree.read().unwrap();
+            let p = RelPath::new(name).unwrap();
+            let id = t.resolve(&p).unwrap();
+            rule_file(id, t.get(id).unwrap(), p, t.index_id())
+        }
+
+        #[test]
+        fn a_pending_rule_file_carries_the_version_to_fetch_it_by() {
+            let r = rig(&[], &[(".gitignore", 8, 5)]);
+            let f = found_at(&r, ".gitignore");
+            let k = f.pending.map(|(_, k)| k);
+            assert_eq!(
+                k,
+                Some(VerKey {
+                    index: 9,
+                    ver: 5,
+                    size: 8
+                })
+            );
+            assert_eq!((f.hash, f.size), (None, 8));
+            r.tree.write().unwrap().apply(
+                &Change::Upsert {
+                    path: RelPath::new(".gitignore").unwrap(),
+                    meta: Meta {
+                        hash: Some([3; 32]),
+                        ..pending_meta(8)
+                    },
+                    ver: 6,
+                },
+                &mut Vec::new(),
+            );
+            let f = found_at(&r, ".gitignore");
+            assert_eq!((f.pending, f.hash), (None, Some([3; 32])));
+        }
+
+        #[test]
+        fn pending_rule_files_are_fetched_in_one_round_and_learned() {
+            let (gi, ig) = (&b"target/\n"[..], &b"*.log\n"[..]);
+            let r = rig(
+                &[(5, gi), (6, ig)],
+                &[
+                    (".gitignore", gi.len() as u64, 5),
+                    (".ignore", ig.len() as u64, 6),
+                ],
+            );
+            let mut found = vec![found_at(&r, ".gitignore"), found_at(&r, ".ignore")];
+            resolve_pending(&r.cache, &r.tree, &mut found);
+
+            assert_eq!(r.host.rounds.load(Relaxed), 1);
+            assert_eq!(found[0].hash, Some(hash_of(gi)));
+            assert_eq!(found[1].hash, Some(hash_of(ig)));
+            assert!(found.iter().all(|f| f.pending.is_none()));
+            assert!(r.cache.contains(&hash_of(gi)) && r.cache.contains(&hash_of(ig)));
+            let learned = found_at(&r, ".gitignore");
+            assert_eq!(learned.hash, Some(hash_of(gi)));
+        }
+
+        #[test]
+        fn a_rule_file_replaced_under_the_fetch_is_retried_at_its_new_version() {
+            let new = &b"node_modules/\n"[..];
+            let r = rig(&[(6, new)], &[(".gitignore", 8, 5)]);
+            *lock(&r.host.bump) = Some(upsert(".gitignore", new.len() as u64, 6));
+            let mut found = vec![found_at(&r, ".gitignore")];
+            resolve_pending(&r.cache, &r.tree, &mut found);
+
+            assert_eq!(r.host.rounds.load(Relaxed), 2);
+            assert_eq!(found[0].hash, Some(hash_of(new)));
+            assert_eq!(found_at(&r, ".gitignore").hash, Some(hash_of(new)));
+        }
+
+        #[test]
+        fn an_unresolvable_rule_file_is_left_without_a_hash() {
+            let r = rig(&[], &[(".gitignore", 8, 5)]);
+            let mut found = vec![found_at(&r, ".gitignore")];
+            resolve_pending(&r.cache, &r.tree, &mut found);
+
+            assert_eq!(r.host.rounds.load(Relaxed), 1);
+            assert_eq!((found[0].hash, found[0].pending), (None, None));
+            assert!(found_at(&r, ".gitignore").pending.is_some());
+        }
+
+        #[test]
+        fn a_pending_rule_file_over_the_text_limit_is_not_fetched() {
+            let r = rig(&[], &[(".gitignore", TEXT_MAX as u64 + 1, 5)]);
+            let mut found = vec![found_at(&r, ".gitignore")];
+            resolve_pending(&r.cache, &r.tree, &mut found);
+            assert_eq!(r.host.rounds.load(Relaxed), 0);
+            assert!(found[0].hash.is_none());
         }
     }
 }

@@ -120,20 +120,162 @@ jobs:
           path: ${{ runner.temp }}/csync-bin
       # artifacts drop the executable bit
       - run: chmod 755 "$RUNNER_TEMP/csync-bin/csync"
-      - name: fuse_it
+      - name: fuse suites
         shell: bash
         env:
           CSYNC_BIN: ${{ runner.temp }}/csync-bin/csync
         run: |
-          if [ "$CSYNC_IT_PRIV" = root ]; then
-            # build as the runner user so target/ stays user-owned, then run only the test binary as root
-            bin="$(cargo test --locked --test fuse_it --no-run --message-format=json \
-              | jq -r 'select(.reason == "compiler-artifact" and .target.name == "fuse_it" and .executable != null) | .executable')"
-            test -x "$bin"
-            sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
-          else
-            cargo test --locked --test fuse_it -- --test-threads=1
-          fi
+          for suite in fuse_it fuse_git; do
+            if [ "$CSYNC_IT_PRIV" = root ]; then
+              # build as the runner user so target/ stays user-owned, then run only the test binary as root
+              bin="$(cargo test --locked --test "$suite" --no-run --message-format=json \
+                | jq -r --arg suite "$suite" 'select(.reason == "compiler-artifact" and .target.name == $suite and .executable != null) | .executable')"
+              test -x "$bin"
+              sudo --preserve-env=CSYNC_BIN,CSYNC_IT_PRIV,RUST_BACKTRACE "$bin" --test-threads=1
+            else
+              cargo test --locked --test "$suite" -- --test-threads=1
+            fi
+          done
+
+  # experimental: whether macFUSE (FSKit backend) can run on a hosted macOS runner; never blocks merging, not in ci-ok
+  macfuse:
+    name: macfuse (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    env:
+      CSYNC_BIN: ${{ github.workspace }}/target/release/csync
+      FSKIT_ID: io.macfuse.app.fsmodule.macfuse
+      FSKIT_LOCAL_ID: io.macfuse.app.fsmodule.macfuse-local
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: macfuse
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo build --locked --release
+      - name: diagnostics before install
+        if: always()
+        shell: bash
+        run: |
+          echo "::group::system"
+          sw_vers; uname -a; csrutil status || true; sysctl -n machdep.cpu.brand_string; sysctl -n kern.hv_vmm_present || true
+          echo "::endgroup::"
+          echo "::group::doctor"; "$CSYNC_BIN" doctor || true; echo "::endgroup::"
+      - name: install macfuse
+        shell: bash
+        run: |
+          set -x
+          brew install --cask macfuse
+          echo "install exit: $?"
+      - name: diagnostics after install
+        if: always()
+        shell: bash
+        run: |
+          echo "::group::macfuse version"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Library/Filesystems/macfuse.fs/Contents/Info.plist || true
+          ls -la /Library/Filesystems/macfuse.fs/Contents /Library/Filesystems/macfuse.fs/Contents/Extensions 2>&1 || true
+          find /Library/Filesystems/macfuse.fs -name '*.appex' 2>/dev/null || true
+          ls -la /usr/local/lib | grep -i fuse || true
+          echo "::endgroup::"
+          echo "::group::pluginkit"; pluginkit -m -A -vvv 2>&1 | grep -i -B1 -A8 fuse || true; echo "::endgroup::"
+          echo "::group::kmutil"; kmutil showloaded 2>&1 | grep -i fuse || echo "no fuse kext loaded"; echo "::endgroup::"
+          echo "::group::systemextensionsctl"; systemextensionsctl list 2>&1 || true; echo "::endgroup::"
+          echo "::group::doctor"; "$CSYNC_BIN" doctor || true; echo "::endgroup::"
+      # the Settings toggle writes enabledModules.plist through fskit_agent, and pluginkit holds the election; both are set,
+      # then doctor must report the module enabled before the test runs
+      - name: enable the FSKit module
+        shell: bash
+        run: |
+          appex_dir=/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app/Contents/Extensions
+          plist="$HOME/Library/Group Containers/group.com.apple.fskit.settings/enabledModules.plist"
+          ok=
+          for attempt in 1 2 3 4 5 6; do
+            sudo killall fskit_agent fskitd 2>&1 || true
+            sleep 2
+            for id in "$FSKIT_ID" "$FSKIT_LOCAL_ID"; do
+              pluginkit -a "$appex_dir/$id.appex"
+              pluginkit -e use -i "$id"
+            done
+            python3 - "$plist" "$FSKIT_ID" "$FSKIT_LOCAL_ID" <<'PY'
+          import plistlib, sys
+          path, ids = sys.argv[1], sys.argv[2:]
+          with open(path, "rb") as f:
+              mods = plistlib.load(f)
+          for i in ids:
+              if i not in mods:
+                  mods.append(i)
+          with open(path, "wb") as f:
+              plistlib.dump(mods, f, fmt=plistlib.FMT_BINARY)
+          PY
+            sleep 3
+            if "$CSYNC_BIN" doctor | grep -q '^PASS  FSKit module'; then ok=1; break; fi
+            echo "attempt $attempt: the module is not enabled yet"
+            sleep 5
+          done
+          plutil -p "$plist"
+          pluginkit -m -A -p com.apple.fskit.fsmodule -vv | grep -i -A2 'io.macfuse' || true
+          "$CSYNC_BIN" doctor | grep -i fskit
+          test -n "$ok"
+          sleep 5
+      - name: fskit client view
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/fsext.swift" <<'EOF'
+          import FSKit
+          import Foundation
+          let sem = DispatchSemaphore(value: 0)
+          FSClient.shared.fetchInstalledExtensions { exts, err in
+              for e in exts ?? [] { print("\(e.bundleIdentifier) enabled=\(e.isEnabled)") }
+              if let err { print("error: \(err)") }
+              sem.signal()
+          }
+          if sem.wait(timeout: .now() + 20) == .timedOut { print("timed out") }
+          EOF
+          swiftc -target "$(uname -m)-apple-macos15.4" -o "$RUNNER_TEMP/fsext" "$RUNNER_TEMP/fsext.swift"
+          "$RUNNER_TEMP/fsext"
+      - name: macguest test
+        shell: bash
+        run: |
+          set +e
+          log="$RUNNER_TEMP/macguest.log"
+          cargo test --locked --release --test fuse_macguest -- --nocapture 2>&1 | tee "$log"
+          rc="${PIPESTATUS[0]}"
+          {
+            echo "### macfuse (${{ matrix.os }}, macOS $(sw_vers -productVersion))"
+            if grep -q '^skip:' "$log"; then
+              echo "DID NOT RUN: $(grep -m1 '^skip:' "$log")"
+              rc=1
+            elif [ "$rc" -ne 0 ]; then
+              echo "FAILED (exit $rc)"
+            elif ! grep -q 'test result: ok. 1 passed' "$log"; then
+              echo "FAILED: no passing test was reported"
+              rc=1
+            else
+              echo "passed: mounted, read, host to guest, guest to host, ignored path, unmount and wipe"
+            fi
+            grep -a -E '^(fsevents |host changes on the mount|late listing|mount table entry)' "$log" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+      - name: mount state and logs
+        if: always()
+        shell: bash
+        run: |
+          mount | grep -i -E 'fuse|csync|fskit' || echo "nothing fuse-like in the mount table"
+          log show --predicate 'process BEGINSWITH "io.macfuse" OR process == "macfuse" OR process == "fskitd" OR process == "fskit_agent" OR process == "csync"' --last 15m --style compact > "$RUNNER_TEMP/unified.log" 2>&1 || true
+          echo "== macfuse and fskit error lines"
+          grep -a -E ' (E|F) +(io\.macfuse|fskitd|fskit_agent|csync)' "$RUNNER_TEMP/unified.log" | grep -a -v -E 'libsqlite3|DetachedSignatures' | tail -40 || true
+          echo "== macfuse daemon lines"
+          grep -a 'io.macfuse:' "$RUNNER_TEMP/unified.log" | tail -40 || true
 
   install-scripts:
     runs-on: ubuntu-24.04

@@ -1,5 +1,7 @@
 pub mod apply;
 pub mod commit;
+pub mod hasher;
+pub(crate) mod peek;
 pub mod serve;
 
 use crate::crypto::trust::{Identity, PeerKey, Trust, TrustEntry, ensure_private_dir, now_unix};
@@ -16,14 +18,15 @@ use crate::net::conn::{
 };
 use crate::net::discover;
 use crate::proto::{
-    BATCH_MAX, Body, Bye, Change, DeltaOp, ExcludeSrc, FRAME_MAX, FsTraits, Hash32, Hello, IndexId,
-    Kind, LinkTarget, Meta, Msg, Name, Notice, NoticeKind, Op, PROTO, Push, RelPath, Reply, ReqId,
-    Seq, SnapEntry, UNACKED_PUSH_MAX, Welcome, WireErr,
+    BATCH_MAX, Body, Bye, Change, DeltaOp, ExcludeSrc, FRAME_MAX, FsTraits, Hash32, Hello,
+    INLINE_MAX, IndexId, Kind, LinkTarget, Meta, Msg, Name, Notice, NoticeKind, Op, PROTO, Push,
+    RelPath, Reply, ReqId, Seq, SnapEntry, UNACKED_PUSH_MAX, Welcome, WireErr,
     hs::{HsHello, PAIR_TIMEOUT_S, PairStep, Role},
     path::TMP_PREFIX,
 };
 use crate::sys::{self, WatchEvent, wflag};
-use crate::tui::{ConnState, NOTICES_MAX, PairPrompt, PeerView, UiBus, UiCmd, UiSnapshot};
+use crate::tui::feed::{By, Entry, What};
+use crate::tui::{ConnState, PairPrompt, PeerView, UiBus, UiCmd, UiSnapshot};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, at, bounded, never, select};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -38,7 +41,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -52,10 +55,16 @@ const EVENT_QUEUE: usize = 4_096;
 const COMMIT_QUEUE: usize = 256;
 const FETCH_QUEUE: usize = 1_024;
 const FETCH_THREADS: usize = 4;
+const LIGHT_THREADS: usize = 2;
+const HASH_THREADS: usize = 2;
+const VERIFY_BLOCK: usize = 4 << 20;
+const PAR_VERIFY_MIN: u64 = 1 << 20;
 pub(crate) const FETCH_INFLIGHT_MAX: usize = 128;
 const UPLOADS_MAX: usize = 64;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_EVERY: Duration = Duration::from_secs(30);
+// the guest answers every ping, so this long without a single frame means the peer is gone
+const PEER_SILENT: Duration = PING_EVERY.saturating_mul(3);
 const UPLOAD_IDLE: Duration = Duration::from_secs(60);
 const UPLOAD_REAP: Duration = Duration::from_secs(5);
 const UI_EVERY: Duration = Duration::from_millis(200);
@@ -224,6 +233,86 @@ pub(crate) fn hash_fd(fd: BorrowedFd<'_>, size: u64) -> io::Result<Hash32> {
     res.map(|()| *h.finalize().as_bytes())
 }
 
+thread_local! {
+    static VBUF: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+type MidHook = Box<dyn FnOnce()>;
+
+// a test's way to change the file after its bytes were read and before the re-stat
+#[cfg(test)]
+thread_local! {
+    pub(crate) static MID_HASH: std::cell::RefCell<Option<MidHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+// the hash of the open file's first k1.size bytes, or None when the file is not provably the version k1 describes
+pub(crate) fn hash_verified(fd: BorrowedFd<'_>, k1: &StatKey) -> io::Result<Option<Hash32>> {
+    hash_verified_with(fd, k1, &mut || true, k1.size >= PAR_VERIFY_MIN)
+}
+
+// as hash_verified; pace runs before every read and returns false to give up
+pub(crate) fn hash_verified_paced(
+    fd: BorrowedFd<'_>,
+    k1: &StatKey,
+    pace: &mut dyn FnMut() -> bool,
+) -> io::Result<Option<Hash32>> {
+    hash_verified_with(fd, k1, pace, false)
+}
+
+// parallel spreads each block over the rayon pool; the digest is the same either way
+fn hash_verified_with(
+    fd: BorrowedFd<'_>,
+    k1: &StatKey,
+    pace: &mut dyn FnMut() -> bool,
+    parallel: bool,
+) -> io::Result<Option<Hash32>> {
+    let mut buf = VBUF.take();
+    let first = k1.size.min(VERIFY_BLOCK as u64) as usize;
+    if buf.len() < first {
+        buf.resize(first, 0);
+    }
+    let mut h = blake3::Hasher::new();
+    let mut off = 0u64;
+    let read = loop {
+        if off >= k1.size {
+            break Ok(true);
+        }
+        if !pace() {
+            break Ok(false);
+        }
+        let n = (k1.size - off).min(VERIFY_BLOCK as u64) as usize;
+        match rustix::io::pread(fd, &mut buf[..n], off) {
+            // the file shrank under the read
+            Ok(0) => break Ok(false),
+            Ok(m) => {
+                if parallel {
+                    h.update_rayon(&buf[..m]);
+                } else {
+                    h.update(&buf[..m]);
+                }
+                off += m as u64;
+            }
+            Err(rustix::io::Errno::INTR) => {}
+            Err(e) => break Err(io::Error::from(e)),
+        }
+    };
+    VBUF.set(buf);
+    if !read? {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    {
+        if let Some(hook) = MID_HASH.with(|m| m.borrow_mut().take()) {
+            hook();
+        }
+    }
+    let post = sys::stat_key(fd)?;
+    let same = sys::same_version(&post, k1) && post.ctime_ns == k1.ctime_ns;
+    Ok(same.then(|| *h.finalize().as_bytes()))
+}
+
 pub(crate) fn read_exact_at(fd: BorrowedFd<'_>, buf: &mut [u8], mut off: u64) -> io::Result<()> {
     let mut done = 0;
     while done < buf.len() {
@@ -276,7 +365,7 @@ pub(crate) fn read_rule(root: BorrowedFd<'_>, p: &RelPath) -> Option<Vec<u8>> {
 
 pub(crate) fn change_cost(c: &Change) -> usize {
     match c {
-        Change::Upsert { path, meta } => {
+        Change::Upsert { path, meta, .. } => {
             64 + path.as_str().len() + meta.link.as_ref().map_or(0, |l| l.as_str().len())
         }
         Change::Remove { path } => 16 + path.as_str().len(),
@@ -302,6 +391,106 @@ pub(crate) fn batches(changes: Vec<Change>) -> Vec<(usize, Vec<Change>)> {
     if !cur.is_empty() {
         done += cur.len();
         out.push((done, cur));
+    }
+    out
+}
+
+fn unnamed_guest() -> Name {
+    Name::new("guest").expect("static name")
+}
+
+// a change carries no earlier state, so a file upsert cannot be told from an addition and reads as changed
+fn feed_row(c: &Change, by: &By, ts_ms: u64, seq: Seq) -> Entry {
+    let base = Entry {
+        id: 0,
+        ts_ms,
+        what: What::Changed,
+        by: by.clone(),
+        path: RelPath::root(),
+        from: None,
+        size: 0,
+        old: None,
+        new: None,
+        ver: seq,
+        merged: false,
+    };
+    match c {
+        Change::Upsert { path, meta, ver } => Entry {
+            what: match meta.kind {
+                Kind::File => What::Changed,
+                Kind::Dir => What::DirAdded,
+                Kind::Symlink => What::Link,
+            },
+            path: path.clone(),
+            size: meta.size,
+            new: meta.hash,
+            ver: *ver,
+            ..base
+        },
+        Change::Remove { path } => Entry {
+            what: What::Removed,
+            path: path.clone(),
+            ..base
+        },
+        Change::Rename { from, to } => Entry {
+            what: What::Renamed,
+            path: to.clone(),
+            from: Some(from.clone()),
+            ..base
+        },
+    }
+}
+
+// a directory upsert is mostly its mtime moving because a child came or went, and cannot be told from a new
+// directory here, so it gets no row; the files inside it do
+fn shown_in_feed(c: &&Change) -> bool {
+    !matches!(c, Change::Upsert { meta, .. } if meta.kind == Kind::Dir)
+}
+
+// only the newest rows are mapped; the rest become the one Burst row that the feed would have made itself
+fn feed_rows(changes: &[Change], by: &By, ts_ms: u64, seq: Seq) -> Vec<Entry> {
+    let total = changes.iter().filter(shown_in_feed).count();
+    let skipped = peek::rows_dropped(total);
+    let mut rows: Vec<Entry> = changes
+        .iter()
+        .rev()
+        .filter(shown_in_feed)
+        .take(total - skipped)
+        .map(|c| feed_row(c, by, ts_ms, seq))
+        .collect();
+    rows.reverse();
+    if skipped > 0 {
+        let ver = rows.last().map_or(seq, |r| r.ver);
+        rows.push(peek::burst_entry(skipped, ts_ms, by, ver));
+    }
+    rows
+}
+
+// a guest that just received the tree can pull every hash it lacks once the host has none pending
+fn send_hashes_done(link: &Link, tree: &Tree) {
+    if tree.pending() == 0 {
+        let _ = link.send(Msg::Push(Push::HashesDone {
+            index: tree.index_id(),
+        }));
+    }
+}
+
+// pushed hashes in frames that stay under BATCH_MAX items and PUSH_BYTES
+fn hash_parts(items: Vec<(RelPath, Seq, Hash32)>) -> Vec<Vec<(RelPath, Seq, Hash32)>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut bytes = 0usize;
+    for item in items {
+        let k = 48 + item.0.as_str().len();
+        if !cur.is_empty() && (cur.len() == BATCH_MAX || bytes + k > PUSH_BYTES) {
+            out.push(std::mem::take(&mut cur));
+            bytes = 0;
+        }
+        bytes += k;
+        cur.push(item);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -385,6 +574,8 @@ pub(crate) struct Guest {
     feed: Mutex<Feed>,
     // in-flight fetch ids, true once cancelled
     fetches: Mutex<FxHashMap<ReqId, bool>>,
+    pub(crate) tx: AtomicU64,
+    pub(crate) rx: AtomicU64,
 }
 
 impl Guest {
@@ -402,6 +593,8 @@ impl Guest {
                 replies: Vec::new(),
             }),
             fetches: Mutex::new(FxHashMap::default()),
+            tx: AtomicU64::new(0),
+            rx: AtomicU64::new(0),
         }
     }
 
@@ -439,6 +632,11 @@ impl Guest {
         lock(&self.fetches).remove(&id);
     }
 
+    // fetch requests accepted from this guest and not yet answered, whether queued or running
+    fn queued(&self) -> u32 {
+        u32::try_from(lock(&self.fetches).len()).unwrap_or(u32::MAX)
+    }
+
     fn cancel_fetch(&self, id: ReqId) {
         if let Some(c) = lock(&self.fetches).get_mut(&id) {
             *c = true;
@@ -449,6 +647,15 @@ impl Guest {
 #[derive(Default)]
 pub(crate) struct Hub {
     guests: Mutex<Vec<Arc<Guest>>>,
+}
+
+// held while a request is being served, so background hashing steps aside
+pub(crate) struct FgGuard<'a>(&'a AtomicUsize);
+
+impl Drop for FgGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) struct Core {
@@ -466,6 +673,9 @@ pub(crate) struct Core {
     pub(crate) dirty: AtomicBool,
     pub(crate) stats: Counters,
     pub(crate) kept: serve::Kept,
+    // jobs the serve pool and the committer are running right now; the hasher yields while it is above zero
+    pub(crate) fg: AtomicUsize,
+    pub(crate) hashing: hasher::Hub,
     ui: Option<Arc<UiBus>>,
     kick: Option<Sender<()>>,
     tmp_seed: u64,
@@ -508,6 +718,8 @@ impl Core {
             dirty: AtomicBool::new(true),
             stats: Counters::default(),
             kept: serve::Kept::default(),
+            fg: AtomicUsize::new(0),
+            hashing: hasher::Hub::default(),
             ui: None,
             kick: None,
             tmp_seed,
@@ -526,6 +738,72 @@ impl Core {
 
     pub(crate) fn rules_w(&self) -> RwLockWriteGuard<'_, Rules> {
         write(&self.rules)
+    }
+
+    pub(crate) fn fg_guard(&self) -> FgGuard<'_> {
+        self.fg.fetch_add(1, Ordering::AcqRel);
+        FgGuard(&self.fg)
+    }
+
+    // records a hash computed for exactly this version of the entry, then tells guests; a stale hash is dropped
+    pub(crate) fn learn_hash(&self, p: &RelPath, ver: Seq, stat: &StatKey, h: Hash32) {
+        self.apply_hash(p, ver, stat, h);
+    }
+
+    pub(crate) fn apply_hash(&self, p: &RelPath, ver: Seq, stat: &StatKey, h: Hash32) -> bool {
+        let applied = self.tree().set_hash(p, ver, stat, h);
+        if applied {
+            self.dirty.store(true, Ordering::Release);
+            if self.hashing.add(p.clone(), ver, h) {
+                self.flush_hashes(false);
+            }
+        }
+        applied
+    }
+
+    // the directory is being read right now, so its pending siblings are hashed first
+    pub(crate) fn hint_dir(&self, dir: &RelPath) {
+        self.hashing.hint(dir);
+    }
+
+    // buffered hashes go to every live guest on the bulk queue; a guest whose queue is full misses them and
+    // can ask for them with Op::Hashes
+    pub(crate) fn flush_hashes(&self, force: bool) {
+        let Some(items) = self.hashing.take(force) else {
+            return;
+        };
+        let index = self.tree().index_id();
+        let guests: Vec<Arc<Guest>> = lock(&self.hub.guests)
+            .iter()
+            .filter(|g| lock(&g.feed).live)
+            .cloned()
+            .collect();
+        let parts = hash_parts(items);
+        for g in &guests {
+            for items in &parts {
+                let push = Msg::Push(Push::Hashes {
+                    index,
+                    items: items.clone(),
+                });
+                if g.link.try_send_bulk(push).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // nothing is pending any more: whatever hashes guests lack are available to pull
+    pub(crate) fn hashes_done(&self) {
+        self.flush_hashes(true);
+        let index = self.tree().index_id();
+        let guests: Vec<Arc<Guest>> = lock(&self.hub.guests)
+            .iter()
+            .filter(|g| lock(&g.feed).live)
+            .cloned()
+            .collect();
+        for g in &guests {
+            let _ = g.link.send(Msg::Push(Push::HashesDone { index }));
+        }
     }
 
     pub(crate) fn tmp_name(&self) -> String {
@@ -579,17 +857,43 @@ impl Core {
                 }
             }
         }
-        let t = now_ms();
-        self.ui(|s| {
-            s.notices.push_back((t, n));
-            while s.notices.len() > NOTICES_MAX {
-                s.notices.pop_front();
-            }
-        });
+        if let Some(u) = &self.ui {
+            u.notice(now_ms(), n);
+        }
+    }
+
+    // the feed keeps only the newest rows, so a huge batch costs O(FEED_MAX) under the tree lock
+    fn feed_changes(
+        &self,
+        changes: &[Change],
+        origin: Option<u64>,
+        guests: &[Arc<Guest>],
+        seq: Seq,
+    ) {
+        let Some(bus) = self.ui.as_ref().filter(|u| u.feed().is_on()) else {
+            return;
+        };
+        let by = match origin {
+            None => By::Host,
+            Some(id) => By::Guest {
+                id,
+                name: guests
+                    .iter()
+                    .find(|g| g.id == id)
+                    .map_or_else(unnamed_guest, |g| g.name.clone()),
+            },
+        };
+        let rows = feed_rows(changes, &by, now_ms(), seq);
+        if !rows.is_empty() {
+            bus.feed().push_batch(rows);
+        }
     }
 
     // runs with the tree lock held so guests see batches in seq order
     pub(crate) fn publish_locked(&self, tree: &Tree, changes: Vec<Change>, origin: Option<u64>) {
+        if tree.pending() > 0 || self.hashing.done_due() {
+            self.hashing.wake();
+        }
         self.dirty.store(true, Ordering::Release);
         self.kick();
         if changes.is_empty() {
@@ -597,6 +901,7 @@ impl Core {
         }
         let seq = tree.seq();
         let guests = lock(&self.hub.guests);
+        self.feed_changes(&changes, origin, &guests, seq);
         if guests.is_empty() {
             return;
         }
@@ -655,6 +960,7 @@ impl Core {
                 f.sent = target;
                 f.lagging = false;
                 f.release(&g.link);
+                send_hashes_done(&g.link, &tree);
             }
             None => {
                 if send_snapshot(&g.link, &tree).is_err() {
@@ -663,6 +969,7 @@ impl Core {
                 f.sent = target;
                 f.lagging = false;
                 f.release(&g.link);
+                send_hashes_done(&g.link, &tree);
                 drop(f);
                 drop(tree);
                 self.notice(
@@ -737,11 +1044,31 @@ impl Core {
             replies: Vec::new(),
         };
         guests.push(g.clone());
+        send_hashes_done(&g.link, &tree);
         Ok(())
     }
 
-    fn stats_to_ui(&self) {
-        let files = self.tree().len() as u64;
+    // true while a figure it publishes is still moving without anything else kicking the ui, so the caller ticks again
+    fn stats_to_ui(&self) -> bool {
+        let (files, hash_pending) = {
+            let t = self.tree();
+            (
+                t.len() as u64,
+                u32::try_from(t.pending()).unwrap_or(u32::MAX),
+            )
+        };
+        let guests: Vec<Arc<Guest>> = lock(&self.hub.guests).clone();
+        let queues: Vec<(u64, u32, u64, u64)> = guests
+            .iter()
+            .map(|g| {
+                (
+                    g.id,
+                    g.queued(),
+                    g.tx.load(Ordering::Relaxed),
+                    g.rx.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         let st = &self.stats;
         let (fetches, commits, refused, merged, tx, rx) = (
             st.fetches.load(Ordering::Relaxed),
@@ -759,7 +1086,17 @@ impl Core {
             s.stats.merged = merged;
             s.stats.tx = tx;
             s.stats.rx = rx;
+            s.stats.hash_pending = hash_pending;
+            for &(id, n, gtx, grx) in &queues {
+                if s.peers.iter().any(|p| p.id == id) {
+                    let io = s.peer_io(id);
+                    io.pending = n;
+                    io.tx = gtx;
+                    io.rx = grx;
+                }
+            }
         });
+        hash_pending > 0 || queues.iter().any(|&(_, n, _, _)| n > 0)
     }
 }
 
@@ -972,7 +1309,8 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     core.kick = Some(kick_tx);
     core.echoes = echoes;
     let core = Arc::new(core);
-    core.stats_to_ui();
+    ui.feed().set_source(Arc::new(peek::HostPeek::new(&core)));
+    let busy = core.stats_to_ui();
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let applier = apply::Applier::new(core.clone(), watcher, ev_rx, stop_rx, index_path);
@@ -989,10 +1327,18 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         fetch_hs.push(spawn("csync-fetch", move || serve::run(&c, &rx))?);
     }
     drop(fetch_rx);
+    let (light_tx, light_rx) = bounded::<serve::FetchJob>(FETCH_QUEUE);
+    let mut light_hs = Vec::with_capacity(LIGHT_THREADS);
+    for _ in 0..LIGHT_THREADS {
+        let (c, rx) = (core.clone(), light_rx.clone());
+        light_hs.push(spawn("csync-light", move || serve::run(&c, &rx))?);
+    }
+    drop(light_rx);
     {
         let c = core.clone();
         spawn("csync-sweep", move || sweep_temps(&c, started))?;
     }
+    let hasher = hasher::start(core.clone(), HASH_THREADS);
 
     let listener = Listener::bind(cfg.listen, id.clone(), trust.clone(), cfg.allow_pairing)?;
     listener.set_hello(HsHello {
@@ -1026,12 +1372,13 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         trust,
         jobs: job_tx,
         fetch: fetch_tx,
+        light: light_tx,
         next_id: 1,
         pending: None,
         sessions: Vec::new(),
     };
     let mut ctl_rx: Receiver<HostCtl> = cfg.ctl.take().unwrap_or_else(never);
-    let mut ui_due: Option<Instant> = None;
+    let mut ui_due: Option<Instant> = busy.then(|| Instant::now() + UI_EVERY);
     loop {
         let pair_rx = host
             .pending
@@ -1065,8 +1412,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
                 }
             },
             recv(ui_tick) -> _ => {
-                ui_due = None;
-                core.stats_to_ui();
+                ui_due = core.stats_to_ui().then(|| Instant::now() + UI_EVERY);
             },
         }
     }
@@ -1082,6 +1428,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     let Host {
         jobs,
         fetch,
+        light,
         sessions,
         ..
     } = host;
@@ -1091,9 +1438,11 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     drop(jobs);
     let _ = commit_h.join();
     drop(fetch);
-    for h in fetch_hs {
+    drop(light);
+    for h in fetch_hs.into_iter().chain(light_hs) {
         let _ = h.join();
     }
+    hasher.stop();
     let _ = stop_tx.send(());
     let _ = apply_h.join();
     core.ui(|s| {
@@ -1122,6 +1471,7 @@ struct Host {
     trust: Arc<Trust>,
     jobs: Sender<commit::Job>,
     fetch: Sender<serve::FetchJob>,
+    light: Sender<serve::FetchJob>,
     next_id: u64,
     pending: Option<Pairing>,
     sessions: Vec<JoinHandle<()>>,
@@ -1313,6 +1663,7 @@ impl Host {
             inbox,
             jobs: self.jobs.clone(),
             fetch: self.fetch.clone(),
+            light: self.light.clone(),
             uploads: FxHashMap::default(),
             order: VecDeque::new(),
             held: FxHashMap::default(),
@@ -1374,6 +1725,7 @@ struct SessionCtx {
     inbox: Receiver<In>,
     jobs: Sender<commit::Job>,
     fetch: Sender<serve::FetchJob>,
+    light: Sender<serve::FetchJob>,
     uploads: FxHashMap<ReqId, Upload>,
     // mutations not yet handed to the committer, in the order the guest sent them
     order: VecDeque<ReqId>,
@@ -1391,7 +1743,10 @@ impl SessionCtx {
         let id = self.g.id;
         lock(&self.core.hub.guests).retain(|x| x.id != id);
         self.g.link.close(CloseReason::Local);
-        self.core.ui(|s| s.peers.retain(|p| p.id != id));
+        self.core.ui(|s| {
+            s.peers.retain(|p| p.id != id);
+            s.io.retain(|p| p.id != id);
+        });
     }
 
     fn set_state(&self, st: ConnState) {
@@ -1447,6 +1802,7 @@ impl SessionCtx {
     }
 
     fn serve(&mut self) {
+        let mut last_rx = Instant::now();
         loop {
             let wait = if self.uploads.is_empty() {
                 PING_EVERY
@@ -1455,8 +1811,15 @@ impl SessionCtx {
             };
             match self.inbox.recv_timeout(wait) {
                 Ok(In::Closed(_)) | Err(RecvTimeoutError::Disconnected) => return,
-                Err(RecvTimeoutError::Timeout) => self.reap(),
+                Err(RecvTimeoutError::Timeout) => {
+                    if last_rx.elapsed() >= PEER_SILENT {
+                        self.g.link.close(CloseReason::Io(io::ErrorKind::TimedOut));
+                        return;
+                    }
+                    self.reap();
+                }
                 Ok(In::Msg(m)) => {
+                    last_rx = Instant::now();
                     if !self.on_msg(m) {
                         return;
                     }
@@ -1466,7 +1829,10 @@ impl SessionCtx {
                     off,
                     last,
                     data,
-                }) => self.on_chunk(id, off, last, &data),
+                }) => {
+                    last_rx = Instant::now();
+                    self.on_chunk(id, off, last, &data);
+                }
             }
             if self.last_ping.elapsed() >= PING_EVERY {
                 self.ping();
@@ -1543,7 +1909,10 @@ impl SessionCtx {
     }
 
     fn on_req(&mut self, id: ReqId, mut op: Op) {
-        if matches!(op, Op::Fetch { .. } | Op::FetchMany { .. }) {
+        if matches!(
+            op,
+            Op::Fetch { .. } | Op::FetchMany { .. } | Op::Resolve { .. } | Op::Hashes { .. }
+        ) {
             return self.queue_fetch(id, op);
         }
         let plan = match &mut op {
@@ -1554,7 +1923,11 @@ impl SessionCtx {
             Op::Rename { to, body, .. } => body
                 .as_mut()
                 .map(|(v, b)| (to.clone(), *v, std::mem::replace(b, Body::Empty))),
-            Op::Mk { .. } | Op::Remove { .. } | Op::SetAttr { .. } => None,
+            Op::Mk { .. }
+            | Op::Remove { .. }
+            | Op::SetAttr { .. }
+            | Op::Resolve { .. }
+            | Op::Hashes { .. } => None,
         };
         let Some((target, ver, body)) = plan else {
             return self.ready(id, op, commit::Payload::None);
@@ -1588,12 +1961,48 @@ impl SessionCtx {
         }
     }
 
+    // the indexed size and whether the entry already has a hash, as a request for it would find them
+    fn indexed(&self, path: &RelPath) -> Option<(u64, bool)> {
+        self.core
+            .tree()
+            .get(path)
+            .map(|e| (e.stat.size, e.meta.hash.is_some()))
+    }
+
+    // work that never streams a large file and never hashes one: it must not queue behind a long stream
+    fn is_light(&self, op: &Op) -> bool {
+        // a pending large file is hashed whole first, which is bulk work
+        let cheap = |path: &RelPath| match self.indexed(path) {
+            Some((size, hashed)) => hashed || size <= INLINE_MAX as u64,
+            None => true,
+        };
+        match op {
+            Op::Hashes { .. } | Op::FetchMany { .. } => true,
+            Op::Resolve { path, .. } => cheap(path),
+            Op::Fetch {
+                path,
+                range: Some(_),
+                ..
+            } => cheap(path),
+            Op::Fetch {
+                path, range: None, ..
+            } => self
+                .indexed(path)
+                .is_some_and(|(size, _)| size <= INLINE_MAX as u64),
+            _ => false,
+        }
+    }
+
     fn queue_fetch(&mut self, id: ReqId, op: Op) {
         if let Err(e) = self.g.begin_fetch(id) {
             return self.g.reply(id, Err(e));
         }
-        if self
-            .fetch
+        let lane = if self.is_light(&op) {
+            &self.light
+        } else {
+            &self.fetch
+        };
+        if lane
             .try_send(serve::FetchJob {
                 guest: self.g.clone(),
                 id,
@@ -1661,10 +2070,8 @@ impl SessionCtx {
             return self.g.reply(id, Err(WireErr::Busy));
         }
         let staged = commit::writable(&self.core.rules_r(), target, false)
-            .and_then(|()| commit::open_parent(&self.core, target))
-            .and_then(|(dir, _)| {
-                commit::Staged::create(&self.core, dir, 0o600).map_err(|e| wire(&e))
-            });
+            .and_then(|()| commit::upload_dir(&self.core, target))
+            .and_then(|dir| commit::Staged::create(&self.core, dir, 0o600).map_err(|e| wire(&e)));
         match staged {
             Ok(staged) => {
                 let hash = matches!(kind, UpKind::Stream { .. });
@@ -1692,6 +2099,7 @@ impl SessionCtx {
             Ok(true) => {
                 if let Some(u) = self.uploads.remove(&id) {
                     self.core.stats.rx.fetch_add(u.want, Ordering::Relaxed);
+                    self.g.rx.fetch_add(u.want, Ordering::Relaxed);
                     self.finish_upload(id, u);
                 }
             }
@@ -1737,7 +2145,9 @@ impl SessionCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::tree::Observed;
     use crate::proto::{Expect, Version};
+    use crate::tui::feed::FEED_MAX;
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
@@ -1780,12 +2190,14 @@ mod tests {
         ));
         let (jobs, jrx) = crossbeam_channel::unbounded();
         let (fetch, _) = bounded(4);
+        let (light, _) = bounded(4);
         let ctx = SessionCtx {
             core: Arc::new(core),
             g,
             inbox: host_end.inbox,
             jobs,
             fetch,
+            light,
             uploads: FxHashMap::default(),
             order: VecDeque::new(),
             held: FxHashMap::default(),
@@ -1808,11 +2220,59 @@ mod tests {
                 len: body.len() as u64,
             },
             sync: false,
+            mtime_ns: None,
         }
     }
 
     fn ids(rx: &Receiver<commit::Job>) -> Vec<ReqId> {
         rx.try_iter().map(|j| j.id).collect()
+    }
+
+    fn fetch_of(path: &str, range: Option<(u64, u32)>) -> Op {
+        Op::Fetch {
+            path: RelPath::new(path).unwrap(),
+            want: None,
+            have: None,
+            range,
+        }
+    }
+
+    #[test]
+    fn only_work_that_cannot_stream_or_hash_a_large_file_takes_the_light_lane() {
+        let (_t, mut s, _jobs, _peer) = session_with(|root| {
+            std::fs::write(root.join("small"), b"hi").unwrap();
+            std::fs::write(root.join("big"), vec![1u8; INLINE_MAX + 1]).unwrap();
+        });
+        let resolve = |p: &str| Op::Resolve {
+            path: RelPath::new(p).unwrap(),
+            at: crate::proto::VerKey {
+                index: 0,
+                ver: 0,
+                size: 0,
+            },
+            inline: false,
+        };
+        assert!(s.is_light(&Op::Hashes {
+            index: 0,
+            items: Vec::new()
+        }));
+        assert!(s.is_light(&Op::FetchMany { items: Vec::new() }));
+        assert!(s.is_light(&fetch_of("small", None)));
+        assert!(!s.is_light(&fetch_of("big", None)));
+        assert!(s.is_light(&fetch_of("small", Some((0, 1)))));
+        assert!(!s.is_light(&fetch_of("big", Some((0, 1)))));
+        assert!(s.is_light(&resolve("small")));
+        assert!(!s.is_light(&resolve("big")));
+        assert!(!s.is_light(&fetch_of("missing", None)));
+
+        let (ftx, frx) = bounded(8);
+        let (ltx, lrx) = bounded(8);
+        s.fetch = ftx;
+        s.light = ltx;
+        s.queue_fetch(1, fetch_of("small", None));
+        s.queue_fetch(2, fetch_of("big", None));
+        assert_eq!(lrx.try_iter().map(|j| j.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(frx.try_iter().map(|j| j.id).collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -1839,6 +2299,37 @@ mod tests {
         );
         s.on_chunk(1, 0, true, &body);
         assert_eq!(ids(&jobs), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_upload_into_a_directory_made_just_ahead_of_it_lands() {
+        let (t, mut s, jobs, _peer) = session();
+        let body = vec![5u8; 100_000];
+        s.on_msg(Msg::Req {
+            id: 1,
+            op: Op::Mk {
+                path: RelPath::new("d").unwrap(),
+                what: crate::proto::Mk::Dir { perm: 0o755 },
+            },
+        });
+        // the committer has not made d yet when the upload into it begins
+        s.on_msg(Msg::Req {
+            id: 2,
+            op: streamed("d/f", &body),
+        });
+        s.on_chunk(2, 0, true, &body);
+        for j in jobs.try_iter().collect::<Vec<_>>() {
+            let r = commit::exec(&s.core, j.op, j.payload, None);
+            assert!(matches!(r, Ok(Reply::Done { .. })), "job {}: {r:?}", j.id);
+        }
+        assert_eq!(std::fs::read(t.0.join("d/f")).unwrap(), body);
+        let left: Vec<_> = std::fs::read_dir(&t.0)
+            .unwrap()
+            .chain(std::fs::read_dir(t.0.join("d")).unwrap())
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(TMP_PREFIX))
+            .collect();
+        assert!(left.is_empty(), "temps left behind: {left:?}");
     }
 
     #[test]
@@ -1930,6 +2421,347 @@ mod tests {
         );
     }
 
+    fn scratch() -> Tmp {
+        let mut r = [0u8; 8];
+        getrandom::fill(&mut r).unwrap();
+        let p = std::env::temp_dir().join(format!(
+            "csync-verify-{}-{:016x}",
+            std::process::id(),
+            u64::from_le_bytes(r)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        Tmp(p)
+    }
+
+    fn body(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn verified(path: &Path, hook: Option<MidHook>) -> Option<Hash32> {
+        let f = File::open(path).unwrap();
+        let k1 = sys::stat_key(f.as_fd()).unwrap();
+        MID_HASH.with(|m| *m.borrow_mut() = hook);
+        let r = hash_verified(f.as_fd(), &k1).unwrap();
+        MID_HASH.with(|m| *m.borrow_mut() = None);
+        r
+    }
+
+    #[test]
+    fn hash_verified_is_the_blake3_of_the_whole_file() {
+        let t = scratch();
+        for n in [
+            0,
+            1,
+            4096,
+            PAR_VERIFY_MIN as usize - 1,
+            PAR_VERIFY_MIN as usize,
+            VERIFY_BLOCK - 1,
+            VERIFY_BLOCK,
+            VERIFY_BLOCK + 1,
+            2 * VERIFY_BLOCK + 5,
+        ] {
+            let p = t.0.join(format!("f{n}"));
+            let data = body(n);
+            std::fs::write(&p, &data).unwrap();
+            assert_eq!(
+                verified(&p, None),
+                Some(*blake3::hash(&data).as_bytes()),
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_parallel_and_the_paced_hash_agree() {
+        let t = scratch();
+        let p = t.0.join("f");
+        let data = body(2 * VERIFY_BLOCK + 12_345);
+        std::fs::write(&p, &data).unwrap();
+        let f = File::open(&p).unwrap();
+        let k1 = sys::stat_key(f.as_fd()).unwrap();
+        let want = Some(*blake3::hash(&data).as_bytes());
+        assert_eq!(hash_verified(f.as_fd(), &k1).unwrap(), want);
+        assert_eq!(
+            hash_verified_paced(f.as_fd(), &k1, &mut || true).unwrap(),
+            want
+        );
+    }
+
+    #[test]
+    fn hash_verified_refuses_a_file_that_changed_while_it_was_read() {
+        use std::io::Write;
+        let t = scratch();
+        let p = t.0.join("f");
+        let fresh = || std::fs::write(&p, body(3 << 20)).unwrap();
+        let hook = |f: Box<dyn FnOnce()>| -> Option<MidHook> { Some(f) };
+
+        fresh();
+        assert!(verified(&p, None).is_some());
+
+        fresh();
+        let q = p.clone();
+        let grow = hook(Box::new(move || {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&q).unwrap();
+            f.write_all(b"tail").unwrap();
+        }));
+        assert_eq!(verified(&p, grow), None);
+
+        fresh();
+        let q = p.clone();
+        let shrink = hook(Box::new(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&q).unwrap();
+            f.set_len(100).unwrap();
+        }));
+        assert_eq!(verified(&p, shrink), None);
+
+        // same size, new mtime
+        fresh();
+        let q = p.clone();
+        let touch = hook(Box::new(move || {
+            let f = std::fs::OpenOptions::new().write(true).open(&q).unwrap();
+            f.set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .unwrap();
+        }));
+        assert_eq!(verified(&p, touch), None);
+
+        // only the mode changes
+        fresh();
+        let q = p.clone();
+        let chmod = hook(Box::new(move || {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }));
+        assert_eq!(verified(&p, chmod), None);
+
+        // only ctime changes: a new hard link
+        fresh();
+        let (q, other) = (p.clone(), t.0.join("link"));
+        let link = hook(Box::new(move || {
+            thread::sleep(Duration::from_millis(30));
+            std::fs::hard_link(&q, &other).unwrap();
+        }));
+        assert_eq!(verified(&p, link), None);
+
+        fresh();
+        assert_eq!(
+            verified(&p, None),
+            Some(*blake3::hash(&body(3 << 20)).as_bytes())
+        );
+    }
+
+    #[test]
+    fn hash_verified_paced_stops_when_the_pacer_says_so() {
+        let t = scratch();
+        let p = t.0.join("f");
+        std::fs::write(&p, body(VERIFY_BLOCK + 1)).unwrap();
+        let f = File::open(&p).unwrap();
+        let k1 = sys::stat_key(f.as_fd()).unwrap();
+        assert_eq!(
+            hash_verified_paced(f.as_fd(), &k1, &mut || false).unwrap(),
+            None
+        );
+        let mut calls = 0;
+        let h = hash_verified_paced(f.as_fd(), &k1, &mut || {
+            calls += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(h, Some(*blake3::hash(&body(VERIFY_BLOCK + 1)).as_bytes()));
+        assert!(calls >= 2, "the pacer is asked before every read");
+    }
+
+    #[test]
+    fn pushed_hashes_are_split_to_fit_a_frame() {
+        let item = |p: &str, v: Seq| (RelPath::new(p).unwrap(), v, [v as u8; 32]);
+        let small: Vec<_> = (0..2 * BATCH_MAX as u64 + 5)
+            .map(|i| item(&format!("d/f{i}"), i))
+            .collect();
+        let parts = hash_parts(small.clone());
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.len() <= BATCH_MAX));
+        assert_eq!(parts.concat(), small);
+
+        let long = vec!["x".repeat(250); 16].join("/");
+        assert!(long.len() > 4_000);
+        let heavy: Vec<_> = (0..2_000u64).map(|i| item(&long, i)).collect();
+        let parts = hash_parts(heavy.clone());
+        assert!(parts.len() > 1);
+        for p in &parts {
+            let bytes: usize = p.iter().map(|i| 48 + i.0.as_str().len()).sum();
+            assert!(bytes <= PUSH_BYTES);
+        }
+        assert_eq!(parts.concat(), heavy);
+        assert!(hash_parts(Vec::new()).is_empty());
+    }
+
+    fn make_pending(core: &Core, p: &str) -> (Seq, StatKey) {
+        let mut t = core.tree();
+        let path = RelPath::new(p).unwrap();
+        let (mut meta, stat, domain) = {
+            let e = t.get(&path).unwrap();
+            (e.meta.clone(), e.stat, e.domain)
+        };
+        meta.hash = None;
+        t.observe(&path, Observed::Present { meta, stat, domain });
+        (t.get(&path).unwrap().seq, stat)
+    }
+
+    // fills every pending hash from the file's own bytes, the way the background hasher does
+    fn learn_pending(core: &Core) {
+        let mut jobs = Vec::new();
+        let mut cursor = 0;
+        loop {
+            cursor = core
+                .tree()
+                .pending_from(cursor, usize::MAX, &|_, _| true, &mut jobs);
+            if cursor == 0 {
+                break;
+            }
+        }
+        for j in jobs {
+            let data = std::fs::read(core.root_path.join(j.path.as_str())).unwrap();
+            core.learn_hash(&j.path, j.ver, &j.stat, *blake3::hash(&data).as_bytes());
+        }
+        assert_eq!(core.tree().pending(), 0);
+    }
+
+    fn drain(peer: &Session) -> Vec<Msg> {
+        let mut out = Vec::new();
+        while let Ok(i) = peer.inbox.recv_timeout(Duration::from_millis(400)) {
+            if let In::Msg(m) = i {
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    fn done_count(msgs: &[Msg]) -> usize {
+        msgs.iter()
+            .filter(|m| matches!(m, Msg::Push(Push::HashesDone { .. })))
+            .count()
+    }
+
+    #[test]
+    fn learn_hash_records_only_the_exact_version_and_pushes_it_to_live_guests() {
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        lock(&s.g.feed).live = true;
+        lock(&s.core.hub.guests).push(s.g.clone());
+        let (ver, stat) = make_pending(&s.core, "a.txt");
+        let a = RelPath::new("a.txt").unwrap();
+        let seq = s.core.tree().seq();
+        s.core.dirty.store(false, Ordering::Release);
+
+        let other = StatKey {
+            size: stat.size + 1,
+            ..stat
+        };
+        s.core.learn_hash(&a, ver, &other, [1; 32]);
+        s.core.learn_hash(&a, ver + 1, &stat, [1; 32]);
+        assert!(s.core.tree().get(&a).unwrap().is_pending());
+        assert!(!s.core.dirty.load(Ordering::Acquire));
+        assert!(s.core.hashing.take(true).is_none());
+
+        s.core.learn_hash(&a, ver, &stat, [2; 32]);
+        assert_eq!(s.core.tree().get(&a).unwrap().meta.hash, Some([2; 32]));
+        assert_eq!(s.core.tree().seq(), seq);
+        assert!(s.core.dirty.load(Ordering::Acquire));
+
+        s.core.flush_hashes(true);
+        let index = s.core.tree().index_id();
+        let msgs = drain(&peer);
+        let pushed: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Push(Push::Hashes { index: i, items }) => Some((*i, items.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pushed, vec![(index, vec![(a, ver, [2; 32])])]);
+    }
+
+    #[test]
+    fn a_guest_that_is_not_live_gets_no_pushed_hashes() {
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        lock(&s.core.hub.guests).push(s.g.clone());
+        let (ver, stat) = make_pending(&s.core, "a.txt");
+        s.core
+            .learn_hash(&RelPath::new("a.txt").unwrap(), ver, &stat, [2; 32]);
+        s.core.hashes_done();
+        assert!(drain(&peer).is_empty());
+    }
+
+    #[test]
+    fn attaching_reports_done_only_while_nothing_is_pending() {
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        assert_eq!(s.core.tree().pending(), 1);
+        learn_pending(&s.core);
+        assert!(s.core.attach(&s.g, None).is_ok());
+        let msgs = drain(&peer);
+        assert_eq!(done_count(&msgs), 1);
+        assert!(matches!(
+            msgs.last(),
+            Some(Msg::Push(Push::HashesDone { .. }))
+        ));
+
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        let (ver, stat) = make_pending(&s.core, "a.txt");
+        assert!(s.core.attach(&s.g, None).is_ok());
+        let msgs = drain(&peer);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Push(Push::Snapshot { .. })))
+        );
+        assert_eq!(done_count(&msgs), 0);
+
+        // once the hash is known, a guest that reconnects with the current seq is told at once
+        s.core
+            .learn_hash(&RelPath::new("a.txt").unwrap(), ver, &stat, [3; 32]);
+        let index = s.core.tree().index_id();
+        let have = Some((index, s.core.tree().seq()));
+        lock(&s.core.hub.guests).clear();
+        assert!(s.core.attach(&s.g, have).is_ok());
+        assert_eq!(done_count(&drain(&peer)), 1);
+    }
+
+    #[test]
+    fn catching_up_reports_done_only_while_nothing_is_pending() {
+        let (_t, s, _jobs, peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        learn_pending(&s.core);
+        assert!(s.core.attach(&s.g, None).is_ok());
+        drain(&peer);
+        let (ver, stat) = make_pending(&s.core, "a.txt");
+        let lag = |s: &SessionCtx, behind: Seq| {
+            let sent = s.core.tree().seq() - behind;
+            let mut f = lock(&s.g.feed);
+            f.lagging = true;
+            f.sent = sent;
+        };
+        lag(&s, 1);
+        s.core.catch_up(&s.g);
+        let msgs = drain(&peer);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Push(Push::Changes { .. })))
+        );
+        assert_eq!(done_count(&msgs), 0);
+
+        s.core
+            .learn_hash(&RelPath::new("a.txt").unwrap(), ver, &stat, [3; 32]);
+        lag(&s, 1);
+        s.core.catch_up(&s.g);
+        assert_eq!(done_count(&drain(&peer)), 1);
+    }
+
     #[test]
     fn a_lagging_guest_gets_its_dir_move_reply_after_the_backlog() {
         let (_t, s, _jobs, peer) = session_with(|root| {
@@ -1980,5 +2812,240 @@ mod tests {
             }
         }
         assert!(removed, "the reply overtook the backlog");
+    }
+
+    // wires a ui bus into the test core and lists the session's guest as a peer on it
+    fn with_ui(s: &mut SessionCtx) -> (Arc<UiBus>, Receiver<()>) {
+        let (bus, wake) = UiBus::new(Role::Host);
+        Arc::get_mut(&mut s.core).unwrap().ui = Some(bus.clone());
+        let view = PeerView {
+            id: s.g.id,
+            name: s.g.name.clone(),
+            fpr: s.g.key.fpr(),
+            state: ConnState::Live,
+            rtt_us: 0,
+        };
+        bus.update(|u| u.peers.push(view));
+        (bus, wake)
+    }
+
+    #[test]
+    fn the_ui_gets_the_pending_hash_count_and_each_guests_fetch_queue() {
+        let (_t, mut s, _jobs, _peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        let (bus, _wake) = with_ui(&mut s);
+        lock(&s.core.hub.guests).push(s.g.clone());
+        assert_eq!(s.core.tree().pending(), 1);
+        s.g.begin_fetch(7).unwrap();
+        s.g.begin_fetch(8).unwrap();
+        assert!(s.core.stats_to_ui(), "moving figures ask for another tick");
+        let snap = bus.read();
+        assert_eq!(snap.stats.hash_pending, 1);
+        assert_eq!(snap.io.iter().find(|p| p.id == s.g.id).unwrap().pending, 2);
+        s.g.tx.fetch_add(4096, Ordering::Relaxed);
+        s.g.rx.fetch_add(512, Ordering::Relaxed);
+        s.core.stats_to_ui();
+        let io = bus
+            .read()
+            .io
+            .iter()
+            .find(|p| p.id == s.g.id)
+            .copied()
+            .unwrap();
+        assert_eq!((io.tx, io.rx), (4096, 512));
+        s.g.end_fetch(7);
+        s.g.end_fetch(8);
+        learn_pending(&s.core);
+        assert!(!s.core.stats_to_ui(), "nothing is moving any more");
+        let snap = bus.read();
+        assert_eq!(snap.stats.hash_pending, 0);
+        assert_eq!(snap.io.iter().find(|p| p.id == s.g.id).unwrap().pending, 0);
+    }
+
+    #[test]
+    fn a_guest_that_left_leaves_no_queue_entry_behind() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        let id = s.g.id;
+        lock(&s.core.hub.guests).push(s.g.clone());
+        s.g.begin_fetch(1).unwrap();
+        s.core.stats_to_ui();
+        assert_eq!(bus.read().io.len(), 1);
+        // a hello for another protocol ends the session at once, which is all this needs of run
+        s.run(Some(Hello {
+            proto: PROTO.wrapping_add(1),
+            build: Name::new("t").unwrap(),
+            have: None,
+        }));
+        let snap = bus.read();
+        assert!(snap.peers.iter().all(|p| p.id != id));
+        assert!(snap.io.iter().all(|p| p.id != id));
+    }
+
+    #[test]
+    fn a_pong_publishes_the_guests_round_trip_time() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        let sent = now_ns() - 5_000_000;
+        assert!(s.on_msg(Msg::Pong {
+            t_ns: sent,
+            host_ns: 0
+        }));
+        let rtt = bus.read().peers[0].rtt_us;
+        assert!((5_000..60_000_000).contains(&rtt), "{rtt}");
+    }
+
+    fn feed_meta(kind: Kind) -> Meta {
+        Meta {
+            kind,
+            perm: 0o644,
+            size: 3,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            hash: Some([7; 32]),
+            link: None,
+            git_ro: false,
+        }
+    }
+
+    fn upsert(path: &str, kind: Kind, ver: Seq) -> Change {
+        Change::Upsert {
+            path: RelPath::new(path).unwrap(),
+            meta: feed_meta(kind),
+            ver,
+        }
+    }
+
+    #[test]
+    fn changes_become_feed_rows_by_kind() {
+        let changes = vec![
+            upsert("f", Kind::File, 4),
+            upsert("d", Kind::Dir, 5),
+            upsert("l", Kind::Symlink, 6),
+            Change::Remove {
+                path: RelPath::new("gone").unwrap(),
+            },
+            Change::Rename {
+                from: RelPath::new("a").unwrap(),
+                to: RelPath::new("b").unwrap(),
+            },
+        ];
+        let rows = feed_rows(&changes, &By::Host, 1_000, 9);
+        let kinds: Vec<What> = rows.iter().map(|r| r.what).collect();
+        // the directory upsert is only its mtime moving, so it has no row
+        assert_eq!(
+            kinds,
+            vec![What::Changed, What::Link, What::Removed, What::Renamed]
+        );
+        assert_eq!(rows[0].path.as_str(), "f");
+        assert_eq!(
+            (rows[0].size, rows[0].new, rows[0].ver),
+            (3, Some([7; 32]), 4)
+        );
+        assert_eq!(rows[1].path.as_str(), "l");
+        assert_eq!(rows[2].path.as_str(), "gone");
+        assert_eq!((rows[2].new, rows[2].ver), (None, 9));
+        assert_eq!(rows[3].path.as_str(), "b");
+        assert_eq!(rows[3].from.as_ref().map(RelPath::as_str), Some("a"));
+        assert!(rows.iter().all(|r| r.by == By::Host && r.ts_ms == 1_000));
+        assert!(rows.iter().all(|r| r.old.is_none() && !r.merged));
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_maps_only_its_tail_and_ends_in_one_burst_row() {
+        let over = FEED_MAX + 45;
+        let mut changes: Vec<Change> = (0..over)
+            .map(|i| upsert(&format!("f{i}"), Kind::File, i as Seq))
+            .collect();
+        // directory upserts do not count towards the burst
+        changes.push(upsert("d", Kind::Dir, 1));
+        let rows = feed_rows(&changes, &By::Host, 1, over as Seq);
+        assert_eq!(rows.len(), FEED_MAX);
+        let skipped = over - (FEED_MAX - 1);
+        let Some(last) = rows.last() else {
+            panic!("no rows")
+        };
+        assert_eq!(last.what, What::Burst(skipped as u32));
+        assert!(last.path.is_root());
+        assert_eq!(rows[0].path.as_str(), format!("f{skipped}"));
+        assert_eq!(rows[FEED_MAX - 2].path.as_str(), format!("f{}", over - 1));
+
+        let exact: Vec<Change> = changes[..FEED_MAX].to_vec();
+        let rows = feed_rows(&exact, &By::Host, 1, 1);
+        assert_eq!(rows.len(), FEED_MAX);
+        assert!(rows.iter().all(|r| !matches!(r.what, What::Burst(_))));
+    }
+
+    #[test]
+    fn a_published_batch_reaches_an_enabled_feed_with_its_origin() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        bus.feed().enable();
+        lock(&s.core.hub.guests).push(s.g.clone());
+        {
+            let tree = s.core.tree();
+            s.core
+                .publish_locked(&tree, vec![upsert("a", Kind::File, 1)], None);
+            s.core.publish_locked(
+                &tree,
+                vec![upsert("b", Kind::File, 2), upsert("c", Kind::Symlink, 3)],
+                Some(s.g.id),
+            );
+            s.core
+                .publish_locked(&tree, vec![upsert("d", Kind::File, 4)], Some(s.g.id + 40));
+        }
+        let rows = bus.feed().window(None, 10);
+        let got: Vec<(&str, &By)> = rows
+            .iter()
+            .rev()
+            .map(|r| (r.path.as_str(), &r.by))
+            .collect();
+        let named = |id: u64, n: &str| By::Guest {
+            id,
+            name: Name::new(n).unwrap(),
+        };
+        assert_eq!(
+            got,
+            vec![
+                ("a", &By::Host),
+                ("b", &named(s.g.id, "g")),
+                ("c", &named(s.g.id, "g")),
+                ("d", &named(s.g.id + 40, "guest")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disabled_feed_gets_nothing_and_maps_nothing() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        {
+            let tree = s.core.tree();
+            s.core
+                .publish_locked(&tree, vec![upsert("a", Kind::File, 1)], None);
+        }
+        assert_eq!(bus.feed().version(), 0);
+        assert!(bus.feed().is_empty());
+    }
+
+    #[test]
+    fn a_notice_reaches_the_snapshot_and_the_feed() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        bus.feed().enable();
+        s.core.notice(
+            Notice {
+                kind: NoticeKind::Refused,
+                path: RelPath::new("x").unwrap(),
+            },
+            false,
+        );
+        let snap = bus.read();
+        assert_eq!(snap.notices.len(), 1);
+        let rows = bus.feed().window(None, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Notice(NoticeKind::Refused));
+        assert_eq!(rows[0].path.as_str(), "x");
     }
 }

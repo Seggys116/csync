@@ -1,7 +1,7 @@
 use crate::ignore::rules::Class;
 use crate::proto::{
-    Change, DEPTH_MAX, Hash32, IndexId, Kind, Meta, Name, RelPath, Seq, SnapEntry, Version,
-    check_snapshot_part,
+    Change, DEPTH_MAX, Expect, Hash32, IndexId, Kind, Meta, Name, RelPath, Seq, SnapEntry, VerKey,
+    Version, check_snapshot_part,
 };
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -40,6 +40,8 @@ pub struct GNode {
     pub parent: NodeId,
     pub name: Name,
     pub meta: Meta,
+    // the host index seq of the entry this node last came from; 0 when unknown
+    pub ver: Seq,
     pub domain: GDomain,
     pub vis: Vis,
     pub r#gen: u64,
@@ -59,6 +61,11 @@ pub struct GNode {
     pub size_gen: u32,
     pub size_pending: bool,
     pub staging: Option<u32>,
+    // errno of a commit that failed after its last handle closed, for the next flush, fsync or write; 0 when none
+    pub werr: i32,
+    // a directory or link this guest made that the host has not answered yet: the pipe ticket of its mk (0 until
+    // the push returns). the guest is the truth for it meanwhile, so host removes and sweeps leave it alone
+    pub unacked: Option<u64>,
     pub special: Special,
     pub children: Option<Children>,
 }
@@ -93,6 +100,35 @@ impl GNode {
 
     pub fn attached(&self) -> bool {
         self.parent != DETACHED
+    }
+
+    // a file whose content hash the host has not computed yet
+    pub fn is_pending(&self) -> bool {
+        self.meta.kind == Kind::File && self.meta.hash.is_none()
+    }
+
+    pub fn ver_key(&self, index: IndexId) -> Option<VerKey> {
+        self.is_pending().then_some(VerKey {
+            index,
+            ver: self.ver,
+            size: self.meta.size,
+        })
+    }
+
+    // what a host operation on this node must find; a file is never matched with Any
+    pub fn expect(&self, index: IndexId) -> Expect {
+        match self.meta.kind {
+            Kind::Dir => Expect::Dir,
+            Kind::Symlink => Expect::Any,
+            Kind::File => match self.meta.version() {
+                Some(v) => Expect::Is(v),
+                None => Expect::Ver(VerKey {
+                    index,
+                    ver: self.ver,
+                    size: self.meta.size,
+                }),
+            },
+        }
     }
 }
 
@@ -130,6 +166,8 @@ pub enum Effect {
     InvalEntry(NodeId, Name),
     Synth(Synth),
     Warm(NodeId, Hash32),
+    // like Warm for a file whose hash is not known yet
+    WarmPending(NodeId),
     Unpin(Hash32),
     ConflictPending(NodeId),
     LocalDiscarded(RelPath),
@@ -228,6 +266,7 @@ impl GTree {
             parent: ROOT,
             name: Name::new("root").expect("static name"),
             meta: dir_meta(0o755),
+            ver: 0,
             domain: GDomain::Synced,
             vis: Vis::Live,
             r#gen: 1,
@@ -241,6 +280,8 @@ impl GTree {
             size_gen: 0,
             size_pending: false,
             staging: None,
+            werr: 0,
+            unacked: None,
             special: Special::None,
             children: Some(Children::default()),
         };
@@ -337,7 +378,7 @@ impl GTree {
         if let Some(id) = self.child(parent, name)
             && let Some(n) = self.get(id)
         {
-            if !self.hidden(id, n) {
+            if !self.hidden(id, n) || (!inj && self.moved_git(id, n)) {
                 return Some((id, n));
             }
             match self.shadows.get(&id) {
@@ -358,7 +399,31 @@ impl GTree {
         }
         let key = (parent, Name::new(name).ok()?);
         let id = *self.ghosts.get(&key)?;
-        self.get(id).map(|n| (id, n))
+        self.get(id)
+            .filter(|n| inj || !self.moved_git(id, n))
+            .map(|n| (id, n))
+    }
+
+    // git expects a rename in .git to show at once, so only the injector still finds the old name
+    fn moved_git(&self, id: NodeId, n: &GNode) -> bool {
+        n.domain == GDomain::GitRo && self.moving.contains_key(&id)
+    }
+
+    // a .git listing as its lookups see it: changes as they arrive, not as the injector has replayed them
+    pub fn list_now(&self, dir: NodeId, out: &mut Vec<(NodeId, Option<Name>)>) -> bool {
+        let Some(kids) = self.get(dir).and_then(|d| d.children.as_ref()) else {
+            return false;
+        };
+        out.reserve(kids.len());
+        for (name, &id) in kids {
+            if let Some(n) = self.get(id)
+                && n.vis != Vis::PendingDelete
+            {
+                let alias = n.parent != dir || n.name != *name;
+                out.push((id, alias.then(|| name.clone())));
+            }
+        }
+        true
     }
 
     // kernel-visible children of dir; ghosts carry the name they are still visible under
@@ -534,6 +599,7 @@ impl GTree {
             parent,
             name: name.clone(),
             meta,
+            ver: 0,
             domain,
             vis,
             r#gen: 0,
@@ -547,6 +613,8 @@ impl GTree {
             size_gen: 0,
             size_pending: false,
             staging: None,
+            werr: 0,
+            unacked: None,
             special: Special::None,
             children,
         };
@@ -786,6 +854,28 @@ impl GTree {
         }
     }
 
+    // true when this forget took a node nothing else holds to zero; reap() then frees it under the write lock
+    pub fn drop_lookups(&self, id: NodeId, n: u64) -> bool {
+        if id == ROOT {
+            return false;
+        }
+        let Some(node) = self.get(id) else {
+            return false;
+        };
+        // fetch_update is deprecated and try_update is past the msrv
+        let mut cur = node.nlookup.load(Relaxed);
+        loop {
+            match node
+                .nlookup
+                .compare_exchange_weak(cur, cur.saturating_sub(n), Relaxed, Relaxed)
+            {
+                Ok(_) => break,
+                Err(seen) => cur = seen,
+            }
+        }
+        cur.saturating_sub(n) == 0 && node.open.load(Relaxed) == 0 && !node.attached()
+    }
+
     pub fn add_lookup(&self, id: NodeId) {
         if let Some(n) = self.get(id) {
             n.nlookup.fetch_add(1, Relaxed);
@@ -913,13 +1003,16 @@ impl GTree {
     pub fn apply(&mut self, c: &Change, fx: &mut Vec<Effect>) {
         fx.append(&mut self.deferred);
         match c {
-            Change::Upsert { path, meta } => {
+            Change::Upsert { path, meta, ver } => {
                 if let Some((p, name)) = self.resolve_parent(path) {
-                    self.upsert_at(p, name, meta.clone(), fx);
+                    self.upsert_at(p, name, meta.clone(), *ver, fx);
                 }
             }
+            // the guest's own mk lands after this remove, so the entry it made stays
             Change::Remove { path } => {
-                if let Some(id) = self.resolve(path) {
+                if let Some(id) = self.resolve(path)
+                    && !self.get(id).is_some_and(|n| n.unacked.is_some())
+                {
                     self.remove_node(id, fx);
                 }
             }
@@ -932,6 +1025,22 @@ impl GTree {
         parent: NodeId,
         name: &str,
         meta: Meta,
+        ver: Seq,
+        fx: &mut Vec<Effect>,
+    ) -> Option<NodeId> {
+        let id = self.upsert_node(parent, name, meta, ver, fx)?;
+        if let Some(n) = self.get_mut(id) {
+            n.ver = ver;
+        }
+        Some(id)
+    }
+
+    fn upsert_node(
+        &mut self,
+        parent: NodeId,
+        name: &str,
+        meta: Meta,
+        ver: Seq,
         fx: &mut Vec<Effect>,
     ) -> Option<NodeId> {
         if !self
@@ -941,7 +1050,7 @@ impl GTree {
             return None;
         }
         match self.child(parent, name) {
-            Some(id) => self.update(id, parent, name, meta, fx),
+            Some(id) => self.update(id, parent, name, meta, ver, fx),
             None => {
                 let nm = Name::new(name).ok()?;
                 let show = self.mounted && self.reachable(parent);
@@ -975,7 +1084,8 @@ impl GTree {
         id: NodeId,
         parent: NodeId,
         name: &str,
-        meta: Meta,
+        mut meta: Meta,
+        ver: Seq,
         fx: &mut Vec<Effect>,
     ) -> Option<NodeId> {
         let on = self.mounted;
@@ -1006,7 +1116,7 @@ impl GTree {
             if let Some(p) = path {
                 fx.push(Effect::LocalDiscarded(p));
             }
-            return self.upsert_at(parent, name, meta, fx);
+            return self.upsert_node(parent, name, meta, ver, fx);
         }
         if n.meta.kind != meta.kind {
             self.detach(id, fx);
@@ -1019,8 +1129,15 @@ impl GTree {
             let nid = self.insert(parent, nm, meta, domain, Vis::Live);
             return (nid != DETACHED).then_some(nid);
         }
-        let content =
-            n.meta.hash != meta.hash || n.meta.size != meta.size || n.meta.link != meta.link;
+        // the same host entry seen again without its hash is the content already learned
+        if meta.hash.is_none() && ver != 0 && n.ver == ver && n.meta.size == meta.size {
+            meta.hash = n.meta.hash;
+        }
+        let hash_moved = match (n.meta.hash, meta.hash) {
+            (Some(a), Some(b)) => a != b,
+            _ => meta.kind == Kind::File && n.ver != ver,
+        };
+        let content = hash_moved || n.meta.size != meta.size || n.meta.link != meta.link;
         let perm = n.meta.perm != meta.perm;
         let mtime = n.meta.mtime_ns != meta.mtime_ns;
         let times = mtime || n.meta.ctime_ns != meta.ctime_ns;
@@ -1033,12 +1150,47 @@ impl GTree {
         let show = on && was == Vis::Live && self.reachable(id);
         let kind = meta.kind;
         let hash = meta.hash;
+        // git renames each new version over the old: a new inode, so no open shares an old reader's pages or size
+        let renew = on
+            && content
+            && kind == Kind::File
+            && n.domain == GDomain::GitRo
+            && meta.git_ro
+            && (n.nlookup.load(Relaxed) > 0 || n.open.load(Relaxed) > 0)
+            && !self.moving.contains_key(&id);
+        if renew {
+            let nm = Name::new(name).ok()?;
+            self.detach_at(id, parent, name, fx);
+            fx.push(Effect::InvalEntry(parent, nm.clone()));
+            fx.push(Effect::InvalInode(parent));
+            let vis = if was == Vis::PendingCreate {
+                Vis::PendingCreate
+            } else {
+                Vis::Live
+            };
+            let nid = self.insert(parent, nm, meta, GDomain::GitRo, vis);
+            let n = self.get_mut(nid)?;
+            n.edited = true;
+            if show {
+                fx.push(Effect::Synth(Synth::Modify { node: nid }));
+            }
+            if warm {
+                match hash {
+                    Some(h) => fx.push(Effect::Warm(nid, h)),
+                    None => fx.push(Effect::WarmPending(nid)),
+                }
+            }
+            return Some(nid);
+        }
         let n = self.get_mut(id)?;
         n.domain = domain_of(&meta);
         n.meta = meta;
         n.edited |= on && content;
         if was == Vis::PendingDelete {
             n.vis = Vis::Live;
+            if kind == Kind::Dir {
+                self.drop_removed_kids(id, fx);
+            }
         }
         if !on || !(content || perm || times || gitro || was == Vis::PendingDelete) {
             return Some(id);
@@ -1053,8 +1205,11 @@ impl GTree {
                 _ => {}
             }
         }
-        if warm && let Some(h) = hash {
-            fx.push(Effect::Warm(id, h));
+        if warm {
+            match hash {
+                Some(h) => fx.push(Effect::Warm(id, h)),
+                None => fx.push(Effect::WarmPending(id)),
+            }
         }
         if conflict {
             fx.push(Effect::ConflictPending(id));
@@ -1124,6 +1279,34 @@ impl GTree {
                 n.vis = Vis::PendingDelete;
             }
             fx.push(Effect::Synth(Synth::Delete { parent, name, dir }));
+        }
+    }
+
+    // a directory removed and made again keeps only entries the injector is still deleting
+    fn drop_removed_kids(&mut self, dir: NodeId, fx: &mut Vec<Effect>) {
+        let gone: Vec<(NodeId, Name)> = self
+            .get(dir)
+            .and_then(|n| n.children.as_ref())
+            .map(|kids| {
+                kids.iter()
+                    .filter(|&(_, &k)| {
+                        self.get(k).is_some_and(|c| {
+                            c.parent == dir
+                                && c.vis != Vis::PendingDelete
+                                && c.domain != GDomain::Local
+                                && c.unacked.is_none()
+                                && c.staging.is_none()
+                        }) && !self.moving.contains_key(&k)
+                    })
+                    .map(|(name, &k)| (k, name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (k, name) in gone {
+            self.detach_at(k, dir, name.as_str(), fx);
+            if self.mounted {
+                fx.push(Effect::InvalEntry(dir, name));
+            }
         }
     }
 
@@ -1288,6 +1471,92 @@ impl GTree {
         true
     }
 
+    // a pending file learning its hash is not a content change: no invalidation and no injected event
+    pub fn learn_hash(&mut self, id: NodeId, ver: Seq, h: Hash32) -> bool {
+        let Some(n) = self.get_mut(id) else {
+            return false;
+        };
+        let fits = n.is_pending() && n.ver == ver && n.domain != GDomain::Local && n.attached();
+        if fits {
+            n.meta.hash = Some(h);
+        }
+        fits
+    }
+
+    pub fn pending_list(&self, max: usize) -> Vec<(NodeId, RelPath, Seq)> {
+        let mut out = Vec::new();
+        for (i, s) in self.slots.iter().enumerate() {
+            if out.len() >= max {
+                break;
+            }
+            let id = i as NodeId + 1;
+            let Some(n) = s.node.as_ref() else { continue };
+            if !n.is_pending() || !n.attached() || n.domain == GDomain::Local {
+                continue;
+            }
+            if let Some(p) = self.rel_path(id) {
+                out.push((id, p, n.ver));
+            }
+        }
+        out
+    }
+
+    // only a node with an open handle has someone to tell; true when it had no error waiting before
+    pub fn set_werr(&mut self, id: NodeId, errno: i32) -> bool {
+        match self.get_mut(id) {
+            Some(n) if n.open.load(std::sync::atomic::Ordering::Relaxed) > 0 => {
+                let fresh = n.werr == 0;
+                n.werr = errno;
+                fresh
+            }
+            _ => false,
+        }
+    }
+
+    // handed out once
+    pub fn take_werr(&mut self, id: NodeId) -> i32 {
+        self.get_mut(id).map_or(0, |n| std::mem::take(&mut n.werr))
+    }
+
+    // removes a refused entry with everything below it, bottom-up. returns the staging ids the writer must drop and
+    // how many nodes with an open handle got errno as a late write error
+    pub fn rollback(&mut self, id: NodeId, errno: i32, fx: &mut Vec<Effect>) -> (Vec<u32>, u32) {
+        let mut order = Vec::new();
+        let mut walk = vec![id];
+        while let Some(x) = walk.pop() {
+            let Some(n) = self.get(x) else { continue };
+            order.push(x);
+            for (name, &k) in n.children.iter().flatten() {
+                if self
+                    .get(k)
+                    .is_some_and(|c| c.parent == x && c.name == *name)
+                {
+                    walk.push(k);
+                }
+            }
+        }
+        let (mut staging, mut told) = (Vec::new(), 0);
+        for &x in order.iter().rev() {
+            if self.set_werr(x, errno) {
+                told += 1;
+            }
+            let Some(n) = self.get_mut(x) else { continue };
+            n.unacked = None;
+            if let Some(s) = n.staging.take() {
+                staging.push(s);
+            }
+            if n.attached() {
+                fx.push(Effect::InvalEntry(n.parent, n.name.clone()));
+            }
+            fx.push(Effect::InvalInode(x));
+        }
+        if let Some(n) = self.get(id).filter(|n| n.attached()) {
+            fx.push(Effect::InvalInode(n.parent));
+        }
+        self.remove(id);
+        (staging, told)
+    }
+
     pub fn was_acked(&self, id: NodeId) -> bool {
         self.acked.contains(&id)
     }
@@ -1334,9 +1603,14 @@ impl GTree {
                 return Err("snapshot parent is not a directory");
             }
             let id = match self.child(parent, e.name.as_str()) {
-                Some(id) if self.acked.contains(&id) => id,
+                Some(id)
+                    if self.acked.contains(&id)
+                        || self.get(id).is_some_and(|n| n.unacked.is_some()) =>
+                {
+                    id
+                }
                 _ => self
-                    .upsert_at(parent, e.name.as_str(), e.meta.clone(), fx)
+                    .upsert_at(parent, e.name.as_str(), e.meta.clone(), e.ver, fx)
                     .unwrap_or(DETACHED),
             };
             if let Some(s) = idx(id).and_then(|i| self.slots.get_mut(i)) {
@@ -1355,14 +1629,15 @@ impl GTree {
 
     fn sweep(&mut self, fx: &mut Vec<Effect>) {
         let ep = self.epoch;
-        // a file with a write in flight may not be on the host yet; it and its directories stay until the commit settles
+        // a file with a write in flight, or a directory or link whose mk is unanswered, may not be on the host yet;
+        // it and its directories stay until the host answers
         let mut keep = rustc_hash::FxHashSet::default();
         for (i, s) in self.slots.iter().enumerate() {
             let id = i as NodeId + 1;
-            if s.node
-                .as_ref()
-                .is_some_and(|n| n.attached() && (n.staging.is_some() || self.acked.contains(&id)))
-            {
+            if s.node.as_ref().is_some_and(|n| {
+                n.attached()
+                    && (n.staging.is_some() || n.unacked.is_some() || self.acked.contains(&id))
+            }) {
                 let mut cur = i as NodeId + 1;
                 while cur != ROOT && keep.insert(cur) {
                     match self.get(cur) {
@@ -1409,6 +1684,7 @@ impl GTree {
                     parent: at,
                     name: n.name.clone(),
                     meta: n.meta.clone(),
+                    ver: n.ver,
                 });
                 if n.children.is_some() {
                     q.push_back((c, next));
@@ -1450,7 +1726,14 @@ mod tests {
 
     fn up(t: &mut GTree, p: &str, meta: Meta) -> Vec<Effect> {
         let mut fx = Vec::new();
-        t.apply(&Change::Upsert { path: rp(p), meta }, &mut fx);
+        t.apply(
+            &Change::Upsert {
+                path: rp(p),
+                meta,
+                ver: 0,
+            },
+            &mut fx,
+        );
         fx
     }
 
@@ -1460,6 +1743,129 @@ mod tests {
         up(&mut t, "src/a.rs", file(1));
         t.set_mounted(true);
         t
+    }
+
+    fn git(meta: Meta) -> Meta {
+        Meta {
+            git_ro: true,
+            ..meta
+        }
+    }
+
+    #[test]
+    fn a_git_file_the_kernel_holds_gets_a_new_inode_for_each_version() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/index", git(file(1)));
+        up(&mut t, ".git/HEAD", git(file(1)));
+        t.set_mounted(true);
+        let gd = t.resolve(&rp(".git")).unwrap();
+        let old = t.resolve(&rp(".git/index")).unwrap();
+        t.add_lookup(old);
+        let fx = up(&mut t, ".git/index", git(file(2)));
+        let new = t.resolve(&rp(".git/index")).unwrap();
+        assert_ne!(new, old, "a held inode is replaced, not rewritten");
+        let o = t.get(old).unwrap();
+        assert!(!o.attached(), "the old inode is detached");
+        assert_eq!(o.meta.size, 1, "the old inode keeps its own version");
+        assert_eq!(t.get(new).unwrap().meta.size, 2);
+        assert_eq!(t.get(new).unwrap().vis, Vis::Live);
+        assert!(fx.contains(&Effect::InvalEntry(gd, nm("index"))));
+        assert!(fx.contains(&Effect::Synth(Synth::Modify { node: new })));
+        // an inode the kernel never looked up has no pages or size to keep apart
+        let head = t.resolve(&rp(".git/HEAD")).unwrap();
+        up(&mut t, ".git/HEAD", git(file(3)));
+        assert_eq!(t.resolve(&rp(".git/HEAD")), Some(head));
+        // a synced file keeps its inode
+        let mut s = mounted_tree();
+        let a = s.resolve(&rp("src/a.rs")).unwrap();
+        s.add_lookup(a);
+        up(&mut s, "src/a.rs", file(4));
+        assert_eq!(s.resolve(&rp("src/a.rs")), Some(a));
+    }
+
+    #[test]
+    fn a_directory_removed_and_made_again_drops_what_it_held() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/objects", git(dir()));
+        up(&mut t, ".git/objects/29", git(dir()));
+        up(&mut t, ".git/objects/29/74f9", git(file(1)));
+        up(&mut t, ".git/objects/30", git(dir()));
+        up(&mut t, ".git/objects/30/aa", git(file(1)));
+        t.set_mounted(true);
+        for p in [".git", ".git/objects", ".git/objects/30"] {
+            let id = t.resolve(&rp(p)).unwrap();
+            t.add_lookup(id);
+        }
+        let mut fx = Vec::new();
+        for p in [".git/objects/29", ".git/objects/30"] {
+            t.apply(&Change::Remove { path: rp(p) }, &mut fx);
+        }
+        let seen = t.resolve(&rp(".git/objects/30/aa")).unwrap();
+        assert_eq!(t.get(seen).unwrap().vis, Vis::PendingDelete);
+        up(&mut t, ".git/objects/29", git(dir()));
+        up(&mut t, ".git/objects/30", git(dir()));
+        assert_eq!(
+            t.resolve(&rp(".git/objects/29/74f9")),
+            None,
+            "an entry the host removed with its directory came back"
+        );
+        // the injector still deletes an entry the kernel knows, so watchers see it go
+        assert_eq!(t.resolve(&rp(".git/objects/30/aa")), Some(seen));
+        assert_eq!(t.get(seen).unwrap().vis, Vis::PendingDelete);
+        up(&mut t, ".git/objects/29/b1", git(file(2)));
+        assert!(t.resolve(&rp(".git/objects/29/b1")).is_some());
+    }
+
+    #[test]
+    fn a_git_rename_shows_the_new_name_at_once_to_all_but_the_injector() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/objects", git(dir()));
+        up(&mut t, ".git/objects/pack", git(dir()));
+        up(&mut t, ".git/objects/pack/.tmp-1-pack-a.idx", git(file(1)));
+        up(&mut t, "src", dir());
+        up(&mut t, "src/a.rs", file(1));
+        t.set_mounted(true);
+        let pack = t.resolve(&rp(".git/objects/pack")).unwrap();
+        let id = t
+            .resolve(&rp(".git/objects/pack/.tmp-1-pack-a.idx"))
+            .unwrap();
+        let mut fx = Vec::new();
+        t.apply(
+            &Change::Rename {
+                from: rp(".git/objects/pack/.tmp-1-pack-a.idx"),
+                to: rp(".git/objects/pack/pack-a.idx"),
+            },
+            &mut fx,
+        );
+        assert_eq!(t.lookup(pack, "pack-a.idx").map(|(i, _)| i), Some(id));
+        assert!(t.lookup(pack, ".tmp-1-pack-a.idx").is_none());
+        let mut ls = Vec::new();
+        t.list_now(pack, &mut ls);
+        assert_eq!(
+            ls,
+            vec![(id, None)],
+            "a .git listing names the new entry once"
+        );
+        // the injector still renames what the kernel saw
+        assert!(t.lookup_as(pack, "pack-a.idx", true).is_none());
+        assert_eq!(
+            t.lookup_as(pack, ".tmp-1-pack-a.idx", true).map(|(i, _)| i),
+            Some(id)
+        );
+        // outside .git a rename shows once injected, as watchers see it
+        let src = t.resolve(&rp("src")).unwrap();
+        t.apply(
+            &Change::Rename {
+                from: rp("src/a.rs"),
+                to: rp("src/b.rs"),
+            },
+            &mut fx,
+        );
+        assert!(t.lookup(src, "b.rs").is_none());
+        assert!(t.lookup(src, "a.rs").is_some());
     }
 
     #[test]
@@ -1767,7 +2173,220 @@ mod tests {
             parent,
             name: nm(name),
             meta,
+            ver: 0,
         }
+    }
+
+    #[test]
+    fn upserts_and_snapshots_store_the_host_ver() {
+        let mut t = GTree::new();
+        let mut fx = Vec::new();
+        let upsert = |t: &mut GTree, p: &str, meta: Meta, ver: Seq, fx: &mut Vec<Effect>| {
+            t.apply(
+                &Change::Upsert {
+                    path: rp(p),
+                    meta,
+                    ver,
+                },
+                fx,
+            );
+        };
+        upsert(&mut t, "src", dir(), 4, &mut fx);
+        upsert(&mut t, "src/a.rs", file(1), 5, &mut fx);
+        let a = t.resolve(&rp("src/a.rs")).unwrap();
+        assert_eq!(
+            t.get(t.resolve(&rp("src")).unwrap()).map(|n| n.ver),
+            Some(4)
+        );
+        assert_eq!(t.get(a).map(|n| n.ver), Some(5));
+        upsert(&mut t, "src/a.rs", file(2), 9, &mut fx);
+        assert_eq!(t.get(a).map(|n| n.ver), Some(9));
+
+        let mut out = Vec::new();
+        t.export(&mut |e| out.push((e.name.as_str().to_owned(), e.ver)));
+        assert_eq!(out, vec![("src".to_owned(), 4), ("a.rs".to_owned(), 9)]);
+
+        let mut s = GTree::new();
+        let mut snap = vec![entry(0, "d", dir()), entry(1, "f", file(3))];
+        snap[0].ver = 11;
+        snap[1].ver = 12;
+        s.apply_snapshot_part(&snap, true, &mut fx).unwrap();
+        let f = s.resolve(&rp("d/f")).unwrap();
+        assert_eq!(s.get(f).map(|n| n.ver), Some(12));
+        assert_eq!(s.get(s.resolve(&rp("d")).unwrap()).map(|n| n.ver), Some(11));
+    }
+
+    fn pending(tag: u8) -> Meta {
+        Meta {
+            hash: None,
+            ..file(tag)
+        }
+    }
+
+    fn upv(t: &mut GTree, p: &str, meta: Meta, ver: Seq) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        t.apply(
+            &Change::Upsert {
+                path: rp(p),
+                meta,
+                ver,
+            },
+            &mut fx,
+        );
+        fx
+    }
+
+    #[test]
+    fn learn_hash_needs_the_matching_ver_and_is_not_a_content_change() {
+        let mut t = GTree::new();
+        upv(&mut t, "f", pending(3), 7);
+        let f = t.resolve(&rp("f")).unwrap();
+        t.set_mounted(true);
+        assert!(t.get(f).unwrap().is_pending());
+        assert!(!t.learn_hash(f, 8, [3; 32]));
+        assert!(t.get(f).unwrap().is_pending());
+        assert!(!t.learn_hash(ROOT, 0, [3; 32]));
+        assert!(!t.learn_hash(999, 7, [3; 32]));
+
+        assert!(t.learn_hash(f, 7, [3; 32]));
+        assert_eq!(t.get(f).unwrap().meta.hash, Some([3; 32]));
+        assert!(!t.get(f).unwrap().is_pending());
+        assert!(
+            !t.learn_hash(f, 7, [9; 32]),
+            "a known hash is never replaced"
+        );
+        assert_eq!(t.get(f).unwrap().meta.hash, Some([3; 32]));
+
+        // the host announcing the same entry again, with or without the hash, changes nothing
+        assert!(upv(&mut t, "f", pending(3), 7).is_empty());
+        assert_eq!(t.get(f).unwrap().meta.hash, Some([3; 32]));
+        assert!(upv(&mut t, "f", file(3), 7).is_empty());
+    }
+
+    #[test]
+    fn a_pending_upsert_is_a_content_change_only_with_a_new_ver() {
+        let mut t = GTree::new();
+        upv(&mut t, "src", dir(), 1);
+        upv(&mut t, "src/a", pending(3), 5);
+        let a = t.resolve(&rp("src/a")).unwrap();
+        t.set_mounted(true);
+
+        assert!(upv(&mut t, "src/a", pending(3), 5).is_empty());
+        assert!(
+            upv(&mut t, "src/a", file(3), 5).is_empty(),
+            "known hash, same ver"
+        );
+        let fx = upv(&mut t, "src/a", pending(3), 6);
+        assert_eq!(
+            fx,
+            vec![
+                Effect::InvalInode(a),
+                Effect::Synth(Synth::Modify { node: a })
+            ]
+        );
+        assert_eq!(t.get(a).unwrap().ver, 6);
+
+        // an open reader gets a warm hint for the pending file instead of a hash
+        t.get_mut(a).unwrap().read_ver = Some(Version {
+            hash: [3; 32],
+            size: 3,
+        });
+        let fx = upv(&mut t, "src/a", pending(3), 7);
+        assert!(fx.contains(&Effect::WarmPending(a)), "{fx:?}");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::Warm(..))));
+
+        // two known hashes still decide by hash alone
+        let mut t = mounted_tree();
+        let a = t.resolve(&rp("src/a.rs")).unwrap();
+        assert!(upv(&mut t, "src/a.rs", file(1), 40).is_empty());
+        assert!(upv(&mut t, "src/a.rs", file(2), 40).contains(&Effect::InvalInode(a)));
+    }
+
+    #[test]
+    fn directory_upserts_with_a_new_ver_are_not_content_changes() {
+        let mut t = GTree::new();
+        upv(&mut t, "src", dir(), 1);
+        t.set_mounted(true);
+        assert!(upv(&mut t, "src", dir(), 2).is_empty());
+    }
+
+    #[test]
+    fn expect_names_the_version_a_node_is_known_by() {
+        let mut t = GTree::new();
+        upv(&mut t, "known", file(1), 2);
+        upv(&mut t, "pend", pending(4), 3);
+        upv(&mut t, "d", dir(), 4);
+        upv(
+            &mut t,
+            "s",
+            Meta {
+                kind: Kind::Symlink,
+                ..file(1)
+            },
+            5,
+        );
+        let n = |name: &str| t.get(t.resolve(&rp(name)).unwrap()).unwrap();
+        assert_eq!(
+            n("known").expect(9),
+            Expect::Is(Version {
+                hash: [1; 32],
+                size: 1
+            })
+        );
+        let key = VerKey {
+            index: 9,
+            ver: 3,
+            size: 4,
+        };
+        assert_eq!(n("pend").expect(9), Expect::Ver(key));
+        assert_eq!(n("pend").ver_key(9), Some(key));
+        assert_eq!(n("known").ver_key(9), None);
+        assert_eq!(n("d").ver_key(9), None);
+        assert_eq!(n("d").expect(9), Expect::Dir);
+        assert_eq!(n("s").expect(9), Expect::Any);
+        assert!(n("pend").is_pending() && !n("known").is_pending() && !n("d").is_pending());
+        for f in ["known", "pend"] {
+            assert_ne!(n(f).expect(9), Expect::Any);
+        }
+    }
+
+    #[test]
+    fn pending_list_is_in_node_order_bounded_and_skips_guest_only_files() {
+        let mut t = GTree::new();
+        upv(&mut t, "d", dir(), 1);
+        upv(&mut t, "d/p1", pending(1), 10);
+        upv(&mut t, "known", file(2), 11);
+        upv(&mut t, "p2", pending(3), 12);
+        upv(&mut t, "d/p3", pending(4), 13);
+        let d = t.resolve(&rp("d")).unwrap();
+        t.insert(d, nm("local"), pending(5), GDomain::Local, Vis::Live);
+        let id = |p: &str| t.resolve(&rp(p)).unwrap();
+        let all = t.pending_list(100);
+        assert_eq!(
+            all,
+            vec![
+                (id("d/p1"), rp("d/p1"), 10),
+                (id("p2"), rp("p2"), 12),
+                (id("d/p3"), rp("d/p3"), 13)
+            ]
+        );
+        assert_eq!(t.pending_list(2), all[..2].to_vec());
+        assert!(t.pending_list(0).is_empty());
+    }
+
+    #[test]
+    fn snapshot_parts_keep_the_ver_of_pending_entries() {
+        let mut t = GTree::new();
+        let mut fx = Vec::new();
+        let mut e = entry(0, "f", pending(2));
+        e.ver = 21;
+        t.apply_snapshot_part(&[e.clone()], true, &mut fx).unwrap();
+        let f = t.resolve(&rp("f")).unwrap();
+        assert_eq!(t.get(f).map(|n| (n.ver, n.is_pending())), Some((21, true)));
+        assert!(t.learn_hash(f, 21, [2; 32]));
+        t.snapshot_reset();
+        t.apply_snapshot_part(&[e], true, &mut fx).unwrap();
+        assert_eq!(t.get(f).unwrap().meta.hash, Some([2; 32]));
     }
 
     #[test]
@@ -1869,6 +2488,37 @@ mod tests {
         assert!(t.resolve(&rp("b")).is_none());
     }
 
+    // a commit that failed after the last close is told to the next flush, fsync or write, once
+    #[test]
+    fn a_late_write_error_is_handed_out_once() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        t.add_open(f);
+        assert!(t.set_werr(f, libc::ECANCELED));
+        assert_eq!(t.take_werr(f), libc::ECANCELED);
+        assert_eq!(t.take_werr(f), 0);
+        assert!(
+            t.set_werr(f, libc::EIO),
+            "a taken error leaves room for the next"
+        );
+        assert!(
+            !t.set_werr(f, libc::ECANCELED),
+            "one still waiting is replaced"
+        );
+        assert_eq!(t.take_werr(f), libc::ECANCELED);
+    }
+
+    #[test]
+    fn a_late_write_error_needs_a_handle_to_tell() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        assert!(!t.set_werr(f, libc::ECANCELED));
+        assert_eq!(t.take_werr(f), 0);
+        assert!(!t.set_werr(DETACHED + 4096, libc::EIO));
+    }
+
     #[test]
     fn nodeids_are_reused_only_after_forget() {
         let mut t = GTree::new();
@@ -1895,6 +2545,42 @@ mod tests {
         assert_eq!(h, f);
         assert!(t.get(h).unwrap().r#gen > g0);
         t.forget(ROOT, 10);
+        assert!(t.get(ROOT).is_some());
+    }
+
+    #[test]
+    fn a_shared_forget_asks_for_the_slot_only_at_zero_unattached_and_unopened() {
+        let mut t = GTree::new();
+        up(&mut t, "f", file(1));
+        let f = t.resolve(&rp("f")).unwrap();
+        t.add_lookup(f);
+        t.add_lookup(f);
+        assert!(!t.drop_lookups(f, 1), "one lookup is still held");
+        assert!(!t.drop_lookups(f, 1), "an attached node stays");
+        assert!(t.get(f).is_some());
+        t.add_lookup(f);
+        t.add_open(f);
+        let mut fx = Vec::new();
+        t.apply(&Change::Remove { path: rp("f") }, &mut fx);
+        assert!(t.get(f).is_some_and(|n| !n.attached()));
+        assert!(!t.drop_lookups(f, 1), "an open handle keeps the slot");
+        assert!(t.drop_open(f), "the last close asks for the slot");
+        t.reap(f);
+        assert!(t.get(f).is_none());
+
+        up(&mut t, "g", file(2));
+        let g = t.resolve(&rp("g")).unwrap();
+        t.add_lookup(g);
+        t.apply(&Change::Remove { path: rp("g") }, &mut fx);
+        assert!(t.get(g).is_some());
+        assert!(
+            t.drop_lookups(g, 5),
+            "an oversized forget saturates at zero"
+        );
+        t.reap(g);
+        assert!(t.get(g).is_none());
+        assert!(!t.drop_lookups(g, 1), "a freed slot is not asked for twice");
+        assert!(!t.drop_lookups(ROOT, 10));
         assert!(t.get(ROOT).is_some());
     }
 
@@ -2064,5 +2750,121 @@ mod tests {
             !t.exchange((d, tg, &nm("a")), (inner, d, &nm("x"))),
             "a directory cannot swap with its own child"
         );
+    }
+
+    // a directory this guest made whose mk the host has not answered
+    fn pending_dir(t: &mut GTree, parent: NodeId, name: &str, ticket: u64) -> NodeId {
+        let id = t.insert_dir(parent, nm(name), dir(), GDomain::Synced);
+        t.get_mut(id).unwrap().unacked = Some(ticket);
+        id
+    }
+
+    #[test]
+    fn a_host_remove_leaves_a_pending_directory_alone() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        let d = pending_dir(&mut t, src, "d", 7);
+        let mut fx = Vec::new();
+        t.apply(&Change::Remove { path: rp("src/d") }, &mut fx);
+        assert!(fx.is_empty());
+        assert_eq!(t.resolve(&rp("src/d")), Some(d));
+        assert_eq!(t.get(d).unwrap().vis, Vis::Live);
+
+        t.get_mut(d).unwrap().unacked = None;
+        t.apply(&Change::Remove { path: rp("src/d") }, &mut fx);
+        assert_eq!(t.get(d).unwrap().vis, Vis::PendingDelete);
+    }
+
+    #[test]
+    fn a_host_entry_over_a_pending_directory_takes_its_meta_or_replaces_it() {
+        let mut t = mounted_tree();
+        let src = t.resolve(&rp("src")).unwrap();
+        let d = pending_dir(&mut t, src, "d", 7);
+        up(&mut t, "src/d", dir_meta(0o700));
+        assert_eq!(t.resolve(&rp("src/d")), Some(d));
+        assert_eq!(t.get(d).unwrap().meta.perm, 0o700);
+        assert_eq!(
+            t.get(d).unwrap().unacked,
+            Some(7),
+            "still waiting for its own"
+        );
+
+        up(&mut t, "src/d", file(4));
+        let now = t.resolve(&rp("src/d")).unwrap();
+        assert_eq!(t.get(now).unwrap().meta.kind, Kind::File);
+        assert_eq!(t.get(now).unwrap().unacked, None);
+    }
+
+    #[test]
+    fn a_snapshot_keeps_a_pending_directory_with_its_ancestors_and_its_own_meta() {
+        let mut t = GTree::new();
+        let mut fx = Vec::new();
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        let a = t.resolve(&rp("a")).unwrap();
+        let p = pending_dir(&mut t, a, "p", 3);
+        let q = t.insert_dir(a, nm("q"), dir(), GDomain::Synced);
+        let deep = pending_dir(&mut t, q, "deep", 4);
+
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        assert_eq!(t.resolve(&rp("a/p")), Some(p));
+        assert_eq!(t.resolve(&rp("a/q")), Some(q), "ancestor of a pending one");
+        assert_eq!(t.resolve(&rp("a/q/deep")), Some(deep));
+
+        t.get_mut(deep).unwrap().unacked = None;
+        t.get_mut(p).unwrap().unacked = None;
+        t.apply_snapshot_part(&[entry(0, "a", dir())], true, &mut fx)
+            .unwrap();
+        assert!(t.resolve(&rp("a/p")).is_none() && t.resolve(&rp("a/q")).is_none());
+
+        let p = pending_dir(&mut t, a, "p", 5);
+        let theirs = Meta {
+            perm: 0o700,
+            ..dir()
+        };
+        t.apply_snapshot_part(
+            &[entry(0, "a", dir()), entry(1, "p", theirs)],
+            true,
+            &mut fx,
+        )
+        .unwrap();
+        assert_eq!(t.get(p).unwrap().meta.perm, 0o755, "the guest is the truth");
+    }
+
+    #[test]
+    fn rollback_removes_the_subtree_bottom_up_and_names_what_to_drop() {
+        let mut t = GTree::new();
+        let a = pending_dir(&mut t, ROOT, "a", 1);
+        let b = pending_dir(&mut t, a, "b", 2);
+        let f = t.insert(b, nm("f"), file(1), GDomain::Synced, Vis::Live);
+        t.get_mut(f).unwrap().staging = Some(9);
+        t.add_open(f);
+        let g = t.insert(a, nm("g"), file(2), GDomain::Synced, Vis::Live);
+        t.get_mut(g).unwrap().staging = Some(4);
+        let keep = t.insert(ROOT, nm("keep"), dir(), GDomain::Synced, Vis::Live);
+
+        let mut fx = Vec::new();
+        let (mut staging, told) = t.rollback(a, libc::EIO, &mut fx);
+        staging.sort_unstable();
+        assert_eq!((staging, told), (vec![4, 9], 1));
+        assert!(t.resolve(&rp("a")).is_none());
+        assert_eq!(t.resolve(&rp("keep")), Some(keep));
+        assert_eq!(t.take_werr(f), libc::EIO, "the open file is told");
+        assert_eq!(t.take_werr(f), 0);
+        assert!(
+            t.get(f)
+                .is_some_and(|n| !n.attached() && n.unacked.is_none())
+        );
+
+        let at = |e: Effect| fx.iter().position(|x| *x == e).unwrap();
+        let (fb, ba, ar) = (
+            at(Effect::InvalEntry(b, nm("f"))),
+            at(Effect::InvalEntry(a, nm("b"))),
+            at(Effect::InvalEntry(ROOT, nm("a"))),
+        );
+        assert!(fb < ba && ba < ar, "children go before their parent");
+        assert!(fx.contains(&Effect::InvalInode(ROOT)));
+        assert!(fx.contains(&Effect::InvalInode(f)));
     }
 }

@@ -37,3 +37,4 @@ pub mod host;
 #[allow(unsafe_code)]
 pub mod sys;
 pub mod tui;
+pub mod update;

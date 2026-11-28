@@ -82,18 +82,18 @@ mod ops {
         metadata_while_open(&m, &w.proj);
         locks(&m);
 
-        // the overlay keeps its fifos and sockets across a restart of the guest
+        // a closed session wipes the overlay, so its fifos and sockets are gone after a restart
         guest.quit(Duration::from_secs(30));
         let mut guest = w.spawn_guest(&g, &w.addr.clone(), &[]);
         eventually("README after restart", SYNC, || {
             m.join("README.md").exists()
         });
-        let ft = fs::symlink_metadata(local.join("ff")).unwrap().file_type();
-        assert!(ft.is_fifo(), "fifo is a {ft:?} after restart");
-        let ft = fs::symlink_metadata(local.join("sk")).unwrap().file_type();
-        assert!(ft.is_socket(), "socket is a {ft:?} after restart");
-        fs::remove_file(local.join("ff")).unwrap();
-        fs::remove_file(local.join("sk")).unwrap();
+        for name in ["ff", "sk"] {
+            assert!(
+                fs::symlink_metadata(local.join(name)).is_err(),
+                "{name} survived the restart"
+            );
+        }
         guest.quit(Duration::from_secs(30));
     }
 

@@ -9,8 +9,8 @@ use crate::index::{
     tree::{Domain, Observed, ROOT, StatKey},
 };
 use crate::proto::{
-    Bytes, Change, DeltaOp, Expect, FILE_MAX, Hash32, INLINE_MAX, Kind, LinkTarget, Meta, Mk, Op,
-    RelPath, Reply, ReqId, Seq, Version, WireErr,
+    Bytes, Change, DeltaOp, Expect, FILE_MAX, Hash32, INLINE_MAX, IndexId, Kind, LinkTarget, Meta,
+    Mk, Op, RelPath, Reply, ReqId, Seq, Version, WireErr,
 };
 use crate::sys::{self, Swap, WatchEvent, wflag};
 use crossbeam_channel::Receiver;
@@ -21,7 +21,7 @@ use std::{
     io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     sync::{Arc, atomic::Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const COPY_BUF: usize = 1 << 20;
@@ -89,6 +89,31 @@ impl Staged {
         ) {
             (Ok(a), Ok(b)) => a.dev == b.dev && a.ino == b.ino,
             _ => false,
+        }
+    }
+
+    // an upload staged before the ops ahead of it made its directory, or in one moved away since, joins it now
+    fn move_into(&mut self, dir: BorrowedFd<'_>) -> Result<(), WireErr> {
+        if same_dir(dir, self.dir.as_fd()).is_ok() {
+            return Ok(());
+        }
+        if !self.still_named() {
+            return Err(WireErr::Busy);
+        }
+        let to = rustix::io::fcntl_dupfd_cloexec(dir, 0).map_err(|_| WireErr::Busy)?;
+        rustix::fs::renameat_with(
+            self.dir.as_fd(),
+            self.name.as_str(),
+            to.as_fd(),
+            self.name.as_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| WireErr::Busy)?;
+        self.dir = to;
+        if self.still_named() {
+            Ok(())
+        } else {
+            Err(WireErr::Busy)
         }
     }
 }
@@ -191,6 +216,7 @@ pub(crate) fn run(core: &Core, rx: &Receiver<Job>) {
             op,
             payload,
         } = job;
+        let _fg = core.fg_guard();
         // a root moved away mid-session is a detached tree: nothing may land there
         if !core.root_intact() {
             core.root_lost();
@@ -267,7 +293,7 @@ pub(crate) fn exec(
         | Op::Remove { path, .. }
         | Op::SetAttr { path, .. } => Some(Hold::new(core, [Some(path), None])),
         Op::Rename { from, to, .. } => Some(Hold::new(core, [Some(from), Some(to)])),
-        Op::Fetch { .. } | Op::FetchMany { .. } => None,
+        Op::Fetch { .. } | Op::FetchMany { .. } | Op::Resolve { .. } | Op::Hashes { .. } => None,
     };
     let r = match op {
         Op::Commit {
@@ -277,7 +303,10 @@ pub(crate) fn exec(
             perm,
             body: _,
             sync,
-        } => commit(core, &path, base, new, perm, payload, sync, origin),
+            mtime_ns,
+        } => commit(
+            core, &path, base, new, perm, mtime_ns, payload, sync, origin,
+        ),
         Op::Mk { path, what } => mk(core, &path, &what, origin),
         Op::Remove { path, expect } => remove(core, &path, expect, origin),
         Op::Rename {
@@ -296,7 +325,9 @@ pub(crate) fn exec(
             perm,
             mtime_ns,
         } => set_attr(core, &path, expect, perm, mtime_ns, origin),
-        Op::Fetch { .. } | Op::FetchMany { .. } => Err(WireErr::Invalid),
+        Op::Fetch { .. } | Op::FetchMany { .. } | Op::Resolve { .. } | Op::Hashes { .. } => {
+            Err(WireErr::Invalid)
+        }
     };
     if let Ok(Reply::Done { .. }) = &r {
         core.stats.commits.fetch_add(1, Ordering::Relaxed);
@@ -473,11 +504,26 @@ pub(crate) fn open_parent<'p>(core: &Core, p: &'p RelPath) -> Result<(OwnedFd, &
     Ok((fd, name))
 }
 
+// where an upload is staged until its turn: a directory that ops still ahead of it make is not there yet
+pub(crate) fn upload_dir(core: &Core, p: &RelPath) -> Result<OwnedFd, WireErr> {
+    match open_parent(core, p) {
+        Err(WireErr::NotFound) => sys::open_beneath(
+            core.root.as_fd(),
+            &RelPath::root(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+        )
+        .map_err(|e| wire(&e)),
+        r => r.map(|(fd, _)| fd),
+    }
+}
+
 pub(crate) struct Cur {
     kind: Kind,
     stat: StatKey,
     fd: Option<OwnedFd>,
     hash: Option<Hash32>,
+    // the index entry this file is, set only when that entry's stat key equals the live one
+    ver: Option<(IndexId, Seq)>,
     link: Option<LinkTarget>,
 }
 
@@ -528,11 +574,13 @@ fn current_from(
             if sys::kind_of_mode(k1.mode) != Some(Kind::File) {
                 return Err(WireErr::Busy);
             }
-            let known = core
-                .tree()
-                .get(path)
-                .filter(|e| e.stat == k1)
-                .and_then(|e| e.meta.hash);
+            let (known, ver) = {
+                let tree = core.tree();
+                match tree.get(path).filter(|e| e.stat == k1) {
+                    Some(e) => (e.meta.hash, Some((tree.index_id(), e.seq))),
+                    None => (None, None),
+                }
+            };
             let hash = match known {
                 Some(h) => h,
                 None => {
@@ -545,6 +593,11 @@ fn current_from(
                     if !sys::same_version(&k1, &k2) {
                         return Err(WireErr::Busy);
                     }
+                    if let Some((_, seq)) = ver
+                        && k1.ctime_ns == k2.ctime_ns
+                    {
+                        core.learn_hash(path, seq, &k1, h);
+                    }
                     h
                 }
             };
@@ -553,6 +606,7 @@ fn current_from(
                 stat: k1,
                 fd: Some(fd),
                 hash: Some(hash),
+                ver,
                 link: None,
             }))
         }
@@ -561,6 +615,7 @@ fn current_from(
             stat: st,
             fd: None,
             hash: None,
+            ver: None,
             link: None,
         })),
         Some(Kind::Symlink) => {
@@ -575,6 +630,7 @@ fn current_from(
                 stat: st,
                 fd: None,
                 hash: None,
+                ver: None,
                 link: Some(link),
             }))
         }
@@ -589,6 +645,9 @@ fn matches_expect(cur: Option<&Cur>, e: Expect) -> bool {
         Expect::Dir => cur.is_some_and(|c| c.kind == Kind::Dir),
         Expect::Is(v) => cur.is_some_and(|c| {
             c.kind == Kind::File && c.hash == Some(v.hash) && c.stat.size == v.size
+        }),
+        Expect::Ver(k) => cur.is_some_and(|c| {
+            c.kind == Kind::File && c.ver == Some((k.index, k.ver)) && c.stat.size == k.size
         }),
     }
 }
@@ -623,6 +682,17 @@ fn same_dir(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> Result<(), WireErr> {
     }
 }
 
+// another spelling of name that lowercases to want; two ascii names are compared without allocating
+fn folds_onto(name: &str, want: &str, name_ascii: bool, other: &str) -> bool {
+    if other == name {
+        return false;
+    }
+    if name_ascii && other.is_ascii() {
+        return other.len() == name.len() && other.eq_ignore_ascii_case(name);
+    }
+    other.to_lowercase() == want
+}
+
 // case-folding volumes resolve a differently spelled name to an existing entry; that must not be written through
 fn collides(core: &Core, dir: BorrowedFd<'_>, path: &RelPath, name: &str, exists: bool) -> bool {
     if !core.fs.case_fold && !core.fs.norm_fold {
@@ -638,9 +708,10 @@ fn collides(core: &Core, dir: BorrowedFd<'_>, path: &RelPath, name: &str, exists
         }
         if core.fs.case_fold {
             let want = name.to_lowercase();
+            let ascii = name.is_ascii();
             let mut hit = false;
             tree.for_children(&parent, &mut |n, _| {
-                if !hit && n.as_str() != name && n.as_str().to_lowercase() == want {
+                if !hit && folds_onto(name, &want, ascii, n.as_str()) {
                     hit = true;
                 }
             });
@@ -677,6 +748,43 @@ fn chmod(fd: BorrowedFd<'_>, perm: u32) -> Result<(), WireErr> {
     rustix::fs::fchmod(fd, Mode::from_bits_truncate((perm & 0o777) as _)).map_err(wire_errno)
 }
 
+// access and modification time both set to the guest's value
+fn stamp(fd: BorrowedFd<'_>, mtime_ns: i64) -> Result<(), WireErr> {
+    let t = rustix::fs::Timespec {
+        tv_sec: mtime_ns.div_euclid(1_000_000_000) as _,
+        tv_nsec: mtime_ns.rem_euclid(1_000_000_000) as _,
+    };
+    let ts = rustix::fs::Timestamps {
+        last_access: t,
+        last_modification: t,
+    };
+    rustix::fs::futimens(fd, &ts).map_err(wire_errno)
+}
+
+const BUSY_WAIT: Duration = Duration::from_millis(50);
+
+// a host write racing the read of the destination answers Busy; wait it out briefly before telling the guest
+fn current_settled(
+    core: &Core,
+    dir: BorrowedFd<'_>,
+    path: &RelPath,
+    name: &str,
+    mut st: Option<StatKey>,
+) -> Result<Option<Cur>, WireErr> {
+    let deadline = Instant::now() + BUSY_WAIT;
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match current_from(core, dir, path, name, st) {
+            Err(WireErr::Busy) if Instant::now() + pause < deadline => {
+                std::thread::sleep(pause);
+                pause *= 2;
+                st = lstat(dir, name)?;
+            }
+            r => return r,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit(
     core: &Core,
@@ -684,6 +792,7 @@ fn commit(
     base: Expect,
     new: Version,
     perm: Option<u16>,
+    mtime_ns: Option<i64>,
     payload: Payload,
     sync: bool,
     origin: Option<u64>,
@@ -694,10 +803,9 @@ fn commit(
     let gate = Gate::new(&core.rules_r(), path)?;
     gate.file?;
     let (dir, name) = open_parent(core, path)?;
-    match &payload {
-        Payload::File(s) | Payload::Delta { lits: Some(s), .. } => {
-            same_dir(dir.as_fd(), s.dir.as_fd())?
-        }
+    let mut payload = payload;
+    match &mut payload {
+        Payload::File(s) | Payload::Delta { lits: Some(s), .. } => s.move_into(dir.as_fd())?,
         _ => {}
     }
     let st = lstat(dir.as_fd(), name)?;
@@ -708,7 +816,7 @@ fn commit(
     if collides(core, dir.as_fd(), path, name, kind.is_some()) {
         return Err(WireErr::Exists);
     }
-    let cur = current_from(core, dir.as_fd(), path, name, st)?;
+    let cur = current_settled(core, dir.as_fd(), path, name, st)?;
     if cur.as_ref().is_some_and(|c| c.kind == Kind::Dir) {
         gate.dir?;
     }
@@ -717,7 +825,7 @@ fn commit(
         && c.hash == Some(new.hash)
         && c.stat.size == new.size
     {
-        return settle_same(core, path, c, perm, origin);
+        return settle_same(core, path, c, perm, mtime_ns, origin);
     }
     if !matches_expect(cur.as_ref(), base) {
         return Ok(conflict(cur.as_ref()));
@@ -761,6 +869,9 @@ fn commit(
         Payload::None => return Err(WireErr::Invalid),
     };
     chmod(tmp.fd.as_fd(), mode)?;
+    if let Some(t) = mtime_ns {
+        stamp(tmp.fd.as_fd(), t)?;
+    }
     if let Some(old) = cur.as_ref().and_then(|c| c.fd.as_ref()) {
         let _ = sys::copy_xattrs(old.as_fd(), tmp.fd.as_fd());
     }
@@ -845,21 +956,32 @@ fn commit(
     Ok(Reply::Done { meta })
 }
 
-// the content is already there (a replayed or duplicate commit); only the mode may differ
+// the content is already there (a replayed or duplicate commit); only the mode and mtime may differ
 fn settle_same(
     core: &Core,
     path: &RelPath,
     c: &Cur,
     perm: Option<u16>,
+    mtime_ns: Option<i64>,
     origin: Option<u64>,
 ) -> Result<Reply, WireErr> {
     let fd = c.fd.as_ref().ok_or(WireErr::Busy)?;
     let mut st = c.stat;
+    let mut touched = false;
     if let Some(p) = perm
         && u32::from(p) & 0o777 != st.mode & 0o777
     {
         note_rule(core, path, &[None]);
         chmod(fd.as_fd(), u32::from(p))?;
+        touched = true;
+    }
+    if let Some(t) = mtime_ns
+        && t != st.mtime_ns
+    {
+        stamp(fd.as_fd(), t)?;
+        touched = true;
+    }
+    if touched {
         st = sys::stat_key(fd.as_fd()).map_err(|e| wire(&e))?;
     }
     let meta = file_meta(&st, c.hash.ok_or(WireErr::Busy)?, false);
@@ -1248,7 +1370,7 @@ fn rename(
     }
     if let Some((ver, payload)) = body {
         // the guest never sent `from`, so its bytes ride along and land directly at `to`
-        let r = commit(core, to, te, ver, None, payload, false, origin)?;
+        let r = commit(core, to, te, ver, None, None, payload, false, origin)?;
         if matches!(r, Reply::Done { .. })
             && fe != Expect::Absent
             && let Ok((d, n)) = open_parent(core, from)
@@ -1418,7 +1540,7 @@ fn rename(
 mod tests {
     use super::*;
     use crate::index::tree::Tree;
-    use crate::proto::Body;
+    use crate::proto::{Body, VerKey};
     use std::{
         fs,
         path::{Path, PathBuf},
@@ -1478,8 +1600,33 @@ mod tests {
             perm: None,
             body: Body::Empty,
             sync: false,
+            mtime_ns: None,
         };
         exec(core, op, Payload::Bytes(data.to_vec()), None)
+    }
+
+    fn put_at(
+        core: &Core,
+        p: &str,
+        base: Expect,
+        data: &[u8],
+        mtime_ns: i64,
+    ) -> Result<Reply, WireErr> {
+        let op = Op::Commit {
+            path: rp(p),
+            base,
+            new: ver(data),
+            perm: Some(0o640),
+            body: Body::Empty,
+            sync: false,
+            mtime_ns: Some(mtime_ns),
+        };
+        exec(core, op, Payload::Bytes(data.to_vec()), None)
+    }
+
+    fn mtime_of(p: &Path) -> i64 {
+        let f = fs::File::open(p).unwrap();
+        sys::stat_key(f.as_fd()).unwrap().mtime_ns
     }
 
     fn temps(dir: &Path) -> Vec<String> {
@@ -1488,6 +1635,46 @@ mod tests {
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with(crate::proto::path::TMP_PREFIX))
             .collect()
+    }
+
+    #[test]
+    fn folds_onto_agrees_with_the_lowercase_comparison_for_ascii_and_other_names() {
+        let reference =
+            |name: &str, other: &str| other != name && other.to_lowercase() == name.to_lowercase();
+        let names = [
+            "a.txt",
+            "A.TXT",
+            "a.TxT",
+            "a.txu",
+            "a.tx",
+            "readme",
+            "README",
+            "Readme.md",
+            "k",
+            "K",
+            "\u{212a}",
+            "caf\u{e9}",
+            "CAF\u{c9}",
+            "cafe",
+            "\u{130}",
+            "i",
+            "stra\u{df}e",
+            "STRASSE",
+            "",
+        ];
+        for name in names {
+            let want = name.to_lowercase();
+            for other in names {
+                assert_eq!(
+                    folds_onto(name, &want, name.is_ascii(), other),
+                    reference(name, other),
+                    "{name:?} vs {other:?}"
+                );
+            }
+        }
+        assert!(folds_onto("a.txt", "a.txt", true, "A.TXT"));
+        assert!(!folds_onto("a.txt", "a.txt", true, "a.txt"));
+        assert!(folds_onto("k", "k", true, "\u{212a}"));
     }
 
     #[test]
@@ -1540,6 +1727,7 @@ mod tests {
             perm: None,
             body: Body::Empty,
             sync: false,
+            mtime_ns: None,
         };
         assert_eq!(
             exec(&core, bad, Payload::Bytes(b"actual".to_vec()), None),
@@ -1565,6 +1753,132 @@ mod tests {
         ));
         assert!(!t.0.join("new.txt").exists());
         assert!(core.tree().get(&rp("new.txt")).is_none());
+    }
+
+    // a file the index knows only by stat key and seq, as after a lazy scan
+    fn pending(core: &Core, root: &Path, name: &str, data: &[u8]) -> VerKey {
+        fs::write(root.join(name), data).unwrap();
+        let f = fs::File::open(root.join(name)).unwrap();
+        let st = sys::stat_key(f.as_fd()).unwrap();
+        let mut meta = file_meta(&st, ver(data).hash, false);
+        meta.hash = None;
+        let mut tree = core.tree();
+        let _ = tree.observe(
+            &rp(name),
+            Observed::Present {
+                meta,
+                stat: st,
+                domain: Domain::Synced,
+            },
+        );
+        let e = tree.get(&rp(name)).unwrap();
+        assert_eq!(e.meta.hash, None);
+        VerKey {
+            index: tree.index_id(),
+            ver: e.seq,
+            size: st.size,
+        }
+    }
+
+    #[test]
+    fn cas_by_hash_on_a_pending_entry() {
+        let t = tmpdir("pend-is");
+        let (core, _rx) = core_at(&t.0);
+        pending(&core, &t.0, "a.txt", b"one\n");
+
+        match put(&core, "a.txt", Expect::Is(ver(b"stale")), b"two\n") {
+            Ok(Reply::Conflict {
+                current: Some(m),
+                inline: Some(b),
+            }) => {
+                assert_eq!(m.hash, Some(ver(b"one\n").hash));
+                assert_eq!(b.0, b"one\n");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        assert_eq!(fs::read(t.0.join("a.txt")).unwrap(), b"one\n");
+
+        match put(&core, "a.txt", Expect::Is(ver(b"one\n")), b"two\n") {
+            Ok(Reply::Done { meta }) => assert_eq!(meta.hash, Some(ver(b"two\n").hash)),
+            other => panic!("expected done, got {other:?}"),
+        }
+        assert_eq!(fs::read(t.0.join("a.txt")).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn cas_by_ver_matches_only_the_exact_verified_index_entry() {
+        let t = tmpdir("pend-ver");
+        let (core, _rx) = core_at(&t.0);
+
+        let k = pending(&core, &t.0, "stale.txt", b"one\n");
+        let bad = VerKey {
+            ver: k.ver.wrapping_add(1),
+            ..k
+        };
+        assert!(matches!(
+            put(&core, "stale.txt", Expect::Ver(bad), b"two\n"),
+            Ok(Reply::Conflict { .. })
+        ));
+
+        let k = pending(&core, &t.0, "index.txt", b"one\n");
+        let bad = VerKey {
+            index: k.index ^ 1,
+            ..k
+        };
+        assert!(matches!(
+            put(&core, "index.txt", Expect::Ver(bad), b"two\n"),
+            Ok(Reply::Conflict { .. })
+        ));
+
+        let k = pending(&core, &t.0, "size.txt", b"one\n");
+        let bad = VerKey {
+            size: k.size + 1,
+            ..k
+        };
+        assert!(matches!(
+            put(&core, "size.txt", Expect::Ver(bad), b"two\n"),
+            Ok(Reply::Conflict { .. })
+        ));
+
+        // same length and inode, mtime moved: the index entry no longer describes the file
+        let k = pending(&core, &t.0, "edit.txt", b"one\n");
+        fs::write(t.0.join("edit.txt"), b"six\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(t.0.join("edit.txt"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        match put(&core, "edit.txt", Expect::Ver(k), b"two\n") {
+            Ok(Reply::Conflict {
+                current: Some(m), ..
+            }) => assert_eq!(m.hash, Some(ver(b"six\n").hash)),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        for n in ["stale.txt", "index.txt", "size.txt"] {
+            assert_eq!(fs::read(t.0.join(n)).unwrap(), b"one\n");
+        }
+        assert_eq!(fs::read(t.0.join("edit.txt")).unwrap(), b"six\n");
+
+        let k = pending(&core, &t.0, "exact.txt", b"one\n");
+        assert!(matches!(
+            put(&core, "exact.txt", Expect::Ver(k), b"two\n"),
+            Ok(Reply::Done { .. })
+        ));
+        assert_eq!(fs::read(t.0.join("exact.txt")).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn a_synchronous_hash_of_a_pending_entry_is_learned() {
+        let t = tmpdir("pend-learn");
+        let (core, _rx) = core_at(&t.0);
+        pending(&core, &t.0, "a.txt", b"one\n");
+        let _ = put(&core, "a.txt", Expect::Is(ver(b"stale")), b"two\n");
+        assert_eq!(
+            core.tree().get(&rp("a.txt")).and_then(|e| e.meta.hash),
+            Some(ver(b"one\n").hash)
+        );
     }
 
     #[test]
@@ -1686,6 +2000,7 @@ mod tests {
             perm: Some(0o755),
             body: Body::Empty,
             sync: false,
+            mtime_ns: None,
         };
         assert_eq!(
             exec(&core, hook, Payload::Bytes(b"#!/bin/sh\n".to_vec()), None),
@@ -1990,6 +2305,7 @@ mod tests {
             perm: None,
             body: Body::Empty,
             sync: false,
+            mtime_ns: None,
         };
         assert_eq!(
             exec(&core, bad, Payload::Bytes(b"y".to_vec()), None),
@@ -2016,6 +2332,7 @@ mod tests {
             perm: Some(0o640),
             body: Body::Empty,
             sync: true,
+            mtime_ns: None,
         };
         assert!(matches!(
             exec(&core, op, Payload::File(s), None),
@@ -2036,6 +2353,7 @@ mod tests {
             perm: None,
             body: Body::Empty,
             sync: false,
+            mtime_ns: None,
         };
         assert!(matches!(
             exec(
@@ -2052,5 +2370,158 @@ mod tests {
         ));
         assert_eq!(fs::read(t.0.join("a.txt")).unwrap(), b"stream!!!");
         assert!(temps(&t.0).is_empty());
+    }
+
+    fn fresh_stat(p: &Path) -> StatKey {
+        let f = fs::File::open(p).unwrap();
+        sys::stat_key(f.as_fd()).unwrap()
+    }
+
+    #[test]
+    fn commit_with_mtime_lands_complete_and_the_index_matches_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        const WHEN: i64 = 1_600_000_000_123_456_789;
+        let t = tmpdir("mtime");
+        fs::write(t.0.join("old.txt"), b"before").unwrap();
+        let (core, _rx) = core_at(&t.0);
+
+        for (name, base) in [
+            ("new.txt", Expect::Absent),
+            ("old.txt", Expect::Is(ver(b"before"))),
+        ] {
+            match put_at(&core, name, base, b"after", WHEN) {
+                Ok(Reply::Done { meta }) => {
+                    assert_eq!(meta.mtime_ns, WHEN);
+                    assert_eq!(meta.hash, Some(ver(b"after").hash));
+                }
+                other => panic!("expected done, got {other:?}"),
+            }
+            let p = t.0.join(name);
+            assert_eq!(fs::read(&p).unwrap(), b"after");
+            assert_eq!(mtime_of(&p), WHEN);
+            assert_eq!(
+                fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            let indexed = core.tree().get(&rp(name)).unwrap().stat;
+            assert_eq!(indexed, fresh_stat(&p));
+        }
+        assert!(temps(&t.0).is_empty());
+    }
+
+    #[test]
+    fn replayed_commit_with_mtime_converges_without_touching_the_file_again() {
+        const WHEN: i64 = 1_600_000_000_123_456_789;
+        let t = tmpdir("mtime-replay");
+        let (core, _rx) = core_at(&t.0);
+        let p = t.0.join("f.txt");
+
+        assert!(matches!(
+            put_at(&core, "f.txt", Expect::Absent, b"body", WHEN),
+            Ok(Reply::Done { .. })
+        ));
+        let first = fresh_stat(&p);
+
+        match put_at(&core, "f.txt", Expect::Absent, b"body", WHEN) {
+            Ok(Reply::Done { meta }) => {
+                assert_eq!(meta.mtime_ns, WHEN);
+                assert_eq!(meta.hash, Some(ver(b"body").hash));
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+        assert_eq!(fs::read(&p).unwrap(), b"body");
+        assert_eq!(fresh_stat(&p), first);
+        assert_eq!(core.tree().get(&rp("f.txt")).unwrap().stat, first);
+        assert!(temps(&t.0).is_empty());
+    }
+
+    #[test]
+    fn commit_of_identical_content_applies_the_mtime_without_rewriting() {
+        const WHEN: i64 = 1_600_000_000_987_654_321;
+        let t = tmpdir("mtime-same");
+        fs::write(t.0.join("f.txt"), b"body").unwrap();
+        let (core, _rx) = core_at(&t.0);
+        let p = t.0.join("f.txt");
+        let ino = fresh_stat(&p).ino;
+        assert_ne!(mtime_of(&p), WHEN);
+
+        match put_at(&core, "f.txt", Expect::Absent, b"body", WHEN) {
+            Ok(Reply::Done { meta }) => assert_eq!(meta.mtime_ns, WHEN),
+            other => panic!("expected done, got {other:?}"),
+        }
+        let after = fresh_stat(&p);
+        assert_eq!(after.ino, ino);
+        assert_eq!(after.mtime_ns, WHEN);
+        assert_eq!(fs::read(&p).unwrap(), b"body");
+        assert_eq!(core.tree().get(&rp("f.txt")).unwrap().stat, after);
+        assert!(temps(&t.0).is_empty());
+    }
+
+    // the guest sends an mk and then the mode and mtime the application set, without waiting in between
+    #[test]
+    fn attribute_changes_queued_behind_an_mk_land_and_the_index_matches_the_filesystem() {
+        use std::os::unix::fs::PermissionsExt;
+        const WHEN: i64 = 1_650_000_000_123_456_789;
+        let t = tmpdir("mk-attr");
+        let (core, _rx) = core_at(&t.0);
+        let root = fs::File::open(&t.0).unwrap();
+        let mk = |p: &str, what: Mk| Op::Mk { path: rp(p), what };
+        let dir = || Mk::Dir { perm: 0o755 };
+        let link = || Mk::Symlink {
+            target: LinkTarget::new("d").unwrap(),
+        };
+
+        assert!(matches!(
+            exec(&core, mk("d", dir()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let attr = Op::SetAttr {
+            path: rp("d"),
+            expect: Expect::Dir,
+            perm: Some(0o750),
+            mtime_ns: Some(WHEN),
+        };
+        match exec(&core, attr, Payload::None, None) {
+            Ok(Reply::Done { meta }) => assert_eq!((meta.perm, meta.mtime_ns), (0o750, WHEN)),
+            other => panic!("expected done, got {other:?}"),
+        }
+        let p = t.0.join("d");
+        assert_eq!(mtime_of(&p), WHEN);
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        let landed = fresh_stat(&p);
+        assert_eq!(core.tree().get(&rp("d")).unwrap().stat, landed);
+
+        // a replay after a reconnect is answered done and leaves the directory as it is
+        assert!(matches!(
+            exec(&core, mk("d", dir()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        assert_eq!(fresh_stat(&p), landed);
+        assert_eq!(core.tree().get(&rp("d")).unwrap().stat, landed);
+
+        assert!(matches!(
+            exec(&core, mk("l", link()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let attr = Op::SetAttr {
+            path: rp("l"),
+            expect: Expect::Any,
+            perm: None,
+            mtime_ns: Some(WHEN),
+        };
+        assert!(matches!(
+            exec(&core, attr, Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
+        let st = sys::stat_key_at(root.as_fd(), "l").unwrap();
+        assert_eq!(st.mtime_ns, WHEN);
+        assert_eq!(core.tree().get(&rp("l")).unwrap().stat, st);
+        assert!(matches!(
+            exec(&core, mk("l", link()), Payload::None, None),
+            Ok(Reply::Done { .. })
+        ));
     }
 }

@@ -81,6 +81,7 @@ pub struct DiskSnap {
     pub parent: u32,
     pub name: String,
     pub meta: DiskMeta,
+    pub ver: u64,
 }
 
 #[derive(Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug, PartialEq)]
@@ -136,7 +137,8 @@ pub fn meta_from_disk(d: &DiskMeta) -> Option<Meta> {
         (None, Kind::File | Kind::Dir) => None,
         _ => return None,
     };
-    if d.size > FILE_MAX || d.perm > 0o7777 || (kind == Kind::File) != d.hash.is_some() {
+    // a file without a hash is pending: its hash is learned after the entry was recorded
+    if d.size > FILE_MAX || d.perm > 0o7777 || (kind != Kind::File && d.hash.is_some()) {
         return None;
     }
     Some(Meta {
@@ -248,6 +250,11 @@ fn domain_byte(d: Domain) -> u8 {
 }
 
 pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::Result<()> {
+    write_index(path, &snapshot_index(tree, resume))
+}
+
+// everything that needs the tree, so the serialising and writing can happen after its lock is released
+pub fn snapshot_index(tree: &Tree, resume: Option<ResumeToken>) -> DiskIndex {
     let mut nodes = Vec::with_capacity(tree.len());
     tree.walk(&mut |parent, name, e| {
         let s = &e.stat;
@@ -267,7 +274,7 @@ pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::
             seq: e.seq,
         });
     });
-    let d = DiskIndex {
+    DiskIndex {
         index: tree.index_id().to_le_bytes(),
         seq: tree.seq(),
         resume: resume.map(|r| DiskResume {
@@ -275,8 +282,11 @@ pub fn save_index(path: &Path, tree: &Tree, resume: Option<ResumeToken>) -> io::
             event_id: r.event_id,
         }),
         nodes,
-    };
-    save(path, FileKind::Index, &d)
+    }
+}
+
+pub fn write_index(path: &Path, d: &DiskIndex) -> io::Result<()> {
+    save(path, FileKind::Index, d)
 }
 
 fn clean_path(index: &Path) -> PathBuf {
@@ -374,6 +384,7 @@ pub fn save_guest_tree(
                 parent: e.parent,
                 name: e.name.as_str().to_owned(),
                 meta: meta_to_disk(&e.meta),
+                ver: e.ver,
             })
             .collect(),
     };
@@ -396,6 +407,7 @@ pub fn load_guest_tree(path: &Path) -> Option<(IndexId, Seq, Vec<SnapEntry>)> {
             parent: e.parent,
             name: Name::new(&e.name).ok()?,
             meta,
+            ver: e.ver,
         });
     }
     Some((IndexId::from_le_bytes(d.index), d.seq, out))
@@ -552,6 +564,125 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_written_later_is_the_file_save_index_writes_and_ignores_later_edits() {
+        let d = tmp_dir();
+        let (direct, split) = (d.join("direct.rkyv"), d.join("split.rkyv"));
+        let mut t = sample();
+        let tok = ResumeToken {
+            volume: [3; 16],
+            event_id: 9,
+        };
+        save_index(&direct, &t, Some(tok)).unwrap();
+        let snap_before = snapshot_index(&t, Some(tok));
+        let before = by_path(&t);
+        let seq = t.seq();
+
+        t = with_pending(t);
+        assert_ne!(t.seq(), seq);
+        write_index(&split, &snap_before).unwrap();
+
+        assert_eq!(fs::read(&direct).unwrap(), fs::read(&split).unwrap());
+        let (u, r) = load_index(&split).unwrap();
+        assert_eq!(r, Some(tok));
+        assert_eq!(u.seq(), seq);
+        assert_eq!(by_path(&u), before);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    fn with_pending(mut t: Tree) -> Tree {
+        let mut m = t
+            .get(&RelPath::new("src/a.txt").unwrap())
+            .unwrap()
+            .meta
+            .clone();
+        m.hash = None;
+        m.size = 77;
+        let stat = StatKey {
+            dev: 1,
+            ino: 99,
+            size: 77,
+            mtime_ns: 3,
+            ctime_ns: 4,
+            mode: 0o100_644,
+        };
+        for p in ["src/pending.txt", ".git/pending-ref"] {
+            let domain = if p.starts_with(".git") {
+                Domain::GitRo
+            } else {
+                Domain::Synced
+            };
+            let mut m = m.clone();
+            m.git_ro = domain == Domain::GitRo;
+            t.observe(
+                &RelPath::new(p).unwrap(),
+                Observed::Present {
+                    meta: m,
+                    stat,
+                    domain,
+                },
+            );
+        }
+        t
+    }
+
+    #[test]
+    fn a_pending_entry_survives_a_save_and_load_and_stays_pending() {
+        let d = tmp_dir();
+        let p = d.join("index.rkyv");
+        let t = with_pending(sample());
+        assert_eq!(t.pending(), 2);
+        save_index(&p, &t, None).unwrap();
+        let (mut u, _) = load_index(&p).unwrap();
+        assert_eq!(by_path(&u), by_path(&t));
+        assert_eq!(u.pending(), 2);
+        assert_eq!(u.seq(), t.seq());
+        let rp = RelPath::new("src/pending.txt").unwrap();
+        let (a, b) = (u.get(&rp).unwrap(), t.get(&rp).unwrap());
+        assert!(a.is_pending());
+        assert_eq!((a.stat, a.seq, a.domain), (b.stat, b.seq, b.domain));
+        let (ver, stat) = (a.seq, a.stat);
+
+        // the loaded tree can still learn the hash for the version it saved
+        assert!(u.set_hash(&rp, ver, &stat, [5; 32]));
+        assert_eq!(u.pending(), 1);
+
+        let g = d.join("tree.rkyv");
+        let entries = snap(&t);
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.meta.hash.is_none() && e.meta.kind == Kind::File)
+        );
+        save_guest_tree(&g, 5, 9, &entries).unwrap();
+        assert_eq!(load_guest_tree(&g), Some((5, 9, entries)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_files_may_lack_a_hash_and_only_files_may_have_one() {
+        let base = |kind: u8, hash: Option<[u8; 32]>, link: Option<&str>| DiskMeta {
+            kind,
+            perm: 0o644,
+            size: 1,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            hash,
+            link: link.map(str::to_owned),
+            git_ro: false,
+        };
+        assert!(meta_from_disk(&base(0, None, None)).is_some_and(|m| m.hash.is_none()));
+        assert_eq!(
+            meta_from_disk(&base(0, Some([1; 32]), None)).and_then(|m| m.hash),
+            Some([1; 32])
+        );
+        assert!(meta_from_disk(&base(1, Some([1; 32]), None)).is_none());
+        assert!(meta_from_disk(&base(2, Some([1; 32]), Some("t"))).is_none());
+        assert!(meta_from_disk(&base(1, None, None)).is_some());
+        assert!(meta_from_disk(&base(2, None, Some("t"))).is_some());
+        assert!(meta_from_disk(&base(0, None, Some("t"))).is_none());
+    }
+
+    #[test]
     fn clean_marker_is_single_use_and_bound_to_the_saved_seq() {
         let d = tmp_dir();
         let p = d.join("index.rkyv");
@@ -695,6 +826,7 @@ mod tests {
         let d = tmp_dir();
         let t = sample();
         let entries = snap(&t);
+        assert!(entries.iter().all(|e| e.ver > 0));
         let g = d.join("tree.rkyv");
         save_guest_tree(&g, 5, 9, &entries).unwrap();
         assert_eq!(load_guest_tree(&g), Some((5, 9, entries)));

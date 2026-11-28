@@ -211,7 +211,11 @@ fn changes_msg() -> io::Result<Msg> {
             link: None,
             git_ro: false,
         };
-        changes.push(Change::Upsert { path, meta });
+        changes.push(Change::Upsert {
+            path,
+            meta,
+            ver: 1_000 + i as u64,
+        });
     }
     Ok(Msg::Push(Push::Changes { seq: 42, changes }))
 }

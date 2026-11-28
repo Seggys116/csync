@@ -27,7 +27,9 @@ impl Depth {
             return Self::True;
         }
         let term = term.unwrap_or("");
-        if term.contains("256") || term.contains("direct") {
+        const RICH: [&str; 5] = ["kitty", "alacritty", "foot", "wezterm", "ghostty"];
+        if term.contains("256") || term.contains("direct") || RICH.iter().any(|n| term.contains(n))
+        {
             Self::Ansi256
         } else {
             Self::Ansi16
@@ -164,6 +166,12 @@ impl Theme {
         } else {
             Style::new().bg(t.color(TRACK))
         };
+        if depth == Depth::Ansi16 {
+            // bright black can equal the background, so dim text and borders avoid it
+            t.dim = Style::new().add_modifier(Modifier::DIM);
+            t.faint = Style::new().fg(Color::Gray).add_modifier(Modifier::DIM);
+            t.border = Style::new().fg(Color::Gray);
+        }
         t
     }
 
@@ -176,16 +184,27 @@ impl Theme {
             Depth::Mono => Color::Reset,
             Depth::True => Color::Rgb(c.0, c.1, c.2),
             Depth::Ansi256 => Color::Indexed(xterm256(c)),
-            Depth::Ansi16 => ANSI16
-                .iter()
-                .min_by_key(|(_, rgb)| rgb.dist(c))
-                .map_or(Color::Reset, |(col, _)| *col),
+            Depth::Ansi16 => match c {
+                TEAL => Color::Cyan,
+                WARN => Color::Yellow,
+                ERR => Color::Red,
+                OK => Color::Green,
+                DIM | FAINT => Color::Gray,
+                _ => ANSI16
+                    .iter()
+                    .min_by_key(|(_, rgb)| rgb.dist(c))
+                    .map_or(Color::Reset, |(col, _)| *col),
+            },
         }
     }
 
     pub fn fg(&self, c: Rgb) -> Style {
         if self.mono() {
             self.bold
+        } else if self.depth == Depth::Ansi16 && c == DIM {
+            self.dim
+        } else if self.depth == Depth::Ansi16 && c == FAINT {
+            self.faint
         } else {
             Style::new().fg(self.color(c))
         }
@@ -233,6 +252,66 @@ mod tests {
     }
 
     #[test]
+    fn modern_terminals_without_colorterm_get_at_least_256_colours() {
+        for term in [
+            "xterm-kitty",
+            "alacritty",
+            "foot",
+            "wezterm",
+            "xterm-ghostty",
+            "screen-256color",
+        ] {
+            assert_eq!(
+                Depth::from_env(None, None, Some(term)),
+                Depth::Ansi256,
+                "{term}"
+            );
+        }
+        assert_eq!(
+            Depth::from_env(Some("1"), None, Some("xterm-kitty")),
+            Depth::Mono
+        );
+        assert_eq!(Depth::from_env(None, None, Some("linux")), Depth::Ansi16);
+        assert_eq!(Depth::from_env(None, None, None), Depth::Ansi16);
+    }
+
+    #[test]
+    fn sixteen_colour_accents_use_fixed_roles_and_never_bright_black() {
+        let t = Theme::new(Depth::Ansi16);
+        assert_eq!(t.color(TEAL), Color::Cyan);
+        assert_eq!(t.color(WARN), Color::Yellow);
+        assert_eq!(t.color(ERR), Color::Red);
+        assert_eq!(t.color(OK), Color::Green);
+        assert_eq!(t.accent.fg, Some(Color::Cyan));
+        assert_eq!(t.warn.fg, Some(Color::Yellow));
+        assert_eq!(t.err.fg, Some(Color::Red));
+        assert_eq!(t.ok.fg, Some(Color::Green));
+        assert!(t.dim.add_modifier.contains(Modifier::DIM));
+        assert!(t.faint.add_modifier.contains(Modifier::DIM));
+        assert_ne!(t.border, t.dim);
+        assert_ne!(t.border, t.faint);
+        assert_ne!(t.dim, t.faint);
+        for s in [t.dim, t.faint, t.border] {
+            assert_ne!(s.fg, Some(Color::DarkGray));
+            assert_ne!(s.fg, Some(Color::Black));
+        }
+        assert_eq!(t.fg(DIM), t.dim);
+        assert_eq!(t.fg(FAINT), t.faint);
+    }
+
+    #[test]
+    fn true_and_256_colour_styles_are_unchanged() {
+        let t = Theme::new(Depth::True);
+        assert_eq!(t.dim, Style::new().fg(Color::Rgb(128, 136, 153)));
+        assert_eq!(t.border, Style::new().fg(Color::Rgb(62, 68, 84)));
+        assert_eq!(t.err.fg, Some(Color::Rgb(248, 113, 113)));
+        let t = Theme::new(Depth::Ansi256);
+        assert_eq!(t.dim, Style::new().fg(t.color(DIM)));
+        assert_eq!(t.border, t.faint);
+        assert!(matches!(t.accent.fg, Some(Color::Indexed(_))));
+    }
+
+    #[test]
     fn colours_degrade_per_depth() {
         assert_eq!(Theme::new(Depth::Mono).color(TEAL), Color::Reset);
         assert_eq!(
@@ -251,7 +330,8 @@ mod tests {
             Theme::new(Depth::Ansi256).color(Rgb(128, 128, 128)),
             Color::Indexed(244)
         );
-        assert_eq!(Theme::new(Depth::Ansi16).color(ERR), Color::LightRed);
+        assert_eq!(Theme::new(Depth::Ansi16).color(ERR), Color::Red);
+        assert_eq!(Theme::new(Depth::Ansi16).color(INFO), Color::LightBlue);
         assert_eq!(Rgb(0, 0, 0).mix(Rgb(200, 100, 50), 0.5), Rgb(100, 50, 25));
         assert_eq!(Rgb(0, 0, 0).mix(Rgb(200, 100, 50), 7.0), Rgb(200, 100, 50));
     }

@@ -1,17 +1,21 @@
 use super::cache::{
-    BlobCache, BlobRef, DELTA_CAP, Done, Remote, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno,
-    lock, pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
+    BlobCache, BlobRef, DELTA_CAP, Done, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno, lock,
+    pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
 };
-use super::tree::{GNode, Vis};
+use super::peek;
+use super::pipe::{Payload, Pipe, Tag, Ticket};
+use super::tree::{GNode, NodeId, Vis};
 use crate::delta;
 use crate::index::tree::StatKey;
 use crate::merge::merge3;
 use crate::net::rpc::RpcError;
 use crate::proto::{
-    Body, Bytes, CHUNK_MAX, DELTA_MIN, DeltaOp, Expect, INLINE_MAX, Kind, LinkTarget, MERGE_MAX,
-    Meta, Mk, Notice, NoticeKind, Op, RelPath, Reply, ReqId, Version, WireErr,
+    Body, Bytes, DELTA_MIN, Expect, INLINE_MAX, IndexId, Kind, LinkTarget, MERGE_MAX, Meta, Mk,
+    Notice, NoticeKind, Op, RelPath, Reply, Version, WireErr,
 };
 use crate::sys;
+use crate::tui::{feed::Entry, now_ms};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,21 +24,78 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const MERGE_TRIES: u32 = 3;
 pub const REFUSED: i32 = libc::ECANCELED;
 const RACY_NS: i64 = 100_000_000;
-const BUSY_MIN: Duration = Duration::from_millis(1);
-const BUSY_MAX: Duration = Duration::from_millis(50);
 // a new file this large commits in place and waits for the host instead of pipelining a copy
 const BORROW_MIN: u64 = 1 << 20;
-// staging reads for a streamed body, split into wire chunks
-const READ_BLOCK: usize = CHUNK_MAX * 16;
+const ASYNC_WAIT: Duration = Duration::from_secs(30);
 
 pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
+pub type FeedFn = Arc<dyn Fn(Entry) + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Flushed {
     Clean,
-    // pipelined create: the host has not answered yet, release() settles it
+    // pipelined create: the host has not answered yet; a close that waits settles it, one that parks it leaves
+    // it to the settler
     Sent(Version),
     Committed { meta: Meta, merged: bool },
+}
+
+// work for the settler thread
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Job {
+    // the host answered the commit of a new file whose last handle closed without waiting for it
+    Settle(u32),
+    // the host answered an mk (mk) or setattr sent without waiting, for the node that was born as `born`
+    Landed {
+        node: NodeId,
+        born: u64,
+        mk: bool,
+        what: Landing,
+    },
+    Stop,
+}
+
+// what the host said to an op sent without waiting, as far as the settler cares
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Landing {
+    Done,
+    // the host's entry is not what the op expected
+    Conflict(Option<Meta>),
+    // the host's rules say the path is ignored
+    Ignored,
+    // anything else, as the errno a late write error carries
+    Failed(i32),
+}
+
+impl Landing {
+    fn of(r: Result<Reply, RpcError>) -> Self {
+        match r {
+            Ok(Reply::Done { .. }) => Self::Done,
+            Ok(Reply::Conflict { current, .. }) => Self::Conflict(current),
+            Ok(_) => Self::Failed(libc::EIO),
+            Err(RpcError::Wire(WireErr::Ignored)) => Self::Ignored,
+            Err(RpcError::Wire(WireErr::TooLarge)) => Self::Failed(libc::EFBIG),
+            Err(_) => Self::Failed(libc::EIO),
+        }
+    }
+}
+
+// how attr_new dealt with a chmod or utimes of a file the host has not answered for yet
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attr {
+    // recorded for, or merged into, a commit that has not gone out
+    Folded,
+    // queued behind the commit without waiting
+    Queued,
+    // not a new file, or its content moved on: the caller does it as for any file the host has
+    Sync,
+}
+
+// closes that left their commit to the settler and are not settled yet
+#[derive(Default)]
+struct Parked {
+    n: Mutex<usize>,
+    cv: Condvar,
 }
 
 // refused: the edit lost a CAS race and was discarded; restore the node to `current` and invalidate it
@@ -89,18 +150,23 @@ pub fn resolve(base: Option<&[u8]>, ours: Option<&[u8]>, theirs: Option<&[u8]>) 
     }
 }
 
+// a file only this guest has made has no host version yet, so it alone is not held to one
+pub fn node_expect(n: &GNode, index: IndexId) -> Expect {
+    if n.is_pending() && n.ver == 0 {
+        Expect::Any
+    } else {
+        n.expect(index)
+    }
+}
+
 // the CAS expectation for a rename target: the version last served to an open of it, else its current one
-pub fn dest_expect(node: Option<&GNode>) -> Expect {
+pub fn dest_expect(node: Option<&GNode>, index: IndexId) -> Expect {
     match node {
         None => Expect::Absent,
         Some(n) if n.vis == Vis::PendingDelete => Expect::Absent,
-        Some(n) => match n.meta.kind {
-            Kind::Dir => Expect::Dir,
-            Kind::Symlink => Expect::Any,
-            Kind::File => n
-                .read_ver
-                .or_else(|| n.meta.version())
-                .map_or(Expect::Any, Expect::Is),
+        Some(n) => match (n.meta.kind, n.read_ver) {
+            (Kind::File, Some(v)) => Expect::Is(v),
+            _ => node_expect(n, index),
         },
     }
 }
@@ -122,6 +188,11 @@ fn trusted(m: Option<&Mark>, cur: &StatKey) -> bool {
     m.is_some_and(|(s, at)| s == cur && s.mtime_ns.saturating_add(RACY_NS) < *at)
 }
 
+// an mtime set on the staging copy stands for the commit only while nothing was written after it
+fn stamped(st: &Staged, stat: &StatKey) -> Option<i64> {
+    st.want_mtime.filter(|m| *m == stat.mtime_ns)
+}
+
 fn commit_deadline(size: u64) -> Instant {
     Instant::now() + WAIT * 2 + Duration::from_millis(size >> 12)
 }
@@ -141,15 +212,30 @@ struct Cell {
     cv: Condvar,
     // answered, even after a waiter took the answer: a release waiting only for the reply must not miss it
     fired: std::sync::atomic::AtomicBool,
+    // a close left this answer to the settler; set only before the answer arrives, taken by put
+    parked: std::sync::atomic::AtomicBool,
 }
 
 impl Cell {
-    fn put(&self, r: Result<Reply, RpcError>) {
+    // true when a parked close is waiting on this answer, so the caller must wake the settler
+    fn put(&self, r: Result<Reply, RpcError>) -> bool {
         let mut g = lock(&self.r);
         *g = Some(r);
         self.fired.store(true, std::sync::atomic::Ordering::Release);
         drop(g);
         self.cv.notify_all();
+        self.parked.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    // false when the answer is already in: the closer has it at hand and settles it itself
+    fn park(&self) -> bool {
+        let _g = lock(&self.r);
+        if self.fired.load(std::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        self.parked
+            .store(true, std::sync::atomic::Ordering::Release);
+        true
     }
 
     fn wait(&self, deadline: Instant) -> Option<Result<Reply, RpcError>> {
@@ -185,8 +271,7 @@ impl Cell {
 }
 
 struct Pending {
-    id: ReqId,
-    remote: Arc<dyn Remote>,
+    ticket: Ticket,
     tmp: TmpBlob,
     ver: Version,
     stat: Mark,
@@ -194,6 +279,7 @@ struct Pending {
 }
 
 struct Staged {
+    id: u32,
     path: RelPath,
     fd: Arc<OwnedFd>,
     base: Option<Version>,
@@ -211,25 +297,17 @@ struct Staged {
     closed: bool,
     // its name was unlinked: open handles keep a private copy that is never committed
     unlinked: bool,
+    // the last handle closed with the first commit unanswered: the settler finishes the close, for this node
+    orphan: Option<NodeId>,
+    // what attr_new was asked to set on a new file; a commit carries them, and the commit's reply shows them
+    want_perm: Option<u16>,
+    want_mtime: Option<i64>,
 }
 
 #[derive(Default)]
 struct Table {
     map: FxHashMap<u32, Arc<Mutex<Staged>>>,
     next: u32,
-}
-
-enum Chunks<'a> {
-    None,
-    File {
-        fd: BorrowedFd<'a>,
-        len: u64,
-    },
-    Literals {
-        new: Vec<u8>,
-        ops: Vec<DeltaOp>,
-        data_len: u64,
-    },
 }
 
 enum Next {
@@ -254,18 +332,14 @@ struct Written {
     merged: Option<Vec<u8>>,
 }
 
-fn body_for<'a>(
-    fd: BorrowedFd<'a>,
-    size: u64,
-    base: Option<&BlobRef>,
-) -> Result<(Body, Chunks<'a>), i32> {
+fn body_for(fd: BorrowedFd<'_>, size: u64, base: Option<&BlobRef>) -> Result<(Body, Payload), i32> {
     if size == 0 {
-        return Ok((Body::Empty, Chunks::None));
+        return Ok((Body::Empty, Payload::None));
     }
     if size <= INLINE_MAX as u64 {
         return Ok((
             Body::Inline(Bytes(read_len(fd, size, INLINE_MAX as u64)?)),
-            Chunks::None,
+            Payload::None,
         ));
     }
     if (DELTA_MIN..=DELTA_CAP).contains(&size)
@@ -279,7 +353,7 @@ fn body_for<'a>(
                     ops: e.ops.clone(),
                     data_len: e.data_len,
                 },
-                Chunks::Literals {
+                Payload::Literals {
                     new,
                     ops: e.ops,
                     data_len: e.data_len,
@@ -287,92 +361,77 @@ fn body_for<'a>(
             ));
         }
     }
-    Ok((Body::Stream { len: size }, Chunks::File { fd, len: size }))
-}
-
-// chunk offsets count from the start of the body stream; the last chunk carries last=true
-fn send_chunks(remote: &dyn Remote, id: ReqId, chunks: &Chunks<'_>) -> Result<(), RpcError> {
-    match chunks {
-        Chunks::None => Ok(()),
-        Chunks::File { fd, len } => {
-            let mut block = vec![0u8; (*len).min(READ_BLOCK as u64) as usize];
-            let mut off = 0u64;
-            while off < *len {
-                let n = (*len - off).min(block.len() as u64) as usize;
-                match pread_full(*fd, &mut block[..n], off) {
-                    Ok(k) if k == n => {}
-                    _ => return Err(RpcError::Wire(WireErr::Io)),
-                }
-                for (i, c) in block[..n].chunks(CHUNK_MAX).enumerate() {
-                    let at = off + (i * CHUNK_MAX) as u64;
-                    let end = at + c.len() as u64;
-                    remote.send_chunk(id, at, end == *len, c.to_vec())?;
-                }
-                off += n as u64;
-            }
-            Ok(())
-        }
-        Chunks::Literals { new, ops, data_len } => {
-            let mut buf = Vec::with_capacity(CHUNK_MAX);
-            let mut off = 0u64;
-            for mut s in delta::literals(new, ops) {
-                while !s.is_empty() {
-                    let take = (CHUNK_MAX - buf.len()).min(s.len());
-                    let (a, rest) = s.split_at(take);
-                    buf.extend_from_slice(a);
-                    s = rest;
-                    if buf.len() == CHUNK_MAX {
-                        let n = buf.len() as u64;
-                        let full = std::mem::replace(&mut buf, Vec::with_capacity(CHUNK_MAX));
-                        remote.send_chunk(id, off, off + n == *data_len, full)?;
-                        off += n;
-                    }
-                }
-            }
-            if !buf.is_empty() {
-                remote.send_chunk(id, off, true, buf)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn submit_cell(
-    remote: &dyn Remote,
-    op: &Op,
-    deadline: Instant,
-) -> Result<(ReqId, Arc<Cell>), RpcError> {
-    let cell = Arc::new(Cell::default());
-    loop {
-        let c = cell.clone();
-        let done: Done = Box::new(move |r: Result<Reply, RpcError>| c.put(r));
-        match remote.submit(op.clone(), done) {
-            Ok(id) => return Ok((id, cell)),
-            Err(RpcError::Busy) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5))
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    // the pipe sends the chunks after this returns, so it holds its own descriptor
+    let fd = fd.try_clone_to_owned().map_err(|e| io_errno(&e))?;
+    Ok((Body::Stream { len: size }, Payload::File { fd, len: size }))
 }
 
 // precondition for every method: the paths are Synced; Local and ignored paths never reach the host
 pub struct Writer {
     cache: Arc<BlobCache>,
     remote: Arc<RemoteSlot>,
+    pipe: Arc<Pipe>,
     notice: NoticeFn,
+    feed: FeedFn,
     table: Mutex<Table>,
+    jobs: Sender<Job>,
+    jobs_rx: Receiver<Job>,
+    parked: Parked,
 }
 
 impl Writer {
-    pub fn new(cache: Arc<BlobCache>, notice: NoticeFn) -> Self {
+    pub fn new(cache: Arc<BlobCache>, pipe: Arc<Pipe>, notice: NoticeFn) -> Self {
         let remote = cache.remote().clone();
+        let (jobs, jobs_rx) = unbounded();
         Self {
             cache,
             remote,
+            pipe,
             notice,
+            feed: Arc::new(|_: Entry| {}),
             table: Mutex::new(Table::default()),
+            jobs,
+            jobs_rx,
+            parked: Parked::default(),
         }
+    }
+
+    // where the activity feed hears of this guest's own writes; without it they are not reported
+    pub fn with_feed(mut self, feed: FeedFn) -> Self {
+        self.feed = feed;
+        self
+    }
+
+    // what the settler thread reads; a parked close is settled when the host's answer to its commit arrives
+    pub fn jobs(&self) -> Receiver<Job> {
+        self.jobs_rx.clone()
+    }
+
+    pub fn stop_settler(&self) {
+        let _ = self.jobs.send(Job::Stop);
+    }
+
+    // waits until no close is left to the settler; false when the deadline came first
+    pub fn drain(&self, deadline: Instant) -> bool {
+        let mut n = lock(&self.parked.n);
+        while *n > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            n = match self.parked.cv.wait_timeout(n, deadline - now) {
+                Ok((g, _)) => g,
+                Err(e) => e.into_inner().0,
+            };
+        }
+        true
+    }
+
+    fn parked_done(&self) {
+        let mut n = lock(&self.parked.n);
+        *n = n.saturating_sub(1);
+        drop(n);
+        self.parked.cv.notify_all();
     }
 
     // no other handle can change the staging file, so it is hashed and sent in place, not copied
@@ -410,6 +469,10 @@ impl Writer {
         });
     }
 
+    fn log(&self, e: Entry) {
+        (self.feed)(e);
+    }
+
     pub fn staging_fd(&self, id: u32) -> Option<Arc<OwnedFd>> {
         self.entry(id).map(|e| lock(&e).fd.clone())
     }
@@ -421,6 +484,10 @@ impl Writer {
         {
             let mut st = lock(&e);
             if !st.refused && !st.closed {
+                // a handle holds the entry again, so the close that parked it has nothing left to settle
+                if st.orphan.take().is_some() {
+                    self.parked_done();
+                }
                 if o.trunc {
                     rustix::fs::ftruncate(&*st.fd, 0).map_err(|e| e.raw_os_error())?;
                     st.synced = None;
@@ -433,9 +500,8 @@ impl Writer {
                 return Ok((id, st.fd.clone()));
             }
         }
-        let fd = Arc::new(self.cache.staging()?);
         let mut base_ref = None;
-        let mut synced = None;
+        let mut cloned = None;
         if let Some(v) = o.base {
             if o.trunc {
                 base_ref = self.cache.get(&v.hash);
@@ -443,14 +509,22 @@ impl Writer {
                 let b = self
                     .cache
                     .fetch_whole(&v.hash, o.path, v.size, fetch_deadline(v.size))?;
-                sys::clone_or_copy(b.fd(), fd.as_fd()).map_err(|e| io_errno(&e))?;
+                cloned = Some(self.cache.staging_from(b.fd())?);
                 base_ref = Some(b);
             }
-            if !o.trunc || v.size == 0 {
-                synced = Some(mark(sys::stat_key(fd.as_fd()).map_err(|e| io_errno(&e))?));
-            }
         }
-        let st = Staged {
+        let fd = Arc::new(match cloned {
+            Some(fd) => fd,
+            None => self.cache.staging()?,
+        });
+        let mut synced = None;
+        if let Some(v) = o.base
+            && (!o.trunc || v.size == 0)
+        {
+            synced = Some(mark(sys::stat_key(fd.as_fd()).map_err(|e| io_errno(&e))?));
+        }
+        let mut st = Staged {
+            id: 0,
             path: o.path.clone(),
             fd: fd.clone(),
             base: o.base,
@@ -464,6 +538,9 @@ impl Writer {
             closed: false,
             unlinked: false,
             unpublished: None,
+            orphan: None,
+            want_perm: None,
+            want_mtime: None,
         };
         let mut t = lock(&self.table);
         let id = loop {
@@ -472,6 +549,7 @@ impl Writer {
                 break t.next;
             }
         };
+        st.id = id;
         t.map.insert(id, Arc::new(Mutex::new(st)));
         Ok((id, fd))
     }
@@ -502,11 +580,26 @@ impl Writer {
 
     // on the last handle: commits anything still dirty, settles a pipelined create, drops the staging
     pub fn release(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
+        self.release_with(id, None)
+    }
+
+    // like release, but a new file's commit is left to the settler instead of waited for: the entry and its staging
+    // copy stay until the host answers. an edit of a file the host has still waits, so it can fail the close
+    pub fn release_async(&self, id: u32, node: NodeId) -> Option<Result<Flushed, Refusal>> {
+        self.release_with(id, Some(node))
+    }
+
+    fn release_with(&self, id: u32, park: Option<NodeId>) -> Option<Result<Flushed, Refusal>> {
         let e = self.entry(id)?;
         let cell = {
             let mut st = lock(&e);
             st.handles = st.handles.saturating_sub(1);
             if st.handles > 0 {
+                return None;
+            }
+            if let Some(node) = park
+                && self.park(&mut st, node, false)
+            {
                 return None;
             }
             st.pending.as_ref().map(|p| (p.cell.clone(), p.ver.size))
@@ -515,13 +608,75 @@ impl Writer {
         if let Some((c, size)) = cell {
             c.ready(commit_deadline(size));
         }
-        let mut st = lock(&e);
+        self.release_tail(id, &e, park)
+    }
+
+    // a new file's commit is in the pipe and carries what the staging copy holds: the close need not wait for the
+    // host. fresh: the commit was pushed just now, so the copy cannot have changed since
+    fn park(&self, st: &mut Staged, node: NodeId, fresh: bool) -> bool {
+        if st.base.is_some() || st.refused || st.unlinked {
+            return false;
+        }
+        let Some(p) = &st.pending else { return false };
+        if !(fresh || self.unchanged(st, p)) || !p.cell.park() {
+            return false;
+        }
+        st.orphan = Some(node);
+        *lock(&self.parked.n) += 1;
+        true
+    }
+
+    // the staging copy still holds the content the pending commit carries
+    fn unchanged(&self, st: &Staged, p: &Pending) -> bool {
+        let Ok(stat) = sys::stat_key(st.fd.as_fd()) else {
+            return false;
+        };
+        trusted(Some(&p.stat), &stat)
+            || (stat.size == p.ver.size
+                && hash_fd(st.fd.as_fd(), stat.size).is_ok_and(|h| h == p.ver.hash))
+    }
+
+    pub fn parked_node(&self, id: u32) -> Option<NodeId> {
+        let e = self.entry(id)?;
+        lock(&e).orphan
+    }
+
+    // the host answered the commit of a parked close: runs what release runs once the reply is in, off the
+    // fuse workers. None when the entry was reopened meanwhile or there is nothing to report
+    pub fn settle_parked(&self, id: u32) -> Option<Result<Flushed, Refusal>> {
+        let e = self.entry(id)?;
+        lock(&e).orphan.take()?;
+        // shutdown fails the commits still queued; nothing further can reach the host
+        let out = if self.pipe.is_closed() {
+            None
+        } else {
+            self.release_tail(id, &e, None)
+        };
+        self.parked_done();
+        out
+    }
+
+    // what a last close does once the host's answer is in hand
+    fn release_tail(
+        &self,
+        id: u32,
+        e: &Arc<Mutex<Staged>>,
+        park: Option<NodeId>,
+    ) -> Option<Result<Flushed, Refusal>> {
+        let mut st = lock(e);
         let mut settled = false;
         let out = if st.refused || st.handles > 0 {
             None
         } else {
             let r = match self.flush_locked(&mut st, false) {
-                Ok(Flushed::Sent(_)) => self.settle(&mut st).map(|o| o.unwrap_or(Flushed::Clean)),
+                Ok(Flushed::Sent(v)) => {
+                    if let Some(node) = park
+                        && self.park(&mut st, node, true)
+                    {
+                        return Some(Ok(Flushed::Sent(v)));
+                    }
+                    self.settle(&mut st).map(|o| o.unwrap_or(Flushed::Clean))
+                }
                 r => r,
             };
             // nobody is left to retry a new file the host never took: the guest copy follows the host
@@ -594,6 +749,137 @@ impl Writer {
         sys::stat_key(st.fd.as_fd()).ok()
     }
 
+    fn landing(&self, node: NodeId, born: u64, mk: bool) -> Done {
+        let jobs = self.jobs.clone();
+        Box::new(move |r| {
+            let _ = jobs.send(Job::Landed {
+                node,
+                born,
+                mk,
+                what: Landing::of(r),
+            });
+        })
+    }
+
+    // an op nobody waits for: the shutdown drain counts it until the settler has seen its answer. it outlasts a
+    // link that is down for a while, because giving up rolls the entry back under an application that was told it exists
+    fn queue_async(&self, op: Op, at: (NodeId, u64), mk: bool) -> Result<Ticket, i32> {
+        *lock(&self.parked.n) += 1;
+        self.pipe
+            .push_with(
+                op,
+                Payload::None,
+                Instant::now() + ASYNC_WAIT,
+                self.landing(at.0, at.1, mk),
+            )
+            .inspect_err(|_| self.parked_done())
+    }
+
+    // `at` is the node and its generation, which the settler checks before acting on the answer
+    pub fn mk_async(&self, path: &RelPath, what: Mk, at: (NodeId, u64)) -> Result<Ticket, i32> {
+        let op = Op::Mk {
+            path: path.clone(),
+            what,
+        };
+        self.queue_async(op, at, true)
+    }
+
+    pub fn attr_async(
+        &self,
+        path: &RelPath,
+        expect: Expect,
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+        at: (NodeId, u64),
+    ) -> Result<Ticket, i32> {
+        let op = Op::SetAttr {
+            path: path.clone(),
+            expect,
+            perm,
+            mtime_ns,
+        };
+        self.queue_async(op, at, false)
+    }
+
+    // the settler has dealt with the answer to a queue_async op
+    pub fn landed_done(&self) {
+        self.parked_done();
+    }
+
+    pub fn closed(&self) -> bool {
+        self.pipe.is_closed()
+    }
+
+    pub fn drop_under(&self, dir: &RelPath) -> Vec<Ticket> {
+        self.pipe.drop_under(dir)
+    }
+
+    // a chmod or utimes of a file this guest made that the host has not answered for. it is recorded for the commit
+    // not yet made, merged into a commit that has not gone out, or queued behind the one that has; nobody waits.
+    // a file the host has, or one whose content moved on since its commit was queued, is left to the caller
+    pub fn attr_new(
+        &self,
+        id: u32,
+        at: (NodeId, u64),
+        perm: Option<u16>,
+        mtime_ns: Option<i64>,
+    ) -> Attr {
+        let Some(e) = self.entry(id) else {
+            return Attr::Sync;
+        };
+        let mut st = lock(&e);
+        if st.base.is_some() || st.refused || st.unlinked || st.closed {
+            return Attr::Sync;
+        }
+        let ver = match &st.pending {
+            Some(p) if st.orphan.is_some() || self.unchanged(&st, p) => Some(p.ver),
+            Some(_) => return Attr::Sync,
+            None => None,
+        };
+        if let Some(p) = perm {
+            st.perm = p;
+            st.want_perm = Some(p);
+        }
+        if mtime_ns.is_some() {
+            st.want_mtime = mtime_ns;
+        }
+        let Some(ver) = ver else {
+            return Attr::Folded;
+        };
+        if self.pipe.amend(&st.path, ver, perm, mtime_ns) {
+            return Attr::Folded;
+        }
+        let op = Op::SetAttr {
+            path: st.path.clone(),
+            expect: Expect::Is(ver),
+            perm,
+            mtime_ns,
+        };
+        match self.queue_async(op, at, false) {
+            Ok(_) => Attr::Queued,
+            Err(_) => Attr::Sync,
+        }
+    }
+
+    // the staging copies of rolled-back files: an open handle keeps its entry so its next flush fails, the rest go now
+    pub fn abandon(&self, ids: &[u32]) {
+        for &id in ids {
+            let Some(e) = self.entry(id) else { continue };
+            let mut st = lock(&e);
+            st.refused = true;
+            st.pending = None;
+            st.base_ref = None;
+            if st.orphan.take().is_some() {
+                self.parked_done();
+            }
+            if st.handles == 0 {
+                st.closed = true;
+                drop(st);
+                lock(&self.table).map.remove(&id);
+            }
+        }
+    }
+
     fn flush_locked(&self, st: &mut Staged, sync: bool) -> Result<Flushed, Refusal> {
         if st.refused {
             return Err(Refusal::err(REFUSED));
@@ -639,8 +925,7 @@ impl Writer {
         stat: Mark,
     ) -> Result<(), Refusal> {
         let deadline = commit_deadline(ver.size);
-        let (_, remote) = self.remote.get(deadline).map_err(Refusal::err)?;
-        let (body, chunks) = body_for(tmp.fd(), ver.size, None).map_err(Refusal::err)?;
+        let (body, payload) = body_for(tmp.fd(), ver.size, None).map_err(Refusal::err)?;
         let op = Op::Commit {
             path: st.path.clone(),
             base: Expect::Absent,
@@ -648,17 +933,21 @@ impl Writer {
             perm: Some(st.perm),
             body,
             sync: false,
+            mtime_ns: stamped(st, &stat.0),
         };
-        let (id, cell) =
-            submit_cell(&*remote, &op, deadline).map_err(|e| Refusal::err(rpc_errno(&e)))?;
-        if let Err(e) = send_chunks(&*remote, id, &chunks) {
-            remote.cancel(id);
-            return Err(Refusal::err(rpc_errno(&e)));
-        }
-        drop(chunks);
+        let cell = Arc::new(Cell::default());
+        let (c, jobs, id) = (cell.clone(), self.jobs.clone(), st.id);
+        let wake = move |r| {
+            if c.put(r) {
+                let _ = jobs.send(Job::Settle(id));
+            }
+        };
+        let ticket = self
+            .pipe
+            .push_with(op, payload, deadline, Box::new(wake))
+            .map_err(Refusal::err)?;
         st.pending = Some(Pending {
-            id,
-            remote,
+            ticket,
             tmp,
             ver,
             stat,
@@ -674,7 +963,7 @@ impl Writer {
         let r = match p.cell.wait(commit_deadline(p.ver.size)) {
             Some(r) => r,
             None => {
-                p.remote.cancel(p.id);
+                self.pipe.cancel(p.ticket);
                 Err(RpcError::Timeout)
             }
         };
@@ -742,57 +1031,19 @@ impl Writer {
         content: Option<(BorrowedFd<'_>, u64, Option<&BlobRef>)>,
         deadline: Instant,
     ) -> Result<Reply, i32> {
-        let (body, chunks) = match content {
+        let (body, payload) = match content {
             Some((fd, size, base)) => {
-                let (b, c) = body_for(fd, size, base)?;
-                (Some(b), c)
+                let (b, p) = body_for(fd, size, base)?;
+                (Some(b), p)
             }
-            None => (None, Chunks::None),
+            None => (None, Payload::None),
         };
         // background warming yields the link while a write waits on the host
         let _busy = self.cache.gate().enter();
-        let (mut gen_seen, mut remote) = self.remote.get(deadline)?;
-        let mut retried = false;
-        let mut backoff = BUSY_MIN;
-        loop {
-            let op = mk(body.clone()).ok_or(libc::EINVAL)?;
-            // replays are safe: the host answers Done when the current content already equals `new`
-            match Self::exchange(&*remote, op, &chunks, deadline) {
-                Err(RpcError::Closed) if !retried => {
-                    retried = true;
-                    (gen_seen, remote) = self.remote.newer(gen_seen, deadline)?;
-                }
-                // busy means the host changed nothing: it caught a host write mid-flight or was out of slots
-                Err(RpcError::Wire(WireErr::Busy)) if Instant::now() + backoff < deadline => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(BUSY_MAX);
-                }
-                r => return r.map_err(|e| rpc_errno(&e)),
-            }
-        }
-    }
-
-    fn exchange(
-        remote: &dyn Remote,
-        op: Op,
-        chunks: &Chunks<'_>,
-        deadline: Instant,
-    ) -> Result<Reply, RpcError> {
-        if matches!(chunks, Chunks::None) {
-            return remote.call(op, deadline);
-        }
-        let (id, cell) = submit_cell(remote, &op, deadline)?;
-        if let Err(e) = send_chunks(remote, id, chunks) {
-            remote.cancel(id);
-            return Err(e);
-        }
-        match cell.wait(deadline) {
-            Some(r) => r,
-            None => {
-                remote.cancel(id);
-                Err(RpcError::Timeout)
-            }
-        }
+        let op = mk(body).ok_or(libc::EINVAL)?;
+        // the pipe resends after a reconnect and on busy, in place
+        let ticket = self.pipe.push(op, payload, Tag::Sync, deadline)?;
+        self.pipe.wait(ticket, deadline).map_err(|e| rpc_errno(&e))
     }
 
     fn commit(
@@ -815,6 +1066,11 @@ impl Writer {
                         st.base.map_or(Expect::Absent, Expect::Is),
                         st.base.is_none().then_some(st.perm),
                     );
+                    let mtime_ns = if st.base.is_none() {
+                        stamped(st, &stat.0)
+                    } else {
+                        None
+                    };
                     let mk = move |b: Option<Body>| {
                         Some(Op::Commit {
                             path: path.clone(),
@@ -823,6 +1079,7 @@ impl Writer {
                             perm,
                             body: b?,
                             sync,
+                            mtime_ns,
                         })
                     };
                     self.send(
@@ -834,7 +1091,16 @@ impl Writer {
                 }
             };
             match reply {
-                Reply::Done { meta } => {
+                Reply::Done { mut meta } => {
+                    // a chmod or utimes queued behind this commit has not reached the host yet, but is already true here
+                    if let Some(p) = st.want_perm {
+                        meta.perm = p;
+                    }
+                    if let Some(m) = st.want_mtime
+                        && sys::stat_key(st.fd.as_fd()).is_ok_and(|k| k.mtime_ns == m)
+                    {
+                        meta.mtime_ns = m;
+                    }
                     // sent in place, so it is stamped once sent, as a copy is once copied
                     if tmp.is_borrowed() && sys::stat_key(st.fd.as_fd()).is_ok_and(|k| k == stat.0)
                     {
@@ -842,12 +1108,14 @@ impl Writer {
                     }
                     st.unpublished = tmp.is_borrowed().then_some(ver);
                     let _ = self.cache.publish(tmp, Some(&st.path));
+                    let old = st.base;
                     st.base = Some(ver);
                     st.base_ref = self.cache.get(&ver.hash);
                     st.synced = Some(stat);
                     if merged {
                         self.say(NoticeKind::Merged, &st.path);
                     }
+                    self.log(peek::commit_row(&st.path, old, ver, merged, now_ms()));
                     return Ok(Flushed::Committed { meta, merged });
                 }
                 Reply::Conflict { current, inline } => {
@@ -879,7 +1147,9 @@ impl Writer {
                         }
                     }
                 }
-                Reply::Blob { .. } | Reply::Blobs { .. } => return Err(Refusal::err(libc::EIO)),
+                Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                    return Err(Refusal::err(libc::EIO));
+                }
             }
         }
     }
@@ -904,7 +1174,7 @@ impl Writer {
         let b = match base {
             Expect::Absent => Some(Vec::new()),
             Expect::Is(v) => self.base_bytes(path, v, base_ref),
-            Expect::Dir | Expect::Any => None,
+            Expect::Dir | Expect::Any | Expect::Ver(_) => None,
         };
         let o = read_len(ours.fd(), ours_size, MERGE_MAX).ok();
         match (
@@ -1046,6 +1316,7 @@ impl Writer {
                         perm,
                         body,
                         sync: false,
+                        mtime_ns: None,
                     })
                 }
             };
@@ -1109,13 +1380,24 @@ impl Writer {
                         }
                     }
                 }
-                Reply::Blob { .. } | Reply::Blobs { .. } => return Err(Refusal::err(libc::EIO)),
+                Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                    return Err(Refusal::err(libc::EIO));
+                }
             }
         }
     }
 
     // on refusal the caller removes `from` locally; the host copy of a pipelined tmp is removed here
     pub fn rename(&self, r: RenameReq<'_>) -> Result<Meta, Refusal> {
+        let (from, to, to_expect, local) = (r.from, r.to, r.to_expect, r.local.is_some());
+        let out = self.rename_op(r);
+        if let Ok(meta) = &out {
+            self.log(peek::rename_row(from, to, to_expect, local, meta, now_ms()));
+        }
+        out
+    }
+
+    fn rename_op(&self, r: RenameReq<'_>) -> Result<Meta, Refusal> {
         let entry = r.staging.and_then(|id| self.entry(id));
         let mut guard = entry.as_ref().map(|e| lock(e));
         if let Some(st) = guard.as_deref_mut() {
@@ -1168,6 +1450,10 @@ impl Writer {
             return Err(Refusal::err(REFUSED));
         }
         let stat = sys::stat_key(st.fd.as_fd()).map_err(|e| Refusal::err(io_errno(&e)))?;
+        // a chmod or utimes recorded for a commit that was never made travels in no op of its own
+        let owes = st.base.is_none()
+            && st.pending.is_none()
+            && (st.want_perm.is_some() || st.want_mtime.is_some());
         let (mut host_ver, clean) = match &st.pending {
             Some(p) => (Some(p.ver), trusted(Some(&p.stat), &stat)),
             None => (st.base, trusted(st.synced.as_ref(), &stat)),
@@ -1230,6 +1516,9 @@ impl Writer {
                 } else {
                     Some(mark(stat))
                 };
+                if owes && let Some(v) = st.base {
+                    self.send_owed(st, r.to, v, &stat);
+                }
                 Ok(w.meta)
             }
             Err(e) => {
@@ -1254,6 +1543,25 @@ impl Writer {
         }
     }
 
+    // the rename carried the content of a new file whose mode and mtime were only recorded; they follow it. the
+    // rename is done and answered, so a host that refuses them leaves the file as it is
+    fn send_owed(&self, st: &Staged, to: &RelPath, ver: Version, stat: &StatKey) {
+        let (perm, mtime_ns) = (st.want_perm, stamped(st, stat));
+        if perm.is_none() && mtime_ns.is_none() {
+            return;
+        }
+        let to = to.clone();
+        let mk = move |_: Option<Body>| {
+            Some(Op::SetAttr {
+                path: to.clone(),
+                expect: Expect::Is(ver),
+                perm,
+                mtime_ns,
+            })
+        };
+        let _ = self.send(&mk, None, commit_deadline(0));
+    }
+
     fn simple(&self, path: &RelPath, op: Op) -> Result<Meta, Refusal> {
         let mk = move |_: Option<Body>| Some(op.clone());
         match self
@@ -1262,18 +1570,24 @@ impl Writer {
         {
             Reply::Done { meta } => Ok(meta),
             Reply::Conflict { current, inline } => Err(self.refuse_path(path, current, inline)),
-            Reply::Blob { .. } | Reply::Blobs { .. } => Err(Refusal::err(libc::EIO)),
+            Reply::Blob { .. } | Reply::Blobs { .. } | Reply::Hashes { .. } => {
+                Err(Refusal::err(libc::EIO))
+            }
         }
     }
 
     pub fn remove(&self, path: &RelPath, expect: Expect) -> Result<Meta, Refusal> {
-        self.simple(
+        let out = self.simple(
             path,
             Op::Remove {
                 path: path.clone(),
                 expect,
             },
-        )
+        );
+        if out.is_ok() {
+            self.log(peek::remove_row(path, expect, now_ms()));
+        }
+        out
     }
 
     pub fn setattr(
@@ -1322,11 +1636,14 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::cache::CacheConfig;
+    use crate::guest::cache::{CacheConfig, Done, Remote};
+    use crate::guest::tree::{GTree, NodeId};
     use crate::net::rpc::ChunkSink;
+    use crate::proto::{Change, ReqId, Seq, VerKey};
+    use crate::tui::feed::{By, What};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     struct Dir(PathBuf);
     impl Drop for Dir {
@@ -1339,6 +1656,9 @@ mod tests {
     struct Script {
         replies: Mutex<VecDeque<Result<Reply, RpcError>>>,
         ops: Mutex<Vec<Op>>,
+        // while set, a request is logged and its answer withheld until answer() gives it
+        hold: AtomicBool,
+        held: Mutex<VecDeque<Done>>,
     }
 
     impl Script {
@@ -1347,6 +1667,11 @@ mod tests {
             lock(&self.replies)
                 .pop_front()
                 .unwrap_or(Err(RpcError::Closed))
+        }
+
+        fn answer(&self, r: Result<Reply, RpcError>) {
+            let d = lock(&self.held).pop_front().expect("nothing held");
+            d(r);
         }
     }
 
@@ -1363,6 +1688,12 @@ mod tests {
             self.next(op)
         }
         fn submit(&self, op: Op, done: Done) -> Result<ReqId, RpcError> {
+            if self.hold.load(Ordering::SeqCst) {
+                // logged last, so a counted request is already held
+                lock(&self.held).push_back(done);
+                lock(&self.ops).push(op);
+                return Ok(1);
+            }
             done(self.next(op));
             Ok(1)
         }
@@ -1393,6 +1724,7 @@ mod tests {
         script: Arc<Script>,
         w: Writer,
         notes: Arc<Mutex<Vec<Notice>>>,
+        rows: Arc<Mutex<Vec<Entry>>>,
     }
 
     fn rig(tag: &str) -> Rig {
@@ -1406,6 +1738,8 @@ mod tests {
         let slot = RemoteSlot::new();
         let script = Arc::new(Script::default());
         slot.set(Some(script.clone() as Arc<dyn Remote>));
+        let (landed, _) = crossbeam_channel::unbounded();
+        let pipe = Pipe::new(slot.clone(), landed).unwrap();
         let cache = Arc::new(
             BlobCache::open(
                 &CacheConfig {
@@ -1418,13 +1752,21 @@ mod tests {
         );
         let notes = Arc::new(Mutex::new(Vec::new()));
         let n = notes.clone();
-        let w = Writer::new(cache.clone(), Arc::new(move |x: Notice| lock(&n).push(x)));
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let f = rows.clone();
+        let w = Writer::new(
+            cache.clone(),
+            pipe,
+            Arc::new(move |x: Notice| lock(&n).push(x)),
+        )
+        .with_feed(Arc::new(move |e: Entry| lock(&f).push(e)));
         Rig {
             d: Dir(p),
             cache,
             script,
             w,
             notes,
+            rows,
         }
     }
 
@@ -1831,5 +2173,702 @@ mod tests {
         assert_eq!(resolve(s(b"a\0"), s(b"b\0"), s(b"a\0")), Resolve::Refuse);
         assert_eq!(resolve(None, s(b"x\n"), s(b"y\n")), Resolve::Refuse);
         assert_eq!(resolve(s(b""), s(b"x\n"), None), Resolve::Refuse);
+    }
+
+    fn pending_meta(size: u64) -> Meta {
+        Meta {
+            hash: None,
+            size,
+            ..meta(ver(b""))
+        }
+    }
+
+    fn tree_with(m: Meta, host_ver: Seq) -> (GTree, NodeId) {
+        let mut t = GTree::new();
+        t.set_version(9, 1);
+        let p = RelPath::new("a.rs").unwrap();
+        let up = Change::Upsert {
+            path: p.clone(),
+            meta: m,
+            ver: host_ver,
+        };
+        t.apply(&up, &mut Vec::new());
+        let id = t.resolve(&p).unwrap();
+        (t, id)
+    }
+
+    #[test]
+    fn dest_expect_holds_a_pending_file_to_its_host_entry() {
+        let (t, id) = tree_with(pending_meta(7), 5);
+        let key = VerKey {
+            index: 9,
+            ver: 5,
+            size: 7,
+        };
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Ver(key));
+        assert_eq!(node_expect(t.get(id).unwrap(), 9), Expect::Ver(key));
+    }
+
+    #[test]
+    fn dest_expect_prefers_the_version_last_served_over_a_pending_one() {
+        let (mut t, id) = tree_with(pending_meta(7), 5);
+        let served = ver(b"served");
+        t.get_mut(id).unwrap().read_ver = Some(served);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Is(served));
+    }
+
+    #[test]
+    fn dest_expect_keeps_its_meaning_for_known_and_absent_nodes() {
+        let v = ver(b"known");
+        let (mut t, id) = tree_with(meta(v), 5);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Is(v));
+        assert_eq!(dest_expect(None, 9), Expect::Absent);
+        t.get_mut(id).unwrap().vis = Vis::PendingDelete;
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Absent);
+        let (t, id) = tree_with(
+            Meta {
+                kind: Kind::Dir,
+                hash: None,
+                ..meta(v)
+            },
+            5,
+        );
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Dir);
+    }
+
+    #[test]
+    fn a_file_only_this_guest_has_is_not_held_to_a_host_version() {
+        let (t, id) = tree_with(pending_meta(0), 0);
+        assert_eq!(dest_expect(t.get(id), 9), Expect::Any);
+    }
+
+    #[test]
+    fn simple_mutations_reach_the_host_in_call_order() {
+        let r = rig("order");
+        let d = RelPath::new("d").unwrap();
+        let l = RelPath::new("l").unwrap();
+        let f = RelPath::new("f").unwrap();
+        for _ in 0..4 {
+            lock(&r.script.replies).push_back(Ok(Reply::Done {
+                meta: meta(ver(b"")),
+            }));
+        }
+        r.w.mkdir(&d, 0o755).unwrap();
+        r.w.symlink(&l, &LinkTarget::new("d").unwrap()).unwrap();
+        r.w.setattr(&f, Expect::Any, Some(0o600), None).unwrap();
+        r.w.remove(&f, Expect::Any).unwrap();
+        match &lock(&r.script.ops)[..] {
+            [
+                Op::Mk {
+                    what: Mk::Dir { .. },
+                    ..
+                },
+                Op::Mk {
+                    what: Mk::Symlink { .. },
+                    ..
+                },
+                Op::SetAttr { .. },
+                Op::Remove { .. },
+            ] => {}
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_busy_mutation_is_sent_again_before_the_next_one() {
+        let r = rig("busy-mk");
+        let d = RelPath::new("d").unwrap();
+        let f = RelPath::new("f").unwrap();
+        lock(&r.script.replies).push_back(Err(RpcError::Wire(WireErr::Busy)));
+        for _ in 0..2 {
+            lock(&r.script.replies).push_back(Ok(Reply::Done {
+                meta: meta(ver(b"")),
+            }));
+        }
+        r.w.mkdir(&d, 0o755).unwrap();
+        r.w.remove(&f, Expect::Any).unwrap();
+        match &lock(&r.script.ops)[..] {
+            [Op::Mk { .. }, Op::Mk { .. }, Op::Remove { .. }] => {}
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    fn until(what: &str, f: impl Fn() -> bool) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(Instant::now() < end, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn sent(r: &Rig) -> usize {
+        lock(&r.script.ops).len()
+    }
+
+    fn held_rig(tag: &str) -> Rig {
+        let r = rig(tag);
+        r.script.hold.store(true, Ordering::SeqCst);
+        r
+    }
+
+    // a new file the guest made: no host version, content written through the staging copy
+    fn open_new(r: &Rig, p: &RelPath, body: &[u8]) -> (u32, Arc<OwnedFd>) {
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: None,
+            })
+            .unwrap();
+        overwrite(fd.as_fd(), body).unwrap();
+        (id, fd)
+    }
+
+    fn done_for(v: Version) -> Result<Reply, RpcError> {
+        Ok(Reply::Done { meta: meta(v) })
+    }
+
+    fn committed(v: Version) -> Option<Result<Flushed, Refusal>> {
+        Some(Ok(Flushed::Committed {
+            meta: meta(v),
+            merged: false,
+        }))
+    }
+
+    const JOB_WAIT: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn closing_a_new_file_does_not_wait_for_the_host() {
+        let r = held_rig("park");
+        let p = RelPath::new("new.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+
+        assert_eq!(r.w.release_async(id, 7), None);
+        assert_eq!(lock(&r.script.held).len(), 1, "the host has not answered");
+        assert!(
+            r.w.staging_fd(id).is_some(),
+            "the settler still needs the entry"
+        );
+        assert_eq!(r.w.parked_node(id), Some(7));
+        assert!(!r.w.drain(Instant::now() + Duration::from_millis(20)));
+        let jobs = r.w.jobs();
+        assert!(jobs.try_recv().is_err());
+
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert!(r.cache.contains(&v.hash));
+        assert!(r.w.drain(Instant::now()));
+        assert_eq!(sent(&r), 1);
+        assert!(lock(&r.notes).is_empty());
+    }
+
+    #[test]
+    fn closing_an_empty_new_file_sends_its_commit_and_returns() {
+        let r = held_rig("park-empty");
+        let p = RelPath::new("touched").unwrap();
+        let (id, _fd) = open_new(&r, &p, b"");
+        let v = ver(b"");
+        assert_eq!(r.w.release_async(id, 3), Some(Ok(Flushed::Sent(v))));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.parked_node(id), Some(3));
+        assert!(r.w.staging_fd(id).is_some());
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert_eq!(sent(&r), 1);
+    }
+
+    #[test]
+    fn a_late_conflict_that_cannot_merge_rolls_back_with_one_notice() {
+        let r = held_rig("park-refuse");
+        let p = RelPath::new("clash.txt").unwrap();
+        let ours = b"mine\n";
+        let theirs = b"th\0eirs";
+        let (id, _fd) = open_new(&r, &p, ours);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(ver(ours))));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        let (jobs, vt) = (r.w.jobs(), ver(theirs));
+        r.script.answer(Ok(Reply::Conflict {
+            current: Some(meta(vt)),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(
+            r.w.settle_parked(id),
+            Some(Err(Refusal {
+                errno: libc::ECANCELED,
+                refused: true,
+                current: Some(meta(vt)),
+            }))
+        );
+        assert_eq!(
+            *lock(&r.notes),
+            vec![Notice {
+                kind: NoticeKind::Refused,
+                path: p
+            }]
+        );
+        assert!(r.w.staging_fd(id).is_none());
+        assert!(!r.cache.contains(&ver(ours).hash));
+        assert!(r.cache.contains(&vt.hash));
+        assert!(r.w.drain(Instant::now()));
+        assert_eq!(sent(&r), 1, "a refused create is not sent again");
+        assert_eq!(r.w.settle_parked(id), None);
+    }
+
+    #[test]
+    fn fsync_waits_for_the_host_after_a_new_file_closes() {
+        let r = held_rig("park-fsync");
+        let p = RelPath::new("synced.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.flush(id, true));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!h.is_finished(), "fsync returned before the host answered");
+            r.script.answer(done_for(v));
+            assert_eq!(
+                h.join().unwrap(),
+                Ok(Flushed::Committed {
+                    meta: meta(v),
+                    merged: false
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn an_edit_of_an_existing_file_still_waits_at_close() {
+        let r = held_rig("park-edit");
+        let p = RelPath::new("lib.rs").unwrap();
+        let (base, ours) = (b"one\ntwo\n", b"ONE\ntwo\n");
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let vo = ver(ours);
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.release_async(id, 5));
+            until("the commit in the pipe", || sent(&r) == 1);
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                !h.is_finished(),
+                "the close returned before the host answered"
+            );
+            r.script.answer(done_for(vo));
+            assert_eq!(h.join().unwrap(), committed(vo));
+        });
+        assert_eq!(r.w.parked_node(id), None);
+        assert!(r.w.staging_fd(id).is_none());
+    }
+
+    #[test]
+    fn a_new_file_changed_after_its_commit_was_sent_still_waits_at_close() {
+        let r = held_rig("park-changed");
+        let p = RelPath::new("grows.txt").unwrap();
+        let (first, second) = (b"fresh\n", b"other\n");
+        let (id, fd) = open_new(&r, &p, first);
+        let (v1, v2) = (ver(first), ver(second));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v1)));
+        until("the first commit", || sent(&r) == 1);
+        overwrite(fd.as_fd(), second).unwrap();
+        std::thread::scope(|s| {
+            let h = s.spawn(|| r.w.release_async(id, 9));
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!h.is_finished());
+            r.script.answer(done_for(v1));
+            until("the second commit", || sent(&r) == 2);
+            r.script.answer(done_for(v2));
+            assert_eq!(h.join().unwrap(), committed(v2));
+        });
+        assert_eq!(r.w.parked_node(id), None);
+    }
+
+    #[test]
+    fn a_reopen_after_a_parked_close_reuses_the_staging_copy() {
+        let r = held_rig("park-reopen");
+        let p = RelPath::new("again.txt").unwrap();
+        let body = b"fresh\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit in the pipe", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        let (again, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: Some(id),
+            })
+            .unwrap();
+        assert_eq!(again, id);
+        assert_eq!(staged(&fd), body);
+        assert_eq!(r.w.parked_node(id), None);
+        assert!(r.w.drain(Instant::now()), "the reopen took the close back");
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        assert_eq!(r.w.settle_parked(id), None);
+        assert!(r.w.staging_fd(id).is_some(), "the reopened handle keeps it");
+
+        assert_eq!(r.w.release(id), committed(v));
+        assert!(r.w.staging_fd(id).is_none());
+        assert_eq!(sent(&r), 1);
+    }
+
+    fn set_mtime(fd: &OwnedFd, ns: i64) {
+        let t = rustix::fs::Timespec {
+            tv_sec: ns.div_euclid(1_000_000_000),
+            tv_nsec: ns.rem_euclid(1_000_000_000) as _,
+        };
+        let ts = rustix::fs::Timestamps {
+            last_access: t,
+            last_modification: t,
+        };
+        rustix::fs::futimens(fd, &ts).unwrap();
+    }
+
+    fn attrs(v: Version, perm: u16, mtime_ns: i64) -> Option<Result<Flushed, Refusal>> {
+        Some(Ok(Flushed::Committed {
+            meta: Meta {
+                perm,
+                mtime_ns,
+                ..meta(v)
+            },
+            merged: false,
+        }))
+    }
+
+    const WHEN: i64 = 1_700_000_000_123_456_789;
+
+    #[test]
+    fn a_chmod_and_utimes_before_the_first_commit_ride_in_it() {
+        let r = rig("attr-fresh");
+        let p = RelPath::new("t.txt").unwrap();
+        let body = b"data\n";
+        let (id, fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        set_mtime(&fd, WHEN);
+        assert_eq!(
+            r.w.attr_new(id, (5, 1), Some(0o600), Some(WHEN)),
+            Attr::Folded
+        );
+        assert_eq!(sent(&r), 0, "recording the change sends nothing");
+
+        lock(&r.script.replies).push_back(done_for(v));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        assert_eq!(r.w.release(id), attrs(v, 0o600, WHEN));
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { perm, mtime_ns, .. }] => {
+                assert_eq!((*perm, *mtime_ns), (Some(0o600), Some(WHEN)))
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mtime_older_than_a_later_write_is_not_stamped() {
+        let r = rig("attr-stale");
+        let p = RelPath::new("t.txt").unwrap();
+        let (id, fd) = open_new(&r, &p, b"one\n");
+        set_mtime(&fd, WHEN);
+        assert_eq!(r.w.attr_new(id, (5, 1), None, Some(WHEN)), Attr::Folded);
+        overwrite(fd.as_fd(), b"two\n").unwrap();
+        lock(&r.script.replies).push_back(done_for(ver(b"two\n")));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(ver(b"two\n"))));
+        until("the commit", || sent(&r) == 1);
+        match &lock(&r.script.ops)[..] {
+            [Op::Commit { mtime_ns, .. }] => assert_eq!(*mtime_ns, None),
+            o => panic!("unexpected {o:?}"),
+        }
+    }
+
+    #[test]
+    fn a_chmod_after_the_close_is_queued_behind_the_commit_without_waiting() {
+        let r = held_rig("attr-parked");
+        let p = RelPath::new("t.txt").unwrap();
+        let body = b"data\n";
+        let (id, _fd) = open_new(&r, &p, body);
+        let v = ver(body);
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        until("the commit", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(id, 7), None);
+
+        assert_eq!(
+            r.w.attr_new(id, (7, 3), Some(0o600), None),
+            Attr::Queued,
+            "the host has not answered the commit"
+        );
+        until("the setattr", || sent(&r) == 2);
+        match &lock(&r.script.ops)[..] {
+            [
+                Op::Commit { .. },
+                Op::SetAttr {
+                    expect,
+                    perm,
+                    mtime_ns,
+                    ..
+                },
+            ] => assert_eq!(
+                (*expect, *perm, *mtime_ns),
+                (Expect::Is(v), Some(0o600), None)
+            ),
+            o => panic!("unexpected {o:?}"),
+        }
+
+        let jobs = r.w.jobs();
+        r.script.answer(done_for(v));
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(Job::Settle(id)));
+        r.script.answer(done_for(v));
+        let landed = Job::Landed {
+            node: 7,
+            born: 3,
+            mk: false,
+            what: Landing::Done,
+        };
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(landed));
+        assert_eq!(r.w.settle_parked(id), attrs(v, 0o600, 1));
+        assert!(!r.w.drain(Instant::now()), "the setattr is not settled yet");
+        r.w.landed_done();
+        assert!(r.w.drain(Instant::now()));
+    }
+
+    #[test]
+    fn attr_new_leaves_an_edit_and_a_changed_file_to_the_caller() {
+        let r = held_rig("attr-sync");
+        let p = RelPath::new("edit.txt").unwrap();
+        let (id, _fd) = open_edit(&r, &p, b"one\n", b"two\n");
+        assert_eq!(r.w.attr_new(id, (5, 1), Some(0o600), None), Attr::Sync);
+        assert_eq!(r.w.attr_new(9999, (5, 1), Some(0o600), None), Attr::Sync);
+
+        let q = RelPath::new("new.txt").unwrap();
+        let (nid, nfd) = open_new(&r, &q, b"fresh\n");
+        assert_eq!(r.w.flush(nid, false), Ok(Flushed::Sent(ver(b"fresh\n"))));
+        until("the commit", || sent(&r) == 1);
+        overwrite(nfd.as_fd(), b"changed since\n").unwrap();
+        assert_eq!(r.w.attr_new(nid, (6, 1), Some(0o600), None), Attr::Sync);
+        assert_eq!(sent(&r), 1, "nothing was queued for either");
+    }
+
+    #[test]
+    fn abandon_drops_a_parked_entry_and_fails_an_open_one() {
+        let r = held_rig("abandon");
+        let (p, q) = (
+            RelPath::new("parked.txt").unwrap(),
+            RelPath::new("open.txt").unwrap(),
+        );
+        let (a, _fa) = open_new(&r, &p, b"a\n");
+        assert_eq!(r.w.flush(a, false), Ok(Flushed::Sent(ver(b"a\n"))));
+        until("the commit", || sent(&r) == 1);
+        assert_eq!(r.w.release_async(a, 7), None);
+        let (b, _fb) = open_new(&r, &q, b"b\n");
+
+        assert!(!r.w.drain(Instant::now()));
+        r.w.abandon(&[a, b]);
+        assert!(r.w.drain(Instant::now()), "the parked close is given up");
+        assert!(r.w.staging_fd(a).is_none());
+        assert_eq!(r.w.parked_node(a), None);
+        assert!(
+            r.w.staging_fd(b).is_some(),
+            "an open handle keeps its entry"
+        );
+        assert_eq!(
+            r.w.flush(b, false).map_err(|e| e.errno),
+            Err(libc::ECANCELED)
+        );
+        assert_eq!(r.w.release(b), None);
+        assert!(r.w.staging_fd(b).is_none());
+        assert_eq!(sent(&r), 1);
+    }
+
+    #[test]
+    fn landing_says_what_the_host_said() {
+        let wire = |w| Err(RpcError::Wire(w));
+        assert_eq!(Landing::of(done_for(ver(b""))), Landing::Done);
+        let conflict = Ok(Reply::Conflict {
+            current: None,
+            inline: None,
+        });
+        assert_eq!(Landing::of(conflict), Landing::Conflict(None));
+        assert_eq!(Landing::of(wire(WireErr::Ignored)), Landing::Ignored);
+        assert_eq!(
+            Landing::of(wire(WireErr::TooLarge)),
+            Landing::Failed(libc::EFBIG)
+        );
+        for e in [WireErr::NotFound, WireErr::Exists, WireErr::Denied] {
+            assert_eq!(Landing::of(wire(e)), Landing::Failed(libc::EIO));
+        }
+        assert_eq!(
+            Landing::of(Err(RpcError::Closed)),
+            Landing::Failed(libc::EIO)
+        );
+        assert_eq!(
+            Landing::of(Err(RpcError::Timeout)),
+            Landing::Failed(libc::EIO)
+        );
+    }
+
+    #[test]
+    fn mk_async_returns_before_the_host_answers_and_tells_the_settler() {
+        let r = held_rig("mk-async");
+        let d = RelPath::new("d").unwrap();
+        let jobs = r.w.jobs();
+        r.w.mk_async(&d, Mk::Dir { perm: 0o755 }, (4, 2)).unwrap();
+        until("the mk", || sent(&r) == 1);
+        assert!(jobs.try_recv().is_err(), "nothing answered yet");
+        assert!(!r.w.drain(Instant::now() + Duration::from_millis(20)));
+
+        r.script.answer(Err(RpcError::Wire(WireErr::Exists)));
+        let want = Job::Landed {
+            node: 4,
+            born: 2,
+            mk: true,
+            what: Landing::Failed(libc::EIO),
+        };
+        assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(want));
+        r.w.landed_done();
+        assert!(r.w.drain(Instant::now()));
+    }
+
+    #[test]
+    fn a_commit_of_an_edit_reaches_the_feed_with_both_versions() {
+        let r = rig("feed-edit");
+        let p = RelPath::new("busy.txt").unwrap();
+        let (base, ours) = (b"one\ntwo\n", b"ONE\ntwo\n");
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let (vb, vo) = (ver(base), ver(ours));
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vo) }));
+        assert!(r.w.flush(id, false).is_ok());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Modified);
+        assert_eq!(rows[0].by, By::Local);
+        assert_eq!(rows[0].path, p);
+        assert_eq!(
+            (rows[0].old, rows[0].new, rows[0].size, rows[0].merged),
+            (Some(vb.hash), Some(vo.hash), vo.size, false)
+        );
+    }
+
+    #[test]
+    fn a_merged_commit_is_flagged_and_based_on_the_hosts_version() {
+        let r = rig("feed-merge");
+        let p = RelPath::new("src/lib.rs").unwrap();
+        let (base, ours, theirs) = (
+            b"one\ntwo\nthree\nfour\n",
+            b"ONE\ntwo\nthree\nfour\n",
+            b"one\ntwo\nthree\nFOUR\n",
+        );
+        let merged = b"ONE\ntwo\nthree\nFOUR\n";
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let (vt, vm) = (ver(theirs), ver(merged));
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: Some(meta(vt)),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vm) }));
+        assert!(r.w.flush(id, false).is_ok());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Modified);
+        assert!(rows[0].merged);
+        assert_eq!((rows[0].old, rows[0].new), (Some(vt.hash), Some(vm.hash)));
+    }
+
+    #[test]
+    fn a_new_file_reaches_the_feed_as_added_once_the_host_took_it() {
+        let r = rig("feed-new");
+        let p = RelPath::new("new.txt").unwrap();
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: None,
+            })
+            .unwrap();
+        let body = b"fresh\n";
+        overwrite(fd.as_fd(), body).unwrap();
+        let v = ver(body);
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        assert!(r.w.release(id).is_some());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].what, rows[0].old), (What::Added, None));
+        assert_eq!((rows[0].new, rows[0].size), (Some(v.hash), v.size));
+    }
+
+    #[test]
+    fn a_refused_edit_leaves_no_row() {
+        let r = rig("feed-refused");
+        let p = RelPath::new("notes.txt").unwrap();
+        let (base, ours, theirs) = (
+            b"one\ntwo\nthree\n",
+            b"one\nours\nthree\n",
+            b"one\ntheirs\nthree\n",
+        );
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: Some(meta(ver(theirs))),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        assert!(r.w.flush(id, false).is_err());
+        assert!(lock(&r.rows).is_empty());
+    }
+
+    #[test]
+    fn a_remove_and_a_rename_reach_the_feed_only_when_the_host_agreed() {
+        let r = rig("feed-rm");
+        let f = RelPath::new("f").unwrap();
+        let v = ver(b"gone\n");
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: None,
+            inline: None,
+        }));
+        assert!(r.w.remove(&f, Expect::Is(v)).is_err());
+        assert!(lock(&r.rows).is_empty());
+
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        r.w.remove(&f, Expect::Is(v)).unwrap();
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        let to = RelPath::new("g").unwrap();
+        r.w.rename(RenameReq {
+            from: &f,
+            to: &to,
+            from_expect: Expect::Is(v),
+            to_expect: Expect::Absent,
+            staging: None,
+            local: None,
+            discard: false,
+        })
+        .unwrap();
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].what, What::Removed);
+        assert_eq!((rows[0].old, rows[0].size), (Some(v.hash), v.size));
+        assert_eq!(rows[0].path, f);
+        assert_eq!(rows[1].what, What::Renamed);
+        assert_eq!(rows[1].by, By::Local);
+        assert_eq!(rows[1].path, to);
+        assert_eq!(rows[1].from, Some(f));
     }
 }

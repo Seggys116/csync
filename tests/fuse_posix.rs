@@ -32,6 +32,8 @@ linux_test!(
     long_name_errno,
     utimensat_mtime_reaches_host,
     shared_mmap_write_reaches_host,
+    deep_ordered_creation_is_whole_after_one_fsync,
+    tar_like_extraction_lands_complete_and_exact,
 );
 
 #[cfg(target_os = "linux")]
@@ -729,5 +731,134 @@ mod posix {
         File::open(&p).unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, want, "guest read after munmap");
         e.host_has("src/mm.bin", &want);
+    }
+
+    // mkdir -p with a file made in each level right away: every create is queued behind its parent in one order,
+    // so one fsync of the deepest file (which waits for the host) leaves the whole chain on the host, no polling
+    pub fn deep_ordered_creation_is_whole_after_one_fsync() {
+        let Some(e) = Env::up("posix-deep") else {
+            return;
+        };
+        let body = |i: usize, n: usize| -> Vec<u8> {
+            (0..n).map(|k| b'a' + ((k + i) % 26) as u8).collect()
+        };
+        let files = [
+            ("src/a/f0", 3usize),
+            ("src/a/b/f1", 1000),
+            ("src/a/b/c/f2", 70_000),
+        ];
+        fs::create_dir_all(e.m("src/a/b/c")).unwrap();
+        for (i, (rel, n)) in files.iter().enumerate().take(2) {
+            fs::write(e.m(rel), body(i, *n)).unwrap();
+        }
+        let (rel, n) = files[2];
+        let mut deepest = File::create(e.m(rel)).unwrap();
+        deepest.write_all(&body(2, n)).unwrap();
+        deepest.sync_all().expect("fsync of the deepest file");
+
+        for dir in ["src/a", "src/a/b", "src/a/b/c"] {
+            assert!(e.h(dir).is_dir(), "{dir} is on the host after the fsync");
+        }
+        for (i, (rel, n)) in files.iter().enumerate() {
+            let got = fs::read(e.h(rel)).unwrap_or_default();
+            assert!(got == body(i, *n), "{rel} on the host: {} bytes", got.len());
+        }
+        close_checked(deepest).unwrap();
+    }
+
+    // tar extracting: each file is created, written and closed, then given its mtime and mode; each directory gets
+    // its mtime after its children. nothing waits on the host per entry, yet after one fsync of the last file the
+    // host holds every byte, mode and nanosecond, and no temporary file of the committer is left behind
+    pub fn tar_like_extraction_lands_complete_and_exact() {
+        const DIRS: usize = 30;
+        const PER: usize = 10;
+        const FILE_T: (i64, i64) = (1_600_000_000, 123_456_789);
+        const DIR_T: (i64, i64) = (1_500_000_000, 987_654_321);
+        let Some(e) = Env::up("posix-tar") else {
+            return;
+        };
+        let stamp = |p: &Path, (sec, nsec): (i64, i64)| {
+            let t = Timespec {
+                tv_sec: sec,
+                tv_nsec: nsec,
+            };
+            let ts = Timestamps {
+                last_access: t,
+                last_modification: t,
+            };
+            rustix::fs::utimensat(CWD, p, &ts, AtFlags::empty()).unwrap();
+        };
+        let chmod = |p: &Path, mode: u32| {
+            fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let body = |d: usize, f: usize| -> Vec<u8> {
+            format!("dir {d} file {f}\n")
+                .repeat(1 + (d * PER + f) % 40)
+                .into_bytes()
+        };
+        let mode = |d: usize, f: usize| {
+            if (d + f).is_multiple_of(3) {
+                0o750
+            } else {
+                0o640
+            }
+        };
+
+        fs::create_dir(e.m("src/t")).unwrap();
+        for d in 0..DIRS {
+            let dir = e.m(&format!("src/t/d{d}"));
+            fs::create_dir(&dir).unwrap();
+            for f in 0..PER {
+                let p = dir.join(format!("f{f}"));
+                fs::write(&p, body(d, f)).unwrap();
+                stamp(&p, FILE_T);
+                chmod(&p, mode(d, f));
+            }
+            stamp(&dir, DIR_T);
+            chmod(&dir, 0o750);
+        }
+        stamp(&e.m("src/t"), DIR_T);
+
+        let mut last = File::create(e.m("src/last.bin")).unwrap();
+        last.write_all(b"the last file of the extraction\n")
+            .unwrap();
+        last.sync_all().expect("fsync of the last file");
+
+        let at = |md: &fs::Metadata| (md.mtime(), md.mtime_nsec());
+        for d in 0..DIRS {
+            let dir = format!("src/t/d{d}");
+            let md = fs::metadata(e.h(&dir)).unwrap();
+            assert_eq!(at(&md), DIR_T, "mtime of {dir}");
+            assert_eq!(md.mode() & 0o777, 0o750, "mode of {dir}");
+            for f in 0..PER {
+                let rel = format!("{dir}/f{f}");
+                let got = fs::read(e.h(&rel)).unwrap_or_default();
+                assert!(got == body(d, f), "{rel} holds {} bytes", got.len());
+                let md = fs::metadata(e.h(&rel)).unwrap();
+                assert_eq!(at(&md), FILE_T, "mtime of {rel}");
+                assert_eq!(md.mode() & 0o777, mode(d, f), "mode of {rel}");
+            }
+        }
+        let md = fs::metadata(e.h("src/t")).unwrap();
+        assert_eq!(at(&md), DIR_T, "mtime of src/t");
+
+        fn leftovers(dir: &Path, found: &mut Vec<PathBuf>) {
+            for ent in fs::read_dir(dir).unwrap() {
+                let ent = ent.unwrap();
+                if ent.file_name().to_string_lossy().starts_with(".csync~") {
+                    found.push(ent.path());
+                }
+                if ent.file_type().unwrap().is_dir() {
+                    leftovers(&ent.path(), found);
+                }
+            }
+        }
+        let mut found = Vec::new();
+        leftovers(&e.h("src"), &mut found);
+        assert!(
+            found.is_empty(),
+            "temporary files left on the host: {found:?}"
+        );
+        close_checked(last).unwrap();
     }
 }

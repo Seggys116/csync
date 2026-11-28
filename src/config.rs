@@ -98,8 +98,12 @@ impl Dirs {
         self.state.join("projects").join(path_id(root))
     }
 
+    pub fn host_state_root(&self) -> PathBuf {
+        self.state.join("hosts")
+    }
+
     pub fn host_state_dir(&self, host: &PeerKey) -> PathBuf {
-        self.state.join("hosts").join(host.fpr_hex())
+        self.host_state_root().join(host.fpr_hex())
     }
 
     pub fn blob_cache_dir(&self, host: &PeerKey) -> PathBuf {

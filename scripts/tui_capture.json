@@ -1,0 +1,428 @@
+{
+ "cols": 100,
+ "rows": 30,
+ "panes": {
+  "host": {
+   "cmd": [
+    "${CAP_BIN}",
+    "host",
+    "/tmp/orbit",
+    "--listen",
+    "0.0.0.0:47890",
+    "--no-mdns"
+   ],
+   "env": {
+    "CSYNC_HOME": "${CAP_HOME}"
+   }
+  },
+  "guest": {
+   "cmd": [
+    "docker",
+    "exec",
+    "-it",
+    "-e",
+    "CSYNC_HOME=/gh",
+    "-e",
+    "COLORTERM=truecolor",
+    "-e",
+    "TERM=xterm-256color",
+    "csync-cap-guest",
+    "csync",
+    "join",
+    "/root/orbit",
+    "--connect",
+    "host.docker.internal:47890",
+    "--name",
+    "dev-box"
+   ]
+  }
+ },
+ "steps": [
+  {
+   "run": [
+    "sh",
+    "-c",
+    "set -e\nP=/tmp/orbit\nrm -rf $P\nmkdir -p $P/src/engine $P/src/net $P/tests $P/docs $P/target/debug\ncd $P\nprintf '[package]\\nname = \"orbit\"\\nversion = \"0.4.2\"\\nedition = \"2021\"\\n\\n[dependencies]\\nserde = \"1\"\\ntokio = { version = \"1\", features = [\"full\"] }\\n' > Cargo.toml\nprintf '/target\\n*.log\\n' > .gitignore\nprintf '# orbit\\n\\nA small job scheduler.\\n' > README.md\nprintf 'a\\nb\\nc\\nd\\ne\\nf\\ng\\nh\\n' > notes.txt\nprintf 'one\\n' > todo.txt\nfor m in main lib config; do printf '// %s\\npub fn run() {}\\n' $m > src/$m.rs; done\nfor m in queue worker timer retry; do for i in 1 2 3; do printf '// engine %s %s\\npub fn step() -> u32 { %s }\\n' $m $i $i > src/engine/${m}_$i.rs; done; done\nfor m in client server codec; do for i in 1 2; do printf '// net %s %s\\npub fn open() {}\\n' $m $i > src/net/${m}_$i.rs; done; done\nfor i in 1 2 3 4 5 6; do printf '#[test]\\nfn case_%s() { assert_eq!(1, 1); }\\n' $i > tests/case_$i.rs; done\nfor i in 1 2 3; do printf '# guide %s\\n' $i > docs/guide_$i.md; done\nhead -c 200000 /dev/urandom | base64 > target/debug/orbit.o\ngit init -q -b main .\ngit add -A\ngit -c user.name=dev -c user.email=dev@example.com commit -q -m \"initial orbit scheduler\"\ngit ls-files | wc -l\n\n"
+   ],
+   "timeout": 60
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "umount /root/orbit 2>/dev/null; rm -rf /gh /root/orbit; mkdir -p /root/orbit"
+   ],
+   "timeout": 60
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "rm -rf ${CAP_HOME}"
+   ]
+  },
+  {
+   "start": "host"
+  },
+  {
+   "sleep": 3.6
+  },
+  {
+   "mark": "waited"
+  },
+  {
+   "mark": "g0"
+  },
+  {
+   "start": "guest"
+  },
+  {
+   "wait_text": {
+    "pane": "host",
+    "re": "Pairing request",
+    "timeout": 30
+   }
+  },
+  {
+   "wait_text": {
+    "pane": "guest",
+    "re": "codes match",
+    "timeout": 30
+   }
+  },
+  {
+   "mark": "code"
+  },
+  {
+   "sleep": 3.4
+  },
+  {
+   "keys": {
+    "pane": "host",
+    "data": "a"
+   }
+  },
+  {
+   "mark": "accepted"
+  },
+  {
+   "sleep": 1.0
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "y"
+   }
+  },
+  {
+   "wait_text": {
+    "pane": "guest",
+    "re": "link\\s+. live",
+    "timeout": 60
+   }
+  },
+  {
+   "wait_text": {
+    "pane": "host",
+    "re": "dev-box\\s+. live",
+    "timeout": 60
+   }
+  },
+  {
+   "mark": "live"
+  },
+  {
+   "sleep": 3
+  },
+  {
+   "mark": "e0"
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf 'pub fn step() -> u32 { 4 }\\n' > src/engine/queue_4.rs; printf '\\npub mod engine;\\n' >> src/lib.rs"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.2
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "cd /root/orbit && cat $(git ls-files) > /dev/null; git status -s; git log --oneline | cat"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "cd /root/orbit && printf '// retry with backoff\\n' >> src/engine/retry_1.rs; printf '# guide 4\\n' > docs/guide_4.md"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.2
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf '# orbit 0.5\\n' > README.md; rm src/net/codec_2.rs"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "cd /root/orbit && mv docs/guide_3.md docs/setup.md; printf 'retries = 5\\n' > settings.toml"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "cd /root/orbit && sh -c 'sed 1s/a/A/ notes.txt > .notes.tmp; sleep 4; mv .notes.tmp notes.txt'"
+   ],
+   "bg": true,
+   "timeout": 60
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf 'a\\nb\\nc\\nd\\ne\\nf\\ng\\nH\\n' > notes.txt"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 3.5
+  },
+  {
+   "run": [
+    "docker",
+    "exec",
+    "csync-cap-guest",
+    "sh",
+    "-c",
+    "cd /root/orbit && sh -c 'cp todo.txt .todo.tmp; printf \"guest\\n\" > .todo.tmp; sleep 4; mv .todo.tmp todo.txt'"
+   ],
+   "bg": true,
+   "timeout": 60
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf 'host\\n' > todo.txt"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 3.5
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf '/target\\n*.log\\n.env\\n' > .gitignore; printf 'TOKEN=x\\n' > .env"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf '0.5.0\\n' > VERSION"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "mark": "e1"
+  },
+  {
+   "sleep": 3
+  },
+  {
+   "sleep": 1
+  },
+  {
+   "run": [
+    "sh",
+    "-c",
+    "cd /tmp/orbit && printf '# orbit\\n\\nA small job scheduler.\\nIt keeps retries and timers.\\n' > README.md"
+   ],
+   "bg": false,
+   "timeout": 60
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "mark": "d0"
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\u001b[A"
+   }
+  },
+  {
+   "sleep": 1
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\r"
+   }
+  },
+  {
+   "sleep": 2.5
+  },
+  {
+   "keys": {
+    "pane": "guest",
+    "data": "\u001b"
+   }
+  },
+  {
+   "sleep": 1.5
+  },
+  {
+   "mark": "d1"
+  },
+  {
+   "print": "host"
+  },
+  {
+   "print": "guest"
+  },
+  {
+   "stop": "guest"
+  },
+  {
+   "stop": "host"
+  }
+ ],
+ "outputs": [
+  {
+   "file": "${CAP_OUT}/tui-host-waiting.svg",
+   "pane": "host",
+   "to": "waited",
+   "title": "csync host",
+   "pause": 1.5,
+   "label": "csync host screen while it waits for a guest to connect"
+  },
+  {
+   "file": "${CAP_OUT}/tui-host-pairing.svg",
+   "pane": "host",
+   "from": "g0",
+   "from_offset": -0.8,
+   "to": "live",
+   "to_offset": 2,
+   "title": "csync host",
+   "pause": 3,
+   "label": "csync host screen: a pairing request arrives with a large verification code, the host accepts and the guest goes live",
+   "still": "accepted",
+   "still_offset": -0.4
+  },
+  {
+   "file": "${CAP_OUT}/tui-host-live.svg",
+   "pane": "host",
+   "from": "e0",
+   "from_offset": -1.0,
+   "to": "e1",
+   "to_offset": 2,
+   "title": "csync host",
+   "pause": 3,
+   "label": "csync host screen with a live guest, counters and an activity list showing a clean merge and a refused edit"
+  },
+  {
+   "file": "${CAP_OUT}/tui-guest-dither.svg",
+   "pane": "guest",
+   "from": "g0",
+   "to": "live",
+   "to_offset": 2,
+   "title": "csync join",
+   "pause": 3,
+   "fps": 12,
+   "label": "csync join screen dissolving between connect, code confirmation and live, with the same code the host shows",
+   "still": "accepted",
+   "still_offset": -0.4
+  },
+  {
+   "file": "${CAP_OUT}/tui-guest-live.svg",
+   "pane": "guest",
+   "from": "e0",
+   "from_offset": -1.0,
+   "to": "e1",
+   "to_offset": 2,
+   "title": "csync join",
+   "pause": 3,
+   "label": "csync join screen with a live session: link latency, cache, edit counters and the activity list"
+  },
+  {
+   "file": "${CAP_OUT}/tui-guest-diff.svg",
+   "pane": "guest",
+   "from": "d0",
+   "from_offset": -0.5,
+   "to": "d1",
+   "to_offset": 0.5,
+   "title": "csync join",
+   "pause": 3,
+   "label": "csync join screen with the activity list and a diff of a host edit opened from it",
+   "still": "d0",
+   "still_offset": 4.0
+  }
+ ]
+}

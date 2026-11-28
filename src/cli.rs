@@ -5,7 +5,7 @@ use crate::host::{HostCfg, HostCtl};
 use crate::net::discover::{self, Found, HostAd};
 use crate::proto::{Name, PROTO, hs::Role};
 use crate::tui::{self, FoundHost, UiBus, UiCmd, view};
-use crate::{bench, doctor};
+use crate::{bench, doctor, update};
 use clap::{Parser, Subcommand, ValueEnum};
 use crossbeam_channel::{Receiver, Sender, bounded, select};
 use std::{
@@ -26,6 +26,7 @@ pub const EXIT_ENV: u8 = 3;
 pub const EXIT_AUTH: u8 = 4;
 pub const EXIT_NOT_RUNNING: u8 = 5;
 pub const EXIT_NO_MATCH: u8 = 6;
+pub const EXIT_UPDATE_AVAILABLE: u8 = 10;
 pub const EXIT_INTERRUPTED: u8 = 130;
 
 const CMD_QUEUE: usize = 64;
@@ -35,17 +36,18 @@ const CTL_REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 const AFTER_HELP: &str = "\
 Typical use:
   on the Mac, in the project:   csync host
-  on the Linux guest:           csync join            (pick the host, compare the pairing code)
+  on a Linux or macOS guest:    csync join            (pick the host, compare the pairing code)
 
 Without a terminal (or with --no-tui) csync prints one status record per line
 (`kind key=value ...`, values percent-escaped) and reads commands from stdin:
   accept [ID] | reject [ID] | confirm yes|no | join N | revoke ID | status | quit
 
 Exit codes: 0 ok, 1 failure, 2 usage, 3 environment (FUSE, mount point, platform),
-4 trust or pairing refused, 5 no running session, 6 nothing matched, 130 interrupted.";
+4 trust or pairing refused, 5 no running session, 6 nothing matched, 10 update available
+(`update --check`), 130 interrupted.";
 
 #[derive(Parser, Debug)]
-#[command(name = "csync", version, about = "Two-way code sync for a macOS host and a Linux FUSE guest", after_help = AFTER_HELP)]
+#[command(name = "csync", version, about = "Two-way code sync for a macOS host and a Linux or macOS FUSE guest", after_help = AFTER_HELP)]
 pub struct Cli {
     #[arg(
         long,
@@ -82,7 +84,9 @@ pub enum Cmd {
         #[arg(long, help = "Advertise on VPN and point-to-point interfaces too")]
         all_interfaces: bool,
     },
-    #[command(about = "Join a host and mount its project with FUSE (Linux)")]
+    #[command(
+        about = "Join a host and mount its project with FUSE (Linux, or macOS with macFUSE 5.5 or later)"
+    )]
     Join {
         #[arg(
             value_name = "MOUNTPOINT",
@@ -108,7 +112,7 @@ pub enum Cmd {
         repair: bool,
         #[arg(
             long,
-            help = "Let other users access the mount (needs user_allow_other in /etc/fuse.conf)"
+            help = "Let other users access the mount (Linux: needs user_allow_other in /etc/fuse.conf)"
         )]
         allow_other: bool,
         #[arg(long, value_name = "SIZE", value_parser = config::parse_size, help = "Blob cache limit, e.g. 4G [default: min(10G, 20% of free space)]")]
@@ -153,6 +157,23 @@ pub enum Cmd {
     Status {
         #[arg(long, help = "Print JSON")]
         json: bool,
+    },
+    #[command(
+        about = "Install the latest csync release over this binary (checked against the release's SHA-256)"
+    )]
+    Update {
+        #[arg(
+            long,
+            conflicts_with = "version",
+            help = "Print the current and latest versions and install nothing; exit code 10 when an update is available"
+        )]
+        check: bool,
+        #[arg(
+            long,
+            value_name = "VERSION",
+            help = "Install this release instead of the latest; an older one is a deliberate downgrade"
+        )]
+        version: Option<String>,
     },
     #[command(hide = true, about = "Run local micro-benchmarks")]
     Bench {
@@ -314,6 +335,7 @@ pub fn run() -> ExitCode {
             json,
         } => cmd_doctor(mount, allow_other, json),
         Cmd::Status { json } => cmd_status(json),
+        Cmd::Update { check, version } => cmd_update(check, version),
         Cmd::Bench { path, quick, json } => cmd_bench(path, quick, json),
     };
     match r {
@@ -626,18 +648,12 @@ fn prepare_mount(p: &Path) -> io::Result<PathBuf> {
     } else {
         env::current_dir()?.join(p)
     };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     crate::guest::fs::clear_stale(&abs);
     if let Err(e) = fs::symlink_metadata(&abs)
-        && doctor::is_enotconn(&e)
+        && doctor::is_dead_mount(&e)
     {
-        let _ = Command::new("fusermount3")
-            .arg("-uz")
-            .arg(&abs)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        force_unmount(&abs);
     }
     if let Some((_, why, fix)) = doctor::mount_point_problem(&abs) {
         let fix = fix.map(|f| format!(" (fix: {f})")).unwrap_or_default();
@@ -646,10 +662,29 @@ fn prepare_mount(p: &Path) -> io::Result<PathBuf> {
             format!("mount point {} {why}{fix}", abs.display()),
         ));
     }
+    doctor::remove_finder_litter(&abs);
     if !abs.exists() {
         fs::create_dir_all(&abs)?;
     }
     fs::canonicalize(&abs)
+}
+
+fn force_unmount(at: &Path) {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("diskutil");
+        c.args(["unmount", "force"]);
+        c
+    } else {
+        let mut c = Command::new("fusermount3");
+        c.arg("-uz");
+        c
+    };
+    let _ = cmd
+        .arg(at)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 struct Picked {
@@ -745,27 +780,29 @@ fn discover_host(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_guest(cfg: GuestCfg, bus: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Result<()> {
     crate::guest::run(cfg, bus, cmds)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn run_guest(cfg: GuestCfg, bus: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Result<()> {
     let _ = (cfg, bus, cmds);
     Err(coded_io(
         EXIT_ENV,
-        "csync join mounts with FUSE and runs on Linux only",
+        "csync join mounts with FUSE and runs on Linux or macOS only",
     ))
 }
 
 fn cmd_join(a: JoinArgs, headless: bool) -> Result<u8, Coded> {
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Err(coded(
             EXIT_ENV,
-            "csync join mounts with FUSE and runs on Linux only; on this machine run csync host",
+            "csync join mounts with FUSE and runs on Linux or macOS only",
         ));
     }
+    #[cfg(target_os = "macos")]
+    crate::sys::macos::fuse3::probe().map_err(|e| coded(EXIT_ENV, e.to_string()))?;
     let name = config::machine_name(a.name.as_deref()).map_err(|m| coded(EXIT_USAGE, m))?;
     let addr = match &a.connect {
         Some(c) => Some(resolve_addr(c).map_err(|m| coded(EXIT_USAGE, m))?),
@@ -1102,6 +1139,10 @@ fn cmd_status(json: bool) -> Result<u8, Coded> {
     })
 }
 
+fn cmd_update(check: bool, version: Option<String>) -> Result<u8, Coded> {
+    update::run(&update::Opts { check, version })
+}
+
 fn cmd_bench(path: Option<PathBuf>, quick: bool, json: bool) -> Result<u8, Coded> {
     let path = match path {
         Some(p) => Some(p),
@@ -1143,6 +1184,18 @@ mod tests {
     }
 
     #[test]
+    fn join_help_names_both_guest_platforms() {
+        let c = Cli::command();
+        let join = c.find_subcommand("join").expect("join subcommand");
+        let about = join
+            .get_about()
+            .map(ToString::to_string)
+            .expect("join about");
+        assert!(about.contains("Linux") && about.contains("macOS") && about.contains("macFUSE"));
+        assert!(AFTER_HELP.contains("Linux or macOS guest"));
+    }
+
+    #[test]
     fn parses_the_documented_commands() {
         let c = Cli::try_parse_from([
             "csync",
@@ -1178,6 +1231,32 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["csync", "status", "--json"]).is_ok());
         assert!(Cli::try_parse_from(["csync", "bench", "--quick"]).is_ok());
+    }
+
+    #[test]
+    fn parses_the_update_flags() {
+        match Cli::try_parse_from(["csync", "update"]).unwrap().cmd {
+            Cmd::Update { check, version } => assert_eq!((check, version), (false, None)),
+            other => panic!("{other:?}"),
+        }
+        match Cli::try_parse_from(["csync", "update", "--check"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Update { check, version } => assert_eq!((check, version), (true, None)),
+            other => panic!("{other:?}"),
+        }
+        match Cli::try_parse_from(["csync", "update", "--version", "v0.1.0"])
+            .unwrap()
+            .cmd
+        {
+            Cmd::Update { check, version } => {
+                assert_eq!((check, version.as_deref()), (false, Some("v0.1.0")));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["csync", "update", "--check", "--version", "1.0.0"]).is_err());
+        assert!(Cli::try_parse_from(["csync", "update", "--version"]).is_err());
     }
 
     #[test]
