@@ -1,0 +1,66 @@
+name: bench
+
+# the end-to-end numbers in the README: a real host and a real FUSE guest in one container on a hosted runner.
+# runs by hand or when the harness itself changes; never part of ci-ok.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/bench-e2e.sh
+      - .github/workflows/bench.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fuse3
+          test -c /dev/fuse || sudo modprobe fuse
+          test -c /dev/fuse
+      - run: rustup toolchain install stable --profile minimal
+      # the corpus is the source of csync's own dependencies: real crates, a few hundred directories
+      - run: cargo fetch --locked
+      - name: three runs
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/target" "$RUNNER_TEMP/out"
+          echo "corpus crates: $(ls -d "$HOME"/.cargo/registry/src/*/* | wc -l)"
+          for run in 1 2 3; do
+            echo "::group::run $run"
+            docker run --rm --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor:unconfined \
+              -e CARGO_TARGET_DIR=/target -e CRATES=400 \
+              -v "$PWD":/src -v "$RUNNER_TEMP/target":/target \
+              -v "$HOME/.cargo/registry/src":/corpus:ro \
+              -v "$PWD/scripts/bench-e2e.sh":/bench.sh:ro -v "$RUNNER_TEMP/out":/out \
+              -w /src rust:1 bash /bench.sh 2>&1 | tee "$RUNNER_TEMP/out/run$run.txt"
+            echo "::endgroup::"
+          done
+          {
+            echo '## end-to-end benchmark'
+            for run in 1 2 3; do
+              echo "### run $run"
+              echo '```'
+              grep -E '^(corpus files|native |host start|join to|guest |idle |storm|churn|host log)' "$RUNNER_TEMP/out/run$run.txt" || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-output
+          path: ${{ runner.temp }}/out
