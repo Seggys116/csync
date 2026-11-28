@@ -2,6 +2,7 @@ use super::cache::{
     BlobCache, BlobRef, DELTA_CAP, Done, RemoteSlot, TmpBlob, WAIT, hash_fd, io_errno, lock,
     pread_full, pwrite_all, read_len, rpc_errno, wire_errno,
 };
+use super::peek;
 use super::pipe::{Payload, Pipe, Tag, Ticket};
 use super::tree::{GNode, NodeId, Vis};
 use crate::delta;
@@ -13,6 +14,7 @@ use crate::proto::{
     Notice, NoticeKind, Op, RelPath, Reply, Version, WireErr,
 };
 use crate::sys;
+use crate::tui::{feed::Entry, now_ms};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustc_hash::FxHashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -27,6 +29,7 @@ const BORROW_MIN: u64 = 1 << 20;
 const ASYNC_WAIT: Duration = Duration::from_secs(30);
 
 pub type NoticeFn = Arc<dyn Fn(Notice) + Send + Sync>;
+pub type FeedFn = Arc<dyn Fn(Entry) + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Flushed {
@@ -369,6 +372,7 @@ pub struct Writer {
     remote: Arc<RemoteSlot>,
     pipe: Arc<Pipe>,
     notice: NoticeFn,
+    feed: FeedFn,
     table: Mutex<Table>,
     jobs: Sender<Job>,
     jobs_rx: Receiver<Job>,
@@ -384,11 +388,18 @@ impl Writer {
             remote,
             pipe,
             notice,
+            feed: Arc::new(|_: Entry| {}),
             table: Mutex::new(Table::default()),
             jobs,
             jobs_rx,
             parked: Parked::default(),
         }
+    }
+
+    // where the activity feed hears of this guest's own writes; without it they are not reported
+    pub fn with_feed(mut self, feed: FeedFn) -> Self {
+        self.feed = feed;
+        self
     }
 
     // what the settler thread reads; a parked close is settled when the host's answer to its commit arrives
@@ -456,6 +467,10 @@ impl Writer {
             kind,
             path: path.clone(),
         });
+    }
+
+    fn log(&self, e: Entry) {
+        (self.feed)(e);
     }
 
     pub fn staging_fd(&self, id: u32) -> Option<Arc<OwnedFd>> {
@@ -1093,12 +1108,14 @@ impl Writer {
                     }
                     st.unpublished = tmp.is_borrowed().then_some(ver);
                     let _ = self.cache.publish(tmp, Some(&st.path));
+                    let old = st.base;
                     st.base = Some(ver);
                     st.base_ref = self.cache.get(&ver.hash);
                     st.synced = Some(stat);
                     if merged {
                         self.say(NoticeKind::Merged, &st.path);
                     }
+                    self.log(peek::commit_row(&st.path, old, ver, merged, now_ms()));
                     return Ok(Flushed::Committed { meta, merged });
                 }
                 Reply::Conflict { current, inline } => {
@@ -1372,6 +1389,15 @@ impl Writer {
 
     // on refusal the caller removes `from` locally; the host copy of a pipelined tmp is removed here
     pub fn rename(&self, r: RenameReq<'_>) -> Result<Meta, Refusal> {
+        let (from, to, to_expect, local) = (r.from, r.to, r.to_expect, r.local.is_some());
+        let out = self.rename_op(r);
+        if let Ok(meta) = &out {
+            self.log(peek::rename_row(from, to, to_expect, local, meta, now_ms()));
+        }
+        out
+    }
+
+    fn rename_op(&self, r: RenameReq<'_>) -> Result<Meta, Refusal> {
         let entry = r.staging.and_then(|id| self.entry(id));
         let mut guard = entry.as_ref().map(|e| lock(e));
         if let Some(st) = guard.as_deref_mut() {
@@ -1551,13 +1577,17 @@ impl Writer {
     }
 
     pub fn remove(&self, path: &RelPath, expect: Expect) -> Result<Meta, Refusal> {
-        self.simple(
+        let out = self.simple(
             path,
             Op::Remove {
                 path: path.clone(),
                 expect,
             },
-        )
+        );
+        if out.is_ok() {
+            self.log(peek::remove_row(path, expect, now_ms()));
+        }
+        out
     }
 
     pub fn setattr(
@@ -1610,6 +1640,7 @@ mod tests {
     use crate::guest::tree::{GTree, NodeId};
     use crate::net::rpc::ChunkSink;
     use crate::proto::{Change, ReqId, Seq, VerKey};
+    use crate::tui::feed::{By, What};
     use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1693,6 +1724,7 @@ mod tests {
         script: Arc<Script>,
         w: Writer,
         notes: Arc<Mutex<Vec<Notice>>>,
+        rows: Arc<Mutex<Vec<Entry>>>,
     }
 
     fn rig(tag: &str) -> Rig {
@@ -1720,17 +1752,21 @@ mod tests {
         );
         let notes = Arc::new(Mutex::new(Vec::new()));
         let n = notes.clone();
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let f = rows.clone();
         let w = Writer::new(
             cache.clone(),
             pipe,
             Arc::new(move |x: Notice| lock(&n).push(x)),
-        );
+        )
+        .with_feed(Arc::new(move |e: Entry| lock(&f).push(e)));
         Rig {
             d: Dir(p),
             cache,
             script,
             w,
             notes,
+            rows,
         }
     }
 
@@ -2709,5 +2745,130 @@ mod tests {
         assert_eq!(jobs.recv_timeout(JOB_WAIT), Ok(want));
         r.w.landed_done();
         assert!(r.w.drain(Instant::now()));
+    }
+
+    #[test]
+    fn a_commit_of_an_edit_reaches_the_feed_with_both_versions() {
+        let r = rig("feed-edit");
+        let p = RelPath::new("busy.txt").unwrap();
+        let (base, ours) = (b"one\ntwo\n", b"ONE\ntwo\n");
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let (vb, vo) = (ver(base), ver(ours));
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vo) }));
+        assert!(r.w.flush(id, false).is_ok());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Modified);
+        assert_eq!(rows[0].by, By::Local);
+        assert_eq!(rows[0].path, p);
+        assert_eq!(
+            (rows[0].old, rows[0].new, rows[0].size, rows[0].merged),
+            (Some(vb.hash), Some(vo.hash), vo.size, false)
+        );
+    }
+
+    #[test]
+    fn a_merged_commit_is_flagged_and_based_on_the_hosts_version() {
+        let r = rig("feed-merge");
+        let p = RelPath::new("src/lib.rs").unwrap();
+        let (base, ours, theirs) = (
+            b"one\ntwo\nthree\nfour\n",
+            b"ONE\ntwo\nthree\nfour\n",
+            b"one\ntwo\nthree\nFOUR\n",
+        );
+        let merged = b"ONE\ntwo\nthree\nFOUR\n";
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        let (vt, vm) = (ver(theirs), ver(merged));
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: Some(meta(vt)),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(vm) }));
+        assert!(r.w.flush(id, false).is_ok());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Modified);
+        assert!(rows[0].merged);
+        assert_eq!((rows[0].old, rows[0].new), (Some(vt.hash), Some(vm.hash)));
+    }
+
+    #[test]
+    fn a_new_file_reaches_the_feed_as_added_once_the_host_took_it() {
+        let r = rig("feed-new");
+        let p = RelPath::new("new.txt").unwrap();
+        let (id, fd) =
+            r.w.open_for_write(OpenW {
+                path: &p,
+                base: None,
+                perm: 0o644,
+                trunc: false,
+                staging: None,
+            })
+            .unwrap();
+        let body = b"fresh\n";
+        overwrite(fd.as_fd(), body).unwrap();
+        let v = ver(body);
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        assert_eq!(r.w.flush(id, false), Ok(Flushed::Sent(v)));
+        assert!(r.w.release(id).is_some());
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].what, rows[0].old), (What::Added, None));
+        assert_eq!((rows[0].new, rows[0].size), (Some(v.hash), v.size));
+    }
+
+    #[test]
+    fn a_refused_edit_leaves_no_row() {
+        let r = rig("feed-refused");
+        let p = RelPath::new("notes.txt").unwrap();
+        let (base, ours, theirs) = (
+            b"one\ntwo\nthree\n",
+            b"one\nours\nthree\n",
+            b"one\ntheirs\nthree\n",
+        );
+        let (id, _fd) = open_edit(&r, &p, base, ours);
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: Some(meta(ver(theirs))),
+            inline: Some(Bytes(theirs.to_vec())),
+        }));
+        assert!(r.w.flush(id, false).is_err());
+        assert!(lock(&r.rows).is_empty());
+    }
+
+    #[test]
+    fn a_remove_and_a_rename_reach_the_feed_only_when_the_host_agreed() {
+        let r = rig("feed-rm");
+        let f = RelPath::new("f").unwrap();
+        let v = ver(b"gone\n");
+        lock(&r.script.replies).push_back(Ok(Reply::Conflict {
+            current: None,
+            inline: None,
+        }));
+        assert!(r.w.remove(&f, Expect::Is(v)).is_err());
+        assert!(lock(&r.rows).is_empty());
+
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        r.w.remove(&f, Expect::Is(v)).unwrap();
+        lock(&r.script.replies).push_back(Ok(Reply::Done { meta: meta(v) }));
+        let to = RelPath::new("g").unwrap();
+        r.w.rename(RenameReq {
+            from: &f,
+            to: &to,
+            from_expect: Expect::Is(v),
+            to_expect: Expect::Absent,
+            staging: None,
+            local: None,
+            discard: false,
+        })
+        .unwrap();
+        let rows = lock(&r.rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].what, What::Removed);
+        assert_eq!((rows[0].old, rows[0].size), (Some(v.hash), v.size));
+        assert_eq!(rows[0].path, f);
+        assert_eq!(rows[1].what, What::Renamed);
+        assert_eq!(rows[1].by, By::Local);
+        assert_eq!(rows[1].path, to);
+        assert_eq!(rows[1].from, Some(f));
     }
 }

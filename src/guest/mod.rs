@@ -17,6 +17,8 @@ pub mod inject;
 #[cfg(target_os = "macos")]
 mod mount_mac;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod peek;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod pipe;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod prefetch;
@@ -37,14 +39,16 @@ mod live {
     #[cfg(target_os = "macos")]
     use super::inject::Boot;
     use super::inject::{Injector, InjectorThread};
+    use super::peek::{self, GuestPeek};
     use super::pipe::Pipe;
     use super::prefetch::{Hint, Prefetch, TreeView};
     use super::tree::{Effect, GDomain, GNode, GTree, NodeId, ROOT, Vis};
     use super::wipe::{self, HostPaths};
-    use super::write::{NoticeFn, Writer};
+    use super::write::{FeedFn, NoticeFn, Writer};
     use crate::config::{GuestCfg, ensure_private_dir};
     use crate::crypto::noise::Reject;
     use crate::crypto::trust::{Identity, PeerKey, TrustEntry, now_unix};
+    use crate::host::peek::rows_dropped;
     use crate::ignore::rules::{Class, Rules};
     use crate::net::conn::{self, CloseReason, Dial, In, Link, NetError, Session};
     use crate::net::rpc::Rpc;
@@ -53,6 +57,7 @@ mod live {
         NoticeKind, Op, PROTO, Push, RelPath, Reply, TEXT_MAX, VerKey, Want, Welcome,
         hs::{HsHello, PAIR_TIMEOUT_S, PairStep, Role},
     };
+    use crate::tui::feed::Entry;
     use crate::tui::{ConnState, PeerView, UiBus, UiCmd, now_ms};
     use crossbeam_channel::{
         Receiver, RecvTimeoutError, Sender, after, bounded, never, select, unbounded,
@@ -423,8 +428,12 @@ mod live {
             if let Some(l) = lock(&link).as_ref() {
                 let _ = l.send(Msg::Push(Push::Notice(n.clone())));
             }
-            bus.update(|s| s.push_notice(now_ms(), n));
+            bus.notice(now_ms(), n);
         })
+    }
+
+    fn feed_fn(bus: Arc<UiBus>) -> FeedFn {
+        Arc::new(move |e: Entry| bus.feed().push_batch([e]))
     }
 
     pub fn run(cfg: GuestCfg, bus: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Result<()> {
@@ -522,7 +531,10 @@ mod live {
         let notice = notice_fn(bus.clone(), link_slot.clone(), ctr.clone());
         let (landed, _) = unbounded();
         let pipe = Pipe::new(remote.clone(), landed)?;
-        let writer = Writer::new(cache.clone(), pipe.clone(), notice.clone());
+        let writer = Writer::new(cache.clone(), pipe.clone(), notice.clone())
+            .with_feed(feed_fn(bus.clone()));
+        bus.feed()
+            .set_source(Arc::new(GuestPeek::new(&cache, &tree)));
         let view: Arc<dyn TreeView> = tree.clone();
         let prefetch = Prefetch::start(cache.clone(), view)?;
         let overlay = rustix::fs::open(
@@ -1146,9 +1158,19 @@ mod live {
                             .collect()
                     };
                     let kept = |p: &RelPath| demote.iter().any(|d| p.starts_with(d));
+                    // only the newest changes are read for the feed, so a huge batch stays cheap under the lock
+                    let feed_from = self.bus.feed().is_on().then(|| rows_dropped(changes.len()));
+                    let mut prior = Vec::new();
                     {
                         let mut t = self.core.tw();
-                        for c in &changes {
+                        for (i, c) in changes.iter().enumerate() {
+                            if feed_from.is_some_and(|f| i >= f) {
+                                let was = t
+                                    .resolve(peek::prior_path(c))
+                                    .and_then(|id| t.get(id))
+                                    .map(|n| n.meta.clone());
+                                prior.push((i, was));
+                            }
                             if let Change::Remove { path } = c
                                 && kept(path)
                             {
@@ -1158,6 +1180,12 @@ mod live {
                         }
                         let index = t.index_id();
                         t.set_version(index, seq);
+                    }
+                    if let Some(first) = feed_from {
+                        let rows = peek::remote_rows(&changes, first, &prior, now_ms(), seq);
+                        if !rows.is_empty() {
+                            self.bus.feed().push_batch(rows);
+                        }
                     }
                     {
                         let r = self.core.rules();
@@ -1185,7 +1213,7 @@ mod live {
                     self.queue(fx);
                     self.synced(seq, false)?;
                 }
-                Push::Notice(n) => self.bus.update(|s| s.push_notice(now_ms(), n)),
+                Push::Notice(n) => self.bus.notice(now_ms(), n),
                 // a pushed hash only labels a node: bytes fetched by it are verified before they are stored
                 Push::Hashes { index, items } => {
                     let applied: Vec<(RelPath, NodeId, Hash32)> = {

@@ -1,6 +1,7 @@
 pub mod apply;
 pub mod commit;
 pub mod hasher;
+pub(crate) mod peek;
 pub mod serve;
 
 use crate::crypto::trust::{Identity, PeerKey, Trust, TrustEntry, ensure_private_dir, now_unix};
@@ -24,7 +25,8 @@ use crate::proto::{
     path::TMP_PREFIX,
 };
 use crate::sys::{self, WatchEvent, wflag};
-use crate::tui::{ConnState, NOTICES_MAX, PairPrompt, PeerView, UiBus, UiCmd, UiSnapshot};
+use crate::tui::feed::{By, Entry, What};
+use crate::tui::{ConnState, PairPrompt, PeerView, UiBus, UiCmd, UiSnapshot};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, at, bounded, never, select};
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
@@ -391,6 +393,77 @@ pub(crate) fn batches(changes: Vec<Change>) -> Vec<(usize, Vec<Change>)> {
         out.push((done, cur));
     }
     out
+}
+
+fn unnamed_guest() -> Name {
+    Name::new("guest").expect("static name")
+}
+
+// a change carries no earlier state, so a file upsert cannot be told from an addition and reads as modified
+fn feed_row(c: &Change, by: &By, ts_ms: u64, seq: Seq) -> Entry {
+    let base = Entry {
+        id: 0,
+        ts_ms,
+        what: What::Modified,
+        by: by.clone(),
+        path: RelPath::root(),
+        from: None,
+        size: 0,
+        old: None,
+        new: None,
+        ver: seq,
+        merged: false,
+    };
+    match c {
+        Change::Upsert { path, meta, ver } => Entry {
+            what: match meta.kind {
+                Kind::File => What::Modified,
+                Kind::Dir => What::DirAdded,
+                Kind::Symlink => What::Link,
+            },
+            path: path.clone(),
+            size: meta.size,
+            new: meta.hash,
+            ver: *ver,
+            ..base
+        },
+        Change::Remove { path } => Entry {
+            what: What::Removed,
+            path: path.clone(),
+            ..base
+        },
+        Change::Rename { from, to } => Entry {
+            what: What::Renamed,
+            path: to.clone(),
+            from: Some(from.clone()),
+            ..base
+        },
+    }
+}
+
+// a directory upsert is mostly its mtime moving because a child came or went, and cannot be told from a new
+// directory here, so it gets no row; the files inside it do
+fn shown_in_feed(c: &&Change) -> bool {
+    !matches!(c, Change::Upsert { meta, .. } if meta.kind == Kind::Dir)
+}
+
+// only the newest rows are mapped; the rest become the one Burst row that the feed would have made itself
+fn feed_rows(changes: &[Change], by: &By, ts_ms: u64, seq: Seq) -> Vec<Entry> {
+    let total = changes.iter().filter(shown_in_feed).count();
+    let skipped = peek::rows_dropped(total);
+    let mut rows: Vec<Entry> = changes
+        .iter()
+        .rev()
+        .filter(shown_in_feed)
+        .take(total - skipped)
+        .map(|c| feed_row(c, by, ts_ms, seq))
+        .collect();
+    rows.reverse();
+    if skipped > 0 {
+        let ver = rows.last().map_or(seq, |r| r.ver);
+        rows.push(peek::burst_entry(skipped, ts_ms, by, ver));
+    }
+    rows
 }
 
 // a guest that just received the tree can pull every hash it lacks once the host has none pending
@@ -784,13 +857,36 @@ impl Core {
                 }
             }
         }
-        let t = now_ms();
-        self.ui(|s| {
-            s.notices.push_back((t, n));
-            while s.notices.len() > NOTICES_MAX {
-                s.notices.pop_front();
-            }
-        });
+        if let Some(u) = &self.ui {
+            u.notice(now_ms(), n);
+        }
+    }
+
+    // the feed keeps only the newest rows, so a huge batch costs O(FEED_MAX) under the tree lock
+    fn feed_changes(
+        &self,
+        changes: &[Change],
+        origin: Option<u64>,
+        guests: &[Arc<Guest>],
+        seq: Seq,
+    ) {
+        let Some(bus) = self.ui.as_ref().filter(|u| u.feed().is_on()) else {
+            return;
+        };
+        let by = match origin {
+            None => By::Host,
+            Some(id) => By::Guest {
+                id,
+                name: guests
+                    .iter()
+                    .find(|g| g.id == id)
+                    .map_or_else(unnamed_guest, |g| g.name.clone()),
+            },
+        };
+        let rows = feed_rows(changes, &by, now_ms(), seq);
+        if !rows.is_empty() {
+            bus.feed().push_batch(rows);
+        }
     }
 
     // runs with the tree lock held so guests see batches in seq order
@@ -805,6 +901,7 @@ impl Core {
         }
         let seq = tree.seq();
         let guests = lock(&self.hub.guests);
+        self.feed_changes(&changes, origin, &guests, seq);
         if guests.is_empty() {
             return;
         }
@@ -1212,6 +1309,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     core.kick = Some(kick_tx);
     core.echoes = echoes;
     let core = Arc::new(core);
+    ui.feed().set_source(Arc::new(peek::HostPeek::new(&core)));
     let busy = core.stats_to_ui();
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
@@ -2051,6 +2149,7 @@ mod tests {
     use super::*;
     use crate::index::tree::Observed;
     use crate::proto::{Expect, Version};
+    use crate::tui::feed::FEED_MAX;
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
@@ -2766,5 +2865,158 @@ mod tests {
         }));
         let rtt = bus.read().peers[0].rtt_us;
         assert!((5_000..60_000_000).contains(&rtt), "{rtt}");
+    }
+
+    fn feed_meta(kind: Kind) -> Meta {
+        Meta {
+            kind,
+            perm: 0o644,
+            size: 3,
+            mtime_ns: 0,
+            ctime_ns: 0,
+            hash: Some([7; 32]),
+            link: None,
+            git_ro: false,
+        }
+    }
+
+    fn upsert(path: &str, kind: Kind, ver: Seq) -> Change {
+        Change::Upsert {
+            path: RelPath::new(path).unwrap(),
+            meta: feed_meta(kind),
+            ver,
+        }
+    }
+
+    #[test]
+    fn changes_become_feed_rows_by_kind() {
+        let changes = vec![
+            upsert("f", Kind::File, 4),
+            upsert("d", Kind::Dir, 5),
+            upsert("l", Kind::Symlink, 6),
+            Change::Remove {
+                path: RelPath::new("gone").unwrap(),
+            },
+            Change::Rename {
+                from: RelPath::new("a").unwrap(),
+                to: RelPath::new("b").unwrap(),
+            },
+        ];
+        let rows = feed_rows(&changes, &By::Host, 1_000, 9);
+        let kinds: Vec<What> = rows.iter().map(|r| r.what).collect();
+        // the directory upsert is only its mtime moving, so it has no row
+        assert_eq!(
+            kinds,
+            vec![What::Modified, What::Link, What::Removed, What::Renamed]
+        );
+        assert_eq!(rows[0].path.as_str(), "f");
+        assert_eq!(
+            (rows[0].size, rows[0].new, rows[0].ver),
+            (3, Some([7; 32]), 4)
+        );
+        assert_eq!(rows[1].path.as_str(), "l");
+        assert_eq!(rows[2].path.as_str(), "gone");
+        assert_eq!((rows[2].new, rows[2].ver), (None, 9));
+        assert_eq!(rows[3].path.as_str(), "b");
+        assert_eq!(rows[3].from.as_ref().map(RelPath::as_str), Some("a"));
+        assert!(rows.iter().all(|r| r.by == By::Host && r.ts_ms == 1_000));
+        assert!(rows.iter().all(|r| r.old.is_none() && !r.merged));
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_maps_only_its_tail_and_ends_in_one_burst_row() {
+        let over = FEED_MAX + 45;
+        let mut changes: Vec<Change> = (0..over)
+            .map(|i| upsert(&format!("f{i}"), Kind::File, i as Seq))
+            .collect();
+        // directory upserts do not count towards the burst
+        changes.push(upsert("d", Kind::Dir, 1));
+        let rows = feed_rows(&changes, &By::Host, 1, over as Seq);
+        assert_eq!(rows.len(), FEED_MAX);
+        let skipped = over - (FEED_MAX - 1);
+        let Some(last) = rows.last() else {
+            panic!("no rows")
+        };
+        assert_eq!(last.what, What::Burst(skipped as u32));
+        assert!(last.path.is_root());
+        assert_eq!(rows[0].path.as_str(), format!("f{skipped}"));
+        assert_eq!(rows[FEED_MAX - 2].path.as_str(), format!("f{}", over - 1));
+
+        let exact: Vec<Change> = changes[..FEED_MAX].to_vec();
+        let rows = feed_rows(&exact, &By::Host, 1, 1);
+        assert_eq!(rows.len(), FEED_MAX);
+        assert!(rows.iter().all(|r| !matches!(r.what, What::Burst(_))));
+    }
+
+    #[test]
+    fn a_published_batch_reaches_an_enabled_feed_with_its_origin() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        bus.feed().enable();
+        lock(&s.core.hub.guests).push(s.g.clone());
+        {
+            let tree = s.core.tree();
+            s.core
+                .publish_locked(&tree, vec![upsert("a", Kind::File, 1)], None);
+            s.core.publish_locked(
+                &tree,
+                vec![upsert("b", Kind::File, 2), upsert("c", Kind::Symlink, 3)],
+                Some(s.g.id),
+            );
+            s.core
+                .publish_locked(&tree, vec![upsert("d", Kind::File, 4)], Some(s.g.id + 40));
+        }
+        let rows = bus.feed().window(None, 10);
+        let got: Vec<(&str, &By)> = rows
+            .iter()
+            .rev()
+            .map(|r| (r.path.as_str(), &r.by))
+            .collect();
+        let named = |id: u64, n: &str| By::Guest {
+            id,
+            name: Name::new(n).unwrap(),
+        };
+        assert_eq!(
+            got,
+            vec![
+                ("a", &By::Host),
+                ("b", &named(s.g.id, "g")),
+                ("c", &named(s.g.id, "g")),
+                ("d", &named(s.g.id + 40, "guest")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_disabled_feed_gets_nothing_and_maps_nothing() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        {
+            let tree = s.core.tree();
+            s.core
+                .publish_locked(&tree, vec![upsert("a", Kind::File, 1)], None);
+        }
+        assert_eq!(bus.feed().version(), 0);
+        assert!(bus.feed().is_empty());
+    }
+
+    #[test]
+    fn a_notice_reaches_the_snapshot_and_the_feed() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        bus.feed().enable();
+        s.core.notice(
+            Notice {
+                kind: NoticeKind::Refused,
+                path: RelPath::new("x").unwrap(),
+            },
+            false,
+        );
+        let snap = bus.read();
+        assert_eq!(snap.notices.len(), 1);
+        let rows = bus.feed().window(None, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, What::Notice(NoticeKind::Refused));
+        assert_eq!(rows[0].path.as_str(), "x");
     }
 }

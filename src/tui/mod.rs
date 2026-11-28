@@ -3,7 +3,9 @@ use crossbeam_channel::Sender;
 use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, sync::Mutex};
 
 pub mod anim;
+pub mod diff;
 pub mod dither;
+pub mod feed;
 pub mod theme;
 pub mod view;
 pub mod widgets;
@@ -96,13 +98,42 @@ pub enum UiCmd {
 pub struct UiBus {
     snap: Mutex<UiSnapshot>,
     wake: Sender<()>,
+    role: Role,
+    feed: feed::FeedSlot,
+    // bumped by every update, so the interactive loop can tell a wake that changed nothing
+    ver: AtomicU64,
 }
 impl UiBus {
     pub fn update(&self, f: impl FnOnce(&mut UiSnapshot)) {
         if let Ok(mut s) = self.snap.lock() {
             f(&mut s);
         }
+        self.ver.fetch_add(1, Ordering::Release);
         let _ = self.wake.try_send(());
+    }
+    pub fn feed(&self) -> &feed::FeedSlot {
+        &self.feed
+    }
+    // a notice goes to the snapshot as always and is mirrored into the activity feed
+    pub fn notice(&self, ts_ms: u64, n: Notice) {
+        let by = match self.role {
+            Role::Host => feed::By::Host,
+            Role::Guest => feed::By::Local,
+        };
+        self.feed.push_batch([feed::Entry {
+            id: 0,
+            ts_ms,
+            what: feed::What::Notice(n.kind),
+            by,
+            path: n.path.clone(),
+            from: None,
+            size: 0,
+            old: None,
+            new: None,
+            ver: 0,
+            merged: false,
+        }]);
+        self.update(|s| s.push_notice(ts_ms, n));
     }
     pub fn read(&self) -> UiSnapshot {
         self.snap
@@ -113,32 +144,38 @@ impl UiBus {
 }
 
 use crossbeam_channel::{Receiver, at, bounded, never, select};
+use diff::{DiffSource, DiffView};
+use feed::{Entry, FeedSlot};
 use ratatui::{
     DefaultTerminal, Terminal,
     backend::Backend,
     buffer::Buffer,
     crossterm::{
+        Command,
         event::{
             self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste,
-            EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+            EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton,
+            MouseEvent, MouseEventKind,
         },
         execute, queue,
         terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate},
     },
+    layout::Rect,
 };
 use std::{
-    fmt::Write as _,
+    fmt::{self, Write as _},
     io::{self, BufRead, Read, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{
         Arc, Once,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use theme::Depth;
-use view::ViewState;
+use view::{FeedUi, Focus, Hits, ViewState};
 
 const FRAME_MIN: Duration = anim::FRAME;
 const UNFOCUSED_FRAME: Duration = Duration::from_secs(1);
@@ -146,6 +183,8 @@ const CMD_TIMEOUT: Duration = Duration::from_secs(1);
 const INPUT_QUEUE: usize = 64;
 const LINE_MAX: u64 = 4096;
 const REPORT_NOTICES: usize = 20;
+// producers push into the feed without waking the screen, so a focused one looks now and then
+const FEED_POLL: Duration = Duration::from_millis(250);
 
 // per-peer transfer counters, kept beside PeerView so producers update them in place
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -242,6 +281,9 @@ impl UiBus {
             Arc::new(Self {
                 snap: Mutex::new(UiSnapshot::new(role)),
                 wake,
+                role,
+                feed: feed::FeedSlot::default(),
+                ver: AtomicU64::new(0),
             }),
             rx,
         )
@@ -252,7 +294,104 @@ enum Action {
     None,
     Redraw,
     Cmd(UiCmd),
+    // the view state already holds the open diff; this is the entry to compute it for
+    Open(Box<Entry>),
     Quit,
+}
+
+// rows or lines one wheel notch moves
+const WHEEL_ROWS: usize = 3;
+
+fn open_selected(f: &mut FeedUi) -> Action {
+    match f.open() {
+        Some(e) => Action::Open(Box::new(e)),
+        None => Action::None,
+    }
+}
+
+fn diff_key(code: KeyCode, vs: &mut ViewState, repeat: bool) -> Option<Action> {
+    let page = vs.feed.diff_page();
+    let f = &mut vs.feed;
+    match code {
+        KeyCode::Esc if !repeat => {
+            f.close_diff();
+        }
+        KeyCode::Up | KeyCode::Char('k') => f.scroll_diff(false, 1),
+        KeyCode::Down | KeyCode::Char('j') => f.scroll_diff(true, 1),
+        KeyCode::PageUp => f.scroll_diff(false, page),
+        KeyCode::PageDown | KeyCode::Char(' ') => f.scroll_diff(true, page),
+        KeyCode::Home => f.scroll_diff(false, usize::MAX),
+        KeyCode::End => f.scroll_diff(true, usize::MAX),
+        _ => return None,
+    }
+    Some(Action::Redraw)
+}
+
+// keys for the activity panel; None leaves the key to the rest of the screen
+fn feed_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState, repeat: bool) -> Option<Action> {
+    if vs.feed.diff.is_some() {
+        return diff_key(k.code, vs, repeat);
+    }
+    let host = s.role == Role::Host;
+    let page = vs.feed.page();
+    let f = &mut vs.feed;
+    let active = !host || f.focus == Focus::Activity;
+    match k.code {
+        KeyCode::Tab if host && !repeat => {
+            f.focus = if active {
+                Focus::Guests
+            } else {
+                Focus::Activity
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') if active => f.step(false, 1),
+        KeyCode::Down | KeyCode::Char('j') if active => f.step(true, 1),
+        KeyCode::PageUp if active => f.step(false, page),
+        KeyCode::PageDown if active => f.step(true, page),
+        // the list runs newest first, so Home goes to the oldest row and End back to the newest
+        KeyCode::Home if active => f.select(1),
+        KeyCode::End if active => f.resume(),
+        KeyCode::Enter if active && !repeat => return Some(open_selected(f)),
+        KeyCode::Esc
+            if !repeat && (f.anchor.is_some() || !f.follow || f.focus == Focus::Activity) =>
+        {
+            f.resume();
+            f.focus = Focus::Guests;
+        }
+        _ => return None,
+    }
+    Some(Action::Redraw)
+}
+
+fn on_mouse(ev: MouseEvent, hits: &Hits, vs: &mut ViewState) -> Action {
+    if !view::wants_mouse(vs) {
+        return Action::None;
+    }
+    let down = match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if vs.feed.diff.is_some() {
+                return Action::None;
+            }
+            let Some(id) = hits.row_at(ev.column, ev.row) else {
+                return Action::None;
+            };
+            vs.feed.focus = Focus::Activity;
+            if vs.feed.anchor == Some(id) {
+                return open_selected(&mut vs.feed);
+            }
+            vs.feed.select(id);
+            return Action::Redraw;
+        }
+        MouseEventKind::ScrollDown => true,
+        MouseEventKind::ScrollUp => false,
+        _ => return Action::None,
+    };
+    if vs.feed.diff.is_some() {
+        vs.feed.scroll_diff(down, WHEEL_ROWS);
+    } else {
+        vs.feed.scroll(down, WHEEL_ROWS);
+    }
+    Action::Redraw
 }
 
 fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
@@ -278,6 +417,11 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
         Role::Guest => s.hosts.len(),
     };
     let prompt = view::guest_prompt(s).is_some();
+    if view::feed_live(s, vs)
+        && let Some(a) = feed_key(k, s, vs, repeat)
+    {
+        return a;
+    }
     match (s.role, k.code) {
         (_, KeyCode::Up | KeyCode::Char('k')) => {
             vs.sel = vs.sel.saturating_sub(1);
@@ -317,6 +461,50 @@ fn on_key(k: KeyEvent, s: &UiSnapshot, vs: &mut ViewState) -> Action {
 
 static FOCUS_REPORTING: AtomicBool = AtomicBool::new(false);
 static PASTE_REPORTING: AtomicBool = AtomicBool::new(false);
+static MOUSE_REPORTING: AtomicBool = AtomicBool::new(false);
+
+// button presses and the wheel only, never motion; the SGR form keeps wide terminals addressable
+struct MouseMode(bool);
+
+impl Command for MouseMode {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str(if self.0 {
+            "\x1b[?1000h\x1b[?1006h"
+        } else {
+            "\x1b[?1000l\x1b[?1006l"
+        })
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+fn mouse_off() {
+    if MOUSE_REPORTING.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), MouseMode(false));
+    }
+}
+
+fn mouse_on() -> io::Result<()> {
+    execute!(io::stdout(), MouseMode(true))?;
+    MOUSE_REPORTING.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+// capture is held only while the activity panel can be clicked, so codes and addresses elsewhere stay selectable
+fn mouse_follow(on: &mut bool, want: bool) {
+    if want == *on {
+        return;
+    }
+    if want {
+        *on = mouse_on().is_ok();
+    } else {
+        mouse_off();
+        *on = false;
+    }
+}
 
 fn focus_off() {
     if FOCUS_REPORTING.swap(false, Ordering::SeqCst) {
@@ -363,6 +551,7 @@ fn focus_on() -> io::Result<()> {
         std::panic::set_hook(Box::new(move |info| {
             focus_off();
             paste_off();
+            mouse_off();
             prev(info);
         }));
     });
@@ -377,6 +566,7 @@ impl Drop for Restore {
     fn drop(&mut self) {
         focus_off();
         paste_off();
+        mouse_off();
         ratatui::restore();
     }
 }
@@ -407,6 +597,20 @@ impl Screen {
         self.vs.deadline(&self.snap)
     }
 
+    // copies the rows the panel will show, and only when the feed or the view moved
+    fn sync_feed(&mut self, slot: &FeedSlot, area: Rect) {
+        let Self { snap, vs, .. } = self;
+        if !vs.feed.on {
+            return;
+        }
+        let rows = view::feed_rows(snap, vs, area);
+        let ver = slot.version();
+        if vs.feed.needs(rows, ver) {
+            let win = slot.window(vs.feed.view, rows);
+            vs.feed.set_rows(win, slot.len(), rows, ver);
+        }
+    }
+
     fn render<B: Backend>(
         &mut self,
         term: &mut Terminal<B>,
@@ -426,6 +630,7 @@ impl Screen {
             Role::Guest => snap.hosts.len(),
         };
         vs.sel = vs.sel.min(len.saturating_sub(1));
+        let mut hits = Hits::default();
         let frame = term
             .draw(|f| {
                 let area = f.area();
@@ -439,7 +644,7 @@ impl Screen {
                     vs.scene = scene;
                     vs.trans = Some(now);
                 }
-                view::draw(f, snap, vs);
+                hits = view::draw(f, snap, vs);
                 if let Some(t0) = vs.trans {
                     let p = anim::progress(t0, now, anim::TRANSITION);
                     if p < 1.0 && from.area == area {
@@ -450,6 +655,7 @@ impl Screen {
                 }
             })
             .map_err(|e| io::Error::other(e.to_string()))?;
+        vs.feed.hits = hits;
         if shown.area == frame.buffer.area {
             for (d, s) in shown.content.iter_mut().zip(&frame.buffer.content) {
                 d.clone_from(s);
@@ -464,7 +670,14 @@ impl Screen {
 }
 
 // one frame wrapped in a synchronized update so terminals that support it never show a torn dissolve
-fn frame(term: &mut DefaultTerminal, screen: &mut Screen, now: Instant) -> io::Result<()> {
+fn frame(
+    term: &mut DefaultTerminal,
+    screen: &mut Screen,
+    slot: &FeedSlot,
+    now: Instant,
+) -> io::Result<()> {
+    let size = term.size()?;
+    screen.sync_feed(slot, Rect::new(0, 0, size.width, size.height));
     queue!(term.backend_mut(), BeginSynchronizedUpdate)?;
     let r = screen.render(term, now, now_ms());
     queue!(term.backend_mut(), EndSynchronizedUpdate)?;
@@ -494,6 +707,113 @@ fn on_signal(sig: i32, ends: &mut Ends<'_>, cmds: &Sender<UiCmd>) -> bool {
     }
     let _ = cmds.send_timeout(UiCmd::Quit, CMD_TIMEOUT);
     false
+}
+
+fn failed_view(why: &str) -> DiffView {
+    DiffView {
+        label: "",
+        added: 0,
+        removed: 0,
+        lines: Vec::new(),
+        cut: None,
+        unavailable: Some(why.to_owned()),
+        detail: None,
+    }
+}
+
+fn compute_diff(source: Option<&dyn DiffSource>, entry: &Entry) -> DiffView {
+    let Some(source) = source else {
+        return failed_view("no earlier version is kept for this session");
+    };
+    catch_unwind(AssertUnwindSafe(|| diff::render(&source.sides(entry))))
+        .unwrap_or_else(|_| failed_view("the diff could not be computed"))
+}
+
+// one short-lived thread per open diff, and only one at a time; a newer open waits its turn and replaces an older waiting one
+struct DiffWorker {
+    tx: Sender<(u64, DiffView)>,
+    rx: Receiver<(u64, DiffView)>,
+    busy: bool,
+    queued: Option<(u64, Entry)>,
+}
+
+impl DiffWorker {
+    fn new() -> Self {
+        let (tx, rx) = bounded(2);
+        Self {
+            tx,
+            rx,
+            busy: false,
+            queued: None,
+        }
+    }
+
+    fn start(&mut self, req: u64, entry: Entry, slot: &FeedSlot) {
+        if self.busy {
+            self.queued = Some((req, entry));
+            return;
+        }
+        self.busy = true;
+        let source = slot.source();
+        let tx = self.tx.clone();
+        let spawned = thread::Builder::new().name("csync-diff".into()).spawn({
+            let tx = tx.clone();
+            move || {
+                let view = compute_diff(source.as_deref(), &entry);
+                let _ = tx.send((req, view));
+            }
+        });
+        if spawned.is_err() {
+            let _ = tx.try_send((req, failed_view("could not start the diff")));
+        }
+    }
+
+    // whether the screen changed
+    fn finish(&mut self, vs: &mut ViewState, slot: &FeedSlot, req: u64, view: DiffView) -> bool {
+        self.busy = false;
+        let shown = vs.feed.finish(req, view);
+        if let Some((next, entry)) = self.queued.take()
+            && vs.feed.diff.as_ref().is_some_and(|d| d.req == next)
+        {
+            self.start(next, entry, slot);
+        }
+        shown
+    }
+}
+
+enum Step {
+    Idle,
+    Dirty,
+    ForceQuit,
+}
+
+fn apply(
+    act: Action,
+    vs: &mut ViewState,
+    cmds: &Sender<UiCmd>,
+    worker: &mut DiffWorker,
+    slot: &FeedSlot,
+) -> Step {
+    match act {
+        Action::None => Step::Idle,
+        Action::Redraw => Step::Dirty,
+        Action::Cmd(c) => {
+            let _ = cmds.send_timeout(c, CMD_TIMEOUT);
+            Step::Dirty
+        }
+        Action::Open(entry) => {
+            worker.start(vs.feed.req, *entry, slot);
+            Step::Dirty
+        }
+        Action::Quit => {
+            if vs.quitting {
+                return Step::ForceQuit;
+            }
+            vs.quitting = true;
+            let _ = cmds.send_timeout(UiCmd::Quit, CMD_TIMEOUT);
+            Step::Dirty
+        }
+    }
 }
 
 // outer error: the terminal failed; inner: the worker's own result
@@ -527,7 +847,15 @@ pub fn run_interactive(
         })?;
     let mut input_open = true;
     let mut sig_open = true;
+    let slot = bus.feed();
+    slot.enable();
+    let mut seen_ver = bus.ver.load(Ordering::Acquire);
+    let mut seen_feed = slot.version();
     let mut screen = Screen::new(bus.read(), Depth::detect(), Instant::now());
+    screen.vs.feed.on = true;
+    let mut worker = DiffWorker::new();
+    let mut mouse = false;
+    let mut poll_at = Instant::now() + FEED_POLL;
     let mut dirty = true;
     let mut urgent = false;
     loop {
@@ -539,30 +867,61 @@ pub fn run_interactive(
             .is_none_or(|t| now.saturating_duration_since(t) >= gap);
         let due = screen.deadline().is_some_and(|d| d <= now);
         if (dirty || due) && ready {
-            frame(&mut term, &mut screen, now)?;
+            frame(&mut term, &mut screen, slot, now)?;
+            mouse_follow(&mut mouse, view::wants_mouse(&screen.vs));
             dirty = false;
             urgent = false;
         }
-        // with nothing dirty and nothing animating there is no timer at all
+        // with nothing dirty and nothing animating the only timer is the slow feed check
         let target = if dirty { Some(now) } else { screen.deadline() };
         let gap = frame_gap(screen.vs.focused, urgent);
         let timer = match target {
             Some(d) => at(screen.last.map_or(d, |t| d.max(t + gap))),
             None => never(),
         };
+        let poll = if screen.vs.focused {
+            at(poll_at)
+        } else {
+            never()
+        };
         let input = if input_open { irx.clone() } else { never() };
         let sigs = if sig_open { signals.clone() } else { never() };
+        let results = worker.rx.clone();
         let vs = &mut screen.vs;
         select! {
             recv(wake) -> _ => {
-                let fresh = bus.read();
-                if fresh != screen.snap {
-                    if !vs.focused && prompt_appeared(&screen.snap, &fresh) {
-                        urgent = true;
-                        bell();
+                let v = bus.ver.load(Ordering::Acquire);
+                if v != seen_ver {
+                    seen_ver = v;
+                    let fresh = bus.read();
+                    if fresh != screen.snap {
+                        if !vs.focused && prompt_appeared(&screen.snap, &fresh) {
+                            urgent = true;
+                            bell();
+                        }
+                        screen.snap = fresh;
+                        vs.touch(Instant::now());
+                        dirty = true;
                     }
-                    screen.snap = fresh;
-                    vs.touch(Instant::now());
+                }
+                let fv = slot.version();
+                if fv != seen_feed {
+                    seen_feed = fv;
+                    dirty = true;
+                }
+            },
+            recv(poll) -> _ => {
+                poll_at = Instant::now() + FEED_POLL;
+                let fv = slot.version();
+                if fv != seen_feed {
+                    seen_feed = fv;
+                    dirty = true;
+                }
+            },
+            recv(results) -> r => {
+                if let Ok((req, done_view)) = r
+                    && worker.finish(vs, slot, req, done_view)
+                {
                     dirty = true;
                 }
             },
@@ -575,21 +934,21 @@ pub fn run_interactive(
                 }
                 Ok(Event::Key(k)) => {
                     vs.touch(Instant::now());
-                    match on_key(k, &screen.snap, vs) {
-                        Action::None => {}
-                        Action::Redraw => dirty = true,
-                        Action::Cmd(c) => {
-                            let _ = cmds.send_timeout(c, CMD_TIMEOUT);
-                            dirty = true;
-                        }
-                        Action::Quit => {
-                            if vs.quitting {
-                                return Ok(Err(forced()));
-                            }
-                            vs.quitting = true;
-                            let _ = cmds.send_timeout(UiCmd::Quit, CMD_TIMEOUT);
-                            dirty = true;
-                        }
+                    let act = on_key(k, &screen.snap, vs);
+                    match apply(act, vs, cmds, &mut worker, slot) {
+                        Step::Idle => {}
+                        Step::Dirty => dirty = true,
+                        Step::ForceQuit => return Ok(Err(forced())),
+                    }
+                }
+                Ok(Event::Mouse(m)) => {
+                    vs.touch(Instant::now());
+                    let hits = vs.feed.hits.clone();
+                    let act = on_mouse(m, &hits, vs);
+                    match apply(act, vs, cmds, &mut worker, slot) {
+                        Step::Idle => {}
+                        Step::Dirty => dirty = true,
+                        Step::ForceQuit => return Ok(Err(forced())),
                     }
                 }
                 Ok(Event::Resize(..)) => dirty = true,
@@ -1414,7 +1773,11 @@ mod tests {
         sc.render(&mut term, end, 1_004_400).unwrap();
         assert_eq!(sc.vs.trans, None);
         let mut plain = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        plain.draw(|f| view::draw(f, &sc.snap, &sc.vs)).unwrap();
+        plain
+            .draw(|f| {
+                view::draw(f, &sc.snap, &sc.vs);
+            })
+            .unwrap();
         assert_eq!(&sc.shown, plain.backend().buffer());
         assert!(
             sc.deadline().is_some(),
@@ -1565,5 +1928,610 @@ mod tests {
         assert!(prompt_appeared(&guest, &waiting));
         guest.pairing = Some(pairing(1));
         assert!(!prompt_appeared(&guest, &waiting));
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        key(code, KeyEventKind::Press)
+    }
+
+    fn feed_entry(id: u64) -> Entry {
+        Entry {
+            id,
+            ts_ms: id,
+            what: feed::What::Modified,
+            by: feed::By::Host,
+            path: RelPath::new(&format!("f{id}")).unwrap(),
+            from: None,
+            size: 0,
+            old: None,
+            new: None,
+            ver: 0,
+            merged: false,
+        }
+    }
+
+    // a host showing ids 20 down to 11 of a ring of 20, drawn at x 2..62 from y 5
+    fn feed_vs() -> ViewState {
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        vs.scene = view::Scene::Host;
+        vs.feed.on = true;
+        let rows: Vec<Entry> = (11..=20).rev().map(feed_entry).collect();
+        let ids = rows.iter().map(|e| e.id).collect();
+        vs.feed.set_rows(rows, 20, 10, 1);
+        vs.feed.hits = Hits {
+            rows: Rect::new(2, 5, 60, 10),
+            ids,
+            diff: None,
+        };
+        vs
+    }
+
+    fn live_guest() -> UiSnapshot {
+        let mut s = UiSnapshot::new(Role::Guest);
+        s.host_addr = Some("10.0.0.2:47480".parse().unwrap());
+        s.mounted = true;
+        s.peers.push(PeerView {
+            id: 9,
+            name: Name::new("h").unwrap(),
+            fpr: [1; 8],
+            state: ConnState::Live,
+            rtt_us: 100,
+        });
+        s
+    }
+
+    fn text_lines(n: usize) -> DiffView {
+        DiffView {
+            label: "this change",
+            added: 0,
+            removed: 0,
+            lines: (0..n)
+                .map(|i| diff::DiffLine {
+                    kind: diff::Kind::Context,
+                    text: format!("line {i}"),
+                })
+                .collect(),
+            cut: None,
+            unavailable: None,
+            detail: None,
+        }
+    }
+
+    fn with_open_diff(vs: &mut ViewState, lines: usize) {
+        vs.feed.diff = Some(view::OpenDiff {
+            req: 1,
+            entry: feed_entry(20),
+            body: view::DiffBody::Ready(text_lines(lines)),
+            scroll: 0,
+        });
+        vs.feed.hits.diff = Some(Rect::new(0, 0, 40, 4));
+    }
+
+    fn scroll_of(vs: &ViewState) -> usize {
+        vs.feed.diff.as_ref().map_or(usize::MAX, |d| d.scroll)
+    }
+
+    #[test]
+    fn tab_moves_the_host_focus_and_the_arrows_follow_it() {
+        let s = sample();
+        let mut vs = feed_vs();
+        assert!(matches!(
+            on_key(press(KeyCode::Down), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, None, "the guests list has the focus");
+        assert!(matches!(
+            on_key(press(KeyCode::Tab), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.focus, Focus::Activity);
+        for (code, want) in [
+            (KeyCode::Down, 20),
+            (KeyCode::Down, 19),
+            (KeyCode::Char('j'), 18),
+            (KeyCode::Up, 19),
+            (KeyCode::Char('k'), 20),
+        ] {
+            assert!(matches!(on_key(press(code), &s, &mut vs), Action::Redraw));
+            assert_eq!(vs.feed.anchor, Some(want), "{code:?}");
+        }
+        assert!(!vs.feed.follow);
+        assert!(matches!(
+            on_key(press(KeyCode::Tab), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.focus, Focus::Guests);
+        assert_eq!(vs.feed.anchor, Some(20), "tabbing away keeps the selection");
+    }
+
+    #[test]
+    fn escape_clears_the_selection_and_gives_the_focus_back() {
+        let s = sample();
+        let mut vs = feed_vs();
+        assert!(matches!(
+            on_key(press(KeyCode::Esc), &s, &mut vs),
+            Action::None
+        ));
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        assert!(vs.feed.anchor.is_some());
+        assert!(matches!(
+            on_key(press(KeyCode::Esc), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, None);
+        assert_eq!(vs.feed.focus, Focus::Guests);
+        assert!(vs.feed.follow);
+    }
+
+    #[test]
+    fn end_resumes_following_and_home_goes_to_the_oldest_row() {
+        let s = sample();
+        let mut vs = feed_vs();
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        assert_eq!((vs.feed.anchor, vs.feed.follow), (Some(19), false));
+        assert!(matches!(
+            on_key(press(KeyCode::Home), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, Some(1));
+        assert!(matches!(
+            on_key(press(KeyCode::End), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(
+            (vs.feed.anchor, vs.feed.view, vs.feed.follow),
+            (None, None, true)
+        );
+        assert_eq!(vs.feed.focus, Focus::Activity, "end keeps the focus");
+    }
+
+    #[test]
+    fn page_keys_move_by_the_rows_on_screen() {
+        let s = sample();
+        let mut vs = feed_vs();
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        on_key(press(KeyCode::PageDown), &s, &mut vs);
+        assert_eq!(vs.feed.anchor, Some(11));
+        on_key(press(KeyCode::PageUp), &s, &mut vs);
+        assert_eq!(vs.feed.anchor, Some(20));
+    }
+
+    #[test]
+    fn enter_opens_the_selected_row_and_shows_it_loading() {
+        let s = sample();
+        let mut vs = feed_vs();
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        assert!(matches!(
+            on_key(press(KeyCode::Enter), &s, &mut vs),
+            Action::None
+        ));
+        assert!(vs.feed.diff.is_none(), "nothing is selected");
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        assert!(matches!(
+            on_key(key(KeyCode::Enter, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(vs.feed.diff.is_none(), "a held key does not open");
+        let act = on_key(press(KeyCode::Enter), &s, &mut vs);
+        assert!(matches!(act, Action::Open(ref e) if e.id == 20));
+        let d = vs.feed.diff.as_ref().expect("the diff is open");
+        assert_eq!((d.req, d.entry.id), (1, 20));
+        assert!(matches!(d.body, view::DiffBody::Loading));
+    }
+
+    #[test]
+    fn an_open_diff_scrolls_closes_and_still_quits() {
+        let s = sample();
+        let mut vs = feed_vs();
+        with_open_diff(&mut vs, 12);
+        for (code, want) in [
+            (KeyCode::Down, 1),
+            (KeyCode::PageDown, 5),
+            (KeyCode::Char(' '), 8),
+            (KeyCode::Up, 7),
+            (KeyCode::Char('k'), 6),
+            (KeyCode::PageUp, 2),
+            (KeyCode::End, 8),
+            (KeyCode::Home, 0),
+        ] {
+            assert!(matches!(on_key(press(code), &s, &mut vs), Action::Redraw));
+            assert_eq!(scroll_of(&vs), want, "{code:?}");
+        }
+        assert!(matches!(
+            on_key(key(KeyCode::Esc, KeyEventKind::Repeat), &s, &mut vs),
+            Action::None
+        ));
+        assert!(vs.feed.diff.is_some());
+        assert!(matches!(
+            on_key(press(KeyCode::Char('q')), &s, &mut vs),
+            Action::Quit
+        ));
+        assert!(matches!(
+            on_key(press(KeyCode::Esc), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert!(vs.feed.diff.is_none());
+    }
+
+    #[test]
+    fn a_guest_uses_the_arrows_for_the_feed_without_tab() {
+        let s = live_guest();
+        let mut vs = feed_vs();
+        assert!(view::feed_live(&s, &vs));
+        assert!(matches!(
+            on_key(press(KeyCode::Tab), &s, &mut vs),
+            Action::None
+        ));
+        assert!(matches!(
+            on_key(press(KeyCode::Down), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, Some(20));
+        assert!(matches!(
+            on_key(press(KeyCode::Esc), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, None);
+    }
+
+    #[test]
+    fn peer_and_pairing_keys_are_untouched_while_the_feed_has_the_focus() {
+        let mut s = sample();
+        let mut vs = feed_vs();
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        assert!(matches!(
+            on_key(press(KeyCode::Char('x')), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.confirm_revoke, Some(7));
+        vs.confirm_revoke = None;
+        s.pairing = Some(pairing(7));
+        assert!(!view::feed_live(&s, &vs));
+        assert!(matches!(
+            on_key(press(KeyCode::Char('a')), &s, &mut vs),
+            Action::Cmd(UiCmd::Accept(7))
+        ));
+        assert!(matches!(
+            on_key(press(KeyCode::Down), &s, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, None, "a pairing request takes the arrows");
+    }
+
+    #[test]
+    fn the_feed_ignores_keys_while_it_is_off() {
+        let s = sample();
+        let mut vs = feed_vs();
+        vs.feed.on = false;
+        on_key(press(KeyCode::Tab), &s, &mut vs);
+        assert_eq!(vs.feed.focus, Focus::Guests);
+        on_key(press(KeyCode::Down), &s, &mut vs);
+        assert_eq!(vs.feed.anchor, None);
+    }
+
+    fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn left(column: u16, row: u16) -> MouseEvent {
+        click(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    #[test]
+    fn a_click_selects_a_row_and_a_second_click_on_it_opens_it() {
+        let mut vs = feed_vs();
+        let hits = vs.feed.hits.clone();
+        assert!(matches!(
+            on_mouse(left(10, 7), &hits, &mut vs),
+            Action::Redraw
+        ));
+        assert_eq!(vs.feed.anchor, Some(18));
+        assert_eq!(vs.feed.focus, Focus::Activity);
+        assert!(vs.feed.diff.is_none());
+        assert!(matches!(on_mouse(left(61, 7), &hits, &mut vs), Action::Open(ref e) if e.id == 18));
+        assert!(vs.feed.diff.is_some());
+    }
+
+    #[test]
+    fn clicks_off_the_rows_and_other_mouse_events_change_nothing() {
+        let mut vs = feed_vs();
+        let hits = vs.feed.hits.clone();
+        for ev in [
+            left(10, 4),
+            left(10, 15),
+            left(1, 7),
+            left(62, 7),
+            click(MouseEventKind::Down(MouseButton::Right), 10, 7),
+            click(MouseEventKind::Up(MouseButton::Left), 10, 7),
+            click(MouseEventKind::Drag(MouseButton::Left), 10, 7),
+            click(MouseEventKind::Moved, 10, 7),
+            click(MouseEventKind::ScrollLeft, 10, 7),
+        ] {
+            assert!(
+                matches!(on_mouse(ev, &hits, &mut vs), Action::None),
+                "{ev:?}"
+            );
+        }
+        assert_eq!(vs.feed.anchor, None);
+        assert_eq!(vs.feed.focus, Focus::Guests);
+        assert!(vs.feed.follow);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_feed_and_then_the_diff() {
+        let mut vs = feed_vs();
+        let hits = vs.feed.hits.clone();
+        let down = click(MouseEventKind::ScrollDown, 10, 7);
+        let up = click(MouseEventKind::ScrollUp, 10, 7);
+        assert!(matches!(on_mouse(down, &hits, &mut vs), Action::Redraw));
+        assert_eq!((vs.feed.view, vs.feed.follow), (Some(8), false));
+        assert!(matches!(on_mouse(up, &hits, &mut vs), Action::Redraw));
+        assert_eq!(vs.feed.view, Some(11));
+        with_open_diff(&mut vs, 12);
+        on_mouse(down, &hits, &mut vs);
+        assert_eq!(scroll_of(&vs), 3);
+        on_mouse(up, &hits, &mut vs);
+        assert_eq!(scroll_of(&vs), 0);
+        assert_eq!(vs.feed.view, Some(11), "the feed stays put behind the diff");
+    }
+
+    #[test]
+    fn the_mouse_is_ignored_where_capture_is_off_and_while_a_diff_is_open() {
+        let mut vs = feed_vs();
+        let hits = vs.feed.hits.clone();
+        vs.scene = view::Scene::HostPair(1);
+        assert!(matches!(
+            on_mouse(left(10, 7), &hits, &mut vs),
+            Action::None
+        ));
+        vs.scene = view::Scene::Host;
+        vs.quitting = true;
+        assert!(matches!(
+            on_mouse(left(10, 7), &hits, &mut vs),
+            Action::None
+        ));
+        vs.quitting = false;
+        with_open_diff(&mut vs, 3);
+        assert!(matches!(
+            on_mouse(left(10, 7), &hits, &mut vs),
+            Action::None
+        ));
+        assert_eq!(vs.feed.anchor, None);
+    }
+
+    #[test]
+    fn capture_is_wanted_only_where_the_panel_can_be_clicked() {
+        let mut vs = feed_vs();
+        for (scene, want) in [
+            (view::Scene::Host, true),
+            (view::Scene::GuestLive, true),
+            (view::Scene::Diff, true),
+            (view::Scene::HostPair(1), false),
+            (view::Scene::HostRevoke(1), false),
+            (view::Scene::GuestPick, false),
+            (view::Scene::GuestSetup, false),
+            (view::Scene::GuestPrompt, false),
+            (view::Scene::Tiny, false),
+            (view::Scene::Blank, false),
+        ] {
+            vs.scene = scene;
+            assert_eq!(view::wants_mouse(&vs), want, "{scene:?}");
+        }
+        vs.scene = view::Scene::Host;
+        vs.quitting = true;
+        assert!(!view::wants_mouse(&vs));
+        vs.quitting = false;
+        vs.feed.on = false;
+        assert!(!view::wants_mouse(&vs));
+    }
+
+    #[test]
+    fn the_mouse_command_asks_for_presses_and_the_wheel_but_never_motion() {
+        let mut on = String::new();
+        MouseMode(true).write_ansi(&mut on).unwrap();
+        assert_eq!(on, "\x1b[?1000h\x1b[?1006h");
+        let mut off = String::new();
+        MouseMode(false).write_ansi(&mut off).unwrap();
+        assert_eq!(off, "\x1b[?1000l\x1b[?1006l");
+        for motion in ["1002", "1003"] {
+            assert!(!on.contains(motion));
+        }
+    }
+
+    #[test]
+    fn mouse_off_is_idempotent_and_clears_the_flag() {
+        MOUSE_REPORTING.store(false, Ordering::SeqCst);
+        mouse_off();
+        assert!(!MOUSE_REPORTING.load(Ordering::SeqCst));
+        MOUSE_REPORTING.store(true, Ordering::SeqCst);
+        mouse_off();
+        assert!(!MOUSE_REPORTING.load(Ordering::SeqCst));
+        mouse_off();
+        assert!(!MOUSE_REPORTING.load(Ordering::SeqCst));
+        let mut on = false;
+        mouse_follow(&mut on, false);
+        assert!(!on);
+    }
+
+    #[test]
+    fn a_stale_diff_result_is_dropped_and_the_current_one_shown() {
+        let slot = FeedSlot::default();
+        let mut vs = feed_vs();
+        let mut w = DiffWorker::new();
+        vs.feed.select(18);
+        assert!(vs.feed.open().is_some());
+        let first = vs.feed.req;
+        vs.feed.close_diff();
+        vs.feed.select(17);
+        assert!(vs.feed.open().is_some());
+        let second = vs.feed.req;
+        w.busy = true;
+        assert!(!w.finish(&mut vs, &slot, first, failed_view("old")));
+        assert!(!w.busy, "the worker is free again");
+        assert!(matches!(
+            vs.feed.diff.as_ref().unwrap().body,
+            view::DiffBody::Loading
+        ));
+        w.busy = true;
+        assert!(w.finish(&mut vs, &slot, second, failed_view("new")));
+        assert!(matches!(
+            vs.feed.diff.as_ref().unwrap().body,
+            view::DiffBody::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn a_waiting_open_runs_after_the_busy_one_and_a_superseded_one_does_not() {
+        let slot = FeedSlot::default();
+        let mut vs = feed_vs();
+        vs.feed.select(18);
+        vs.feed.open();
+        let live = vs.feed.req;
+        let mut w = DiffWorker::new();
+        w.start(live - 1, feed_entry(19), &slot);
+        assert!(w.busy);
+        w.start(live, feed_entry(18), &slot);
+        assert_eq!(w.queued.as_ref().map(|q| q.0), Some(live));
+        let (req, _) =
+            w.rx.recv_timeout(Duration::from_secs(5))
+                .expect("first result");
+        assert_eq!(req, live - 1);
+        assert!(!w.finish(&mut vs, &slot, req, failed_view("x")));
+        assert!(w.busy, "the waiting open started");
+        let (req, view) =
+            w.rx.recv_timeout(Duration::from_secs(5))
+                .expect("second result");
+        assert_eq!(req, live);
+        assert_eq!(
+            view.unavailable.as_deref(),
+            Some("no earlier version is kept for this session")
+        );
+        assert!(w.finish(&mut vs, &slot, req, view));
+
+        w.queued = Some((live + 5, feed_entry(1)));
+        w.busy = true;
+        w.finish(&mut vs, &slot, 0, failed_view("x"));
+        assert!(
+            !w.busy && w.queued.is_none(),
+            "a waiting open nobody wants is dropped"
+        );
+    }
+
+    struct Swap;
+
+    impl DiffSource for Swap {
+        fn sides(&self, _: &Entry) -> diff::Sides {
+            diff::Sides {
+                label: "swap",
+                old: diff::Side::Bytes(b"a\n".to_vec()),
+                new: diff::Side::Bytes(b"b\n".to_vec()),
+                note: None,
+            }
+        }
+    }
+
+    struct Boom;
+
+    impl DiffSource for Boom {
+        fn sides(&self, _: &Entry) -> diff::Sides {
+            panic!("a source that fails")
+        }
+    }
+
+    #[test]
+    fn the_diff_comes_from_the_registered_source_and_survives_a_failing_one() {
+        let e = feed_entry(1);
+        let src: &dyn DiffSource = &Swap;
+        let v = compute_diff(Some(src), &e);
+        assert_eq!((v.label, v.added, v.removed), ("swap", 1, 1));
+        assert!(v.unavailable.is_none());
+        let src: &dyn DiffSource = &Boom;
+        let v = compute_diff(Some(src), &e);
+        assert_eq!(
+            v.unavailable.as_deref(),
+            Some("the diff could not be computed")
+        );
+        assert!(compute_diff(None, &e).unavailable.is_some());
+    }
+
+    fn mirrored(bus: &UiBus) -> Vec<Entry> {
+        bus.feed().window(None, 10)
+    }
+
+    #[test]
+    fn a_notice_reaches_the_snapshot_always_and_the_feed_once_it_is_on() {
+        let n = |kind| Notice {
+            kind,
+            path: RelPath::new("a/b").unwrap(),
+        };
+        let (bus, wake) = UiBus::new(Role::Guest);
+        let v0 = bus.ver.load(Ordering::Acquire);
+        bus.notice(5, n(NoticeKind::Refused));
+        assert_eq!(bus.read().notices.len(), 1);
+        assert!(mirrored(&bus).is_empty(), "the feed is off");
+        assert!(bus.ver.load(Ordering::Acquire) > v0);
+        assert!(wake.try_recv().is_ok());
+
+        bus.feed().enable();
+        bus.notice(6, n(NoticeKind::Merged));
+        assert_eq!(bus.read().notices.len(), 2);
+        let rows = mirrored(&bus);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].what, feed::What::Notice(NoticeKind::Merged));
+        assert_eq!(rows[0].by, feed::By::Local);
+        assert_eq!(rows[0].path.as_str(), "a/b");
+        assert_eq!(rows[0].ts_ms, 6);
+
+        let (host, _) = UiBus::new(Role::Host);
+        host.feed().enable();
+        host.notice(1, n(NoticeKind::Resynced));
+        assert_eq!(mirrored(&host)[0].by, feed::By::Host);
+    }
+
+    #[test]
+    fn every_update_bumps_the_version_even_when_nothing_changes() {
+        let (bus, _wake) = UiBus::new(Role::Host);
+        let v0 = bus.ver.load(Ordering::Acquire);
+        bus.update(|_| {});
+        bus.update(|s| s.hint("h"));
+        assert_eq!(bus.ver.load(Ordering::Acquire), v0 + 2);
+    }
+
+    #[test]
+    fn the_screen_copies_only_the_rows_the_panel_shows() {
+        let t0 = Instant::now();
+        let (bus, _wake) = UiBus::new(Role::Host);
+        bus.feed().enable();
+        for i in 1..=100 {
+            bus.feed().push_batch([feed_entry(i)]);
+        }
+        let mut sc = Screen::new(sample(), Depth::True, t0);
+        sc.vs.feed.on = true;
+        let area = Rect::new(0, 0, 80, 24);
+        sc.sync_feed(bus.feed(), area);
+        let want = view::feed_rows(&sc.snap, &sc.vs, area);
+        assert!(want > 0 && want < 100, "{want}");
+        assert_eq!(sc.vs.feed.rows.len(), want);
+        assert_eq!(sc.vs.feed.len, 100);
+        assert_eq!(sc.vs.feed.rows[0].id, 100);
+        assert!(!sc.vs.feed.needs(want, bus.feed().version()));
+        bus.feed().push_batch([feed_entry(101)]);
+        assert!(sc.vs.feed.needs(want, bus.feed().version()));
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        sc.sync_feed(bus.feed(), area);
+        sc.render(&mut term, t0, 1_000_000).unwrap();
+        assert_eq!(sc.vs.feed.hits.ids.len(), want);
+        assert_eq!(sc.vs.feed.hits.ids[0], 101);
+        assert_eq!(sc.vs.scene, view::Scene::Host);
     }
 }
