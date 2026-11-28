@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* A guest that creates a directory and then a file larger than 48 KiB inside it no longer sometimes fails `fsync` with
+  ENOENT: the host opened the file's parent when the request arrived instead of when its turn came, so it could look
+  for a directory an earlier request in the same ordered stream had not made yet.
 * The terminal UI now shows what it had no data for: each guest's bytes in and out and its queued fetch requests on
   the host, how many files are still waiting for a hash, and why a guest's link dropped while it reconnects.
 * The terminal UI shows an Activity list of the last 256 changes (added, modified, changed, removed, renamed, merged,

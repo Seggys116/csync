@@ -2070,10 +2070,8 @@ impl SessionCtx {
             return self.g.reply(id, Err(WireErr::Busy));
         }
         let staged = commit::writable(&self.core.rules_r(), target, false)
-            .and_then(|()| commit::open_parent(&self.core, target))
-            .and_then(|(dir, _)| {
-                commit::Staged::create(&self.core, dir, 0o600).map_err(|e| wire(&e))
-            });
+            .and_then(|()| commit::upload_dir(&self.core, target))
+            .and_then(|dir| commit::Staged::create(&self.core, dir, 0o600).map_err(|e| wire(&e)));
         match staged {
             Ok(staged) => {
                 let hash = matches!(kind, UpKind::Stream { .. });
@@ -2301,6 +2299,37 @@ mod tests {
         );
         s.on_chunk(1, 0, true, &body);
         assert_eq!(ids(&jobs), vec![1, 2]);
+    }
+
+    #[test]
+    fn an_upload_into_a_directory_made_just_ahead_of_it_lands() {
+        let (t, mut s, jobs, _peer) = session();
+        let body = vec![5u8; 100_000];
+        s.on_msg(Msg::Req {
+            id: 1,
+            op: Op::Mk {
+                path: RelPath::new("d").unwrap(),
+                what: crate::proto::Mk::Dir { perm: 0o755 },
+            },
+        });
+        // the committer has not made d yet when the upload into it begins
+        s.on_msg(Msg::Req {
+            id: 2,
+            op: streamed("d/f", &body),
+        });
+        s.on_chunk(2, 0, true, &body);
+        for j in jobs.try_iter().collect::<Vec<_>>() {
+            let r = commit::exec(&s.core, j.op, j.payload, None);
+            assert!(matches!(r, Ok(Reply::Done { .. })), "job {}: {r:?}", j.id);
+        }
+        assert_eq!(std::fs::read(t.0.join("d/f")).unwrap(), body);
+        let left: Vec<_> = std::fs::read_dir(&t.0)
+            .unwrap()
+            .chain(std::fs::read_dir(t.0.join("d")).unwrap())
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().starts_with(TMP_PREFIX))
+            .collect();
+        assert!(left.is_empty(), "temps left behind: {left:?}");
     }
 
     #[test]

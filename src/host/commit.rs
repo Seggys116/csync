@@ -91,6 +91,31 @@ impl Staged {
             _ => false,
         }
     }
+
+    // an upload staged before the ops ahead of it made its directory, or in one moved away since, joins it now
+    fn move_into(&mut self, dir: BorrowedFd<'_>) -> Result<(), WireErr> {
+        if same_dir(dir, self.dir.as_fd()).is_ok() {
+            return Ok(());
+        }
+        if !self.still_named() {
+            return Err(WireErr::Busy);
+        }
+        let to = rustix::io::fcntl_dupfd_cloexec(dir, 0).map_err(|_| WireErr::Busy)?;
+        rustix::fs::renameat_with(
+            self.dir.as_fd(),
+            self.name.as_str(),
+            to.as_fd(),
+            self.name.as_str(),
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(|_| WireErr::Busy)?;
+        self.dir = to;
+        if self.still_named() {
+            Ok(())
+        } else {
+            Err(WireErr::Busy)
+        }
+    }
 }
 
 impl Drop for Staged {
@@ -479,6 +504,19 @@ pub(crate) fn open_parent<'p>(core: &Core, p: &'p RelPath) -> Result<(OwnedFd, &
     Ok((fd, name))
 }
 
+// where an upload is staged until its turn: a directory that ops still ahead of it make is not there yet
+pub(crate) fn upload_dir(core: &Core, p: &RelPath) -> Result<OwnedFd, WireErr> {
+    match open_parent(core, p) {
+        Err(WireErr::NotFound) => sys::open_beneath(
+            core.root.as_fd(),
+            &RelPath::root(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+        )
+        .map_err(|e| wire(&e)),
+        r => r.map(|(fd, _)| fd),
+    }
+}
+
 pub(crate) struct Cur {
     kind: Kind,
     stat: StatKey,
@@ -765,10 +803,9 @@ fn commit(
     let gate = Gate::new(&core.rules_r(), path)?;
     gate.file?;
     let (dir, name) = open_parent(core, path)?;
-    match &payload {
-        Payload::File(s) | Payload::Delta { lits: Some(s), .. } => {
-            same_dir(dir.as_fd(), s.dir.as_fd())?
-        }
+    let mut payload = payload;
+    match &mut payload {
+        Payload::File(s) | Payload::Delta { lits: Some(s), .. } => s.move_into(dir.as_fd())?,
         _ => {}
     }
     let st = lstat(dir.as_fd(), name)?;
