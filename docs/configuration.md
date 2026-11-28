@@ -146,16 +146,27 @@ Hidden from `--help`. Runs local micro-benchmarks. Flags: `--path PATH` (tree to
 | Key | Where | Action |
 |---|---|---|
 | `q`, `Ctrl-C` | both | Quit cleanly. Pressed again during shutdown, exit at once |
-| `Up`, `k` / `Down`, `j` | both | Move the selection in the guest list (host) or host list (guest) |
+| `Up`, `k` / `Down`, `j` | both | Move the selection in the guest list (host) or host list (guest). Once a guest is mounted, and on a host while the Activity panel has focus, they move through the Activity list instead |
 | `a` | host | Accept the pending pairing request |
 | `r` | host | Reject the pending pairing request |
 | `x`, then `y` | host | Revoke the selected guest: remove its key and close its session. Any key other than `y` cancels |
 | `y` / `n` | guest | Confirm or decline the pairing code |
 | `Enter` | guest | Join the selected host from the discovery list |
+| `Tab` | host | Move focus between the guest list and the Activity panel |
+| `PgUp` / `PgDn` | Activity | Move the selection a page |
+| `Home` / `End` | Activity | Select the oldest row / go back to the newest and follow new rows |
+| `Enter` | Activity | Open a diff of the selected row |
+| `Esc` | Activity | Stop browsing: follow new rows again, and on the host return focus to the guest list |
+| `Up`, `k` / `Down`, `j`, `PgUp`, `PgDn`, `Space`, `Home`, `End` | diff | Scroll |
+| `Esc` | diff | Close the diff. `q` still quits |
+
+The mouse works only where the Activity panel can be clicked: a click selects a row, a click on the selected row opens its diff, and the wheel scrolls the list or the diff. The terminal is asked for button presses and the wheel only, never motion, and only on those screens; the pairing, revoke, host-pick and setup screens and the quit screen leave it off so their text stays selectable. Hold shift while dragging to select text where the mouse is on. How the list is built and what a diff compares is in [how it works](how-it-works.md#activity-feed-and-diffs).
+
+Pasted text and held-down key repeats never accept, reject, confirm, revoke or quit: only a fresh press of the key does. A pane that is not focused still redraws when something changes, at most once a second, and rings the terminal bell when a pairing request arrives. On a short guest screen the least important status rows are left out and a `+N more` marker counts them. Hints stay visible when the Activity panel is full.
 
 SIGINT, SIGTERM and SIGHUP ask for a clean shutdown; a second signal exits at once.
 
-Colours follow the terminal: a non-empty `NO_COLOR` turns them off, `COLORTERM=truecolor` or `24bit` enables 24-bit colour, and a `TERM` containing `256` or `direct` enables 256 colours. With `TERM=dumb`, or when the terminal cannot be set up, csync falls back to the line protocol below.
+Colours follow the terminal: a non-empty `NO_COLOR` turns them off, `COLORTERM=truecolor` or `24bit` enables 24-bit colour, and a `TERM` containing `256`, `direct`, `kitty`, `alacritty`, `foot`, `wezterm` or `ghostty` enables 256 colours. Any other terminal gets the 16 ANSI colours, with fixed roles for the accents (cyan, yellow, red, green) and reverse video for the selected row. With `TERM=dumb`, or when the terminal cannot be set up, csync falls back to the line protocol below.
 
 ## Line protocol
 

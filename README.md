@@ -103,8 +103,14 @@ straight away. Across a VPN or when mDNS is blocked, use `csync join --connect H
 
 <p align="center"><img src="https://raw.githubusercontent.com/Seggys116/csync/main/.github/assets/tui-guest-live.svg" alt="The guest screen showing a live session with link latency, cache and edit counters" width="760"></p>
 
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/csync/main/.github/assets/tui-guest-diff.svg" alt="The guest screen with the activity list and a diff of a host edit opened from it" width="760"></p>
+
 The screens above are captures of a macOS host and a Linux guest running against each other. The interface animates
 only while something is changing and stops all timers when the terminal loses focus, so an idle `csync` costs nothing.
+
+Both screens list recent changes in an Activity panel. Select a row with the arrow keys or the mouse and press Enter,
+or click it again, to see a diff of that change. A guest diffs the version before the change against the one after it; the host, which
+keeps no history, compares the working tree against git HEAD and labels it that way.
 
 ## How it works
 

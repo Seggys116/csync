@@ -4,6 +4,16 @@
 
 * The terminal UI now shows what it had no data for: each guest's bytes in and out and its queued fetch requests on
   the host, how many files are still waiting for a hash, and why a guest's link dropped while it reconnects.
+* The terminal UI shows an Activity list of the last 256 changes (added, modified, changed, removed, renamed, merged,
+  notices) and who made them. Select a row with the arrow keys, `j` and `k` (`Tab` moves focus to the list on the
+  host) or the mouse, then press `Enter` or click it again to open a diff. A guest diffs the blob cache against the
+  new version, fetching it from the host when it is 1 MiB or less. The host has no history, so it shows the working
+  tree against `git HEAD` and says so. A diff that cannot be made says why. Nothing is added to the protocol, and the
+  line output is unchanged. Mouse capture is on only where the list can be clicked, and shift-drag still selects text.
+* A cold open of a file up to 48 KiB now fetches its directory's small siblings in the same round trip (up to 1 MiB
+  and 512 files, pending ones by version), and the prefetcher continues with the rest of the directory. Pushed hashes
+  of files nobody has opened are left to the running walk or queued as background work once it is idle, and warming
+  `.git` objects no longer uses the wide scan window. In same-session comparisons a cold `rg` over a 17,000-file tree was about 15 percent faster.
 * Small requests (version resolution, hash lookups, batches of small files, small files and ranges) get their own two
   host threads, so a large transfer no longer makes a guest wait to open a file. Hashing a large pending file for a
   guest uses all cores.
