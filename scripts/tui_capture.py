@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """record real terminal sessions and write animated svgs for the readme.
 
-usage: tui_capture.py SPEC.json [--save-timeline FILE | --load-timeline FILE] [--frames-dir DIR]
+usage: tui_capture.py SPEC.json --font DIR [--save-timeline FILE | --load-timeline FILE] [--frames-dir DIR]
 
-needs pyte (pip install pyte, in a venv). strings in the spec may use ${CAP_NAME} placeholders, filled from
+needs pyte and fonttools (pip install pyte fonttools, in a venv), and DIR holding SourceCodePro-Regular.ttf and
+SourceCodePro-Bold.ttf (SIL OFL 1.1). ascii text is drawn from the font outlines as paths, so no viewer font can
+stretch or space it. strings in the spec may use ${CAP_NAME} placeholders, filled from
 the environment. the spec lists:
 
   cols, rows   terminal size in cells
@@ -38,6 +40,9 @@ import unicodedata
 from collections import defaultdict
 
 import pyte
+from fontTools.pens.svgPathPen import SVGPathPen
+from fontTools.pens.transformPen import TransformPen
+from fontTools.ttLib import TTFont
 
 BG = "#0d1117"
 FG = "#c9d1d9"
@@ -435,6 +440,45 @@ def split_pieces(cells):
 INHERIT = "inherit"
 
 
+class Glyphs:
+    """outlines of one monospace font, defined once per svg and drawn as paths"""
+
+    def __init__(self, directory):
+        self.fonts = [TTFont(os.path.join(directory, f"SourceCodePro-{w}.ttf")) for w in ("Regular", "Bold")]
+        for f in self.fonts:
+            adv = f["hmtx"][f.getBestCmap()[ord("m")]][0] / f["head"].unitsPerEm * FONT_PX
+            if abs(adv - CW) > 0.05:
+                raise SystemExit(f"font advance {adv:.2f}px does not match the {CW}px cell")
+        self.used = {}
+
+    def reset(self):
+        self.used = {}
+
+    def outline(self, font, ch):
+        glyphs = font.getGlyphSet()
+        scale = FONT_PX / font["head"].unitsPerEm
+        pen = SVGPathPen(glyphs, ntos=fmt)
+        glyphs[font.getBestCmap()[ord(ch)]].draw(TransformPen(pen, (scale, 0, 0, -scale, 0, BASE_Y)))
+        return pen.getCommands()
+
+    def run(self, text, x0, bold):
+        uses = []
+        for k, ch in enumerate(text):
+            if ch == " ":
+                continue
+            key = (bold, ch)
+            if key not in self.used:
+                self.used[key] = (f"g{len(self.used)}", self.outline(self.fonts[1 if bold else 0], ch))
+            uses.append(f'<use href="#{self.used[key][0]}" x="{fmt(x0 + k * CW)}"/>')
+        return "".join(uses)
+
+    def defs(self):
+        return [f'<path id="{i}" d="{d}"/>' for i, d in self.used.values()]
+
+
+GLYPHS = None
+
+
 def piece_elements(cells, pal):
     """svg elements for one piece laid out from x=0; fg INHERIT leaves the fill to the referencing element"""
 
@@ -506,13 +550,15 @@ def piece_elements(cells, pal):
         if ds:
             out.append(f'<path{fcls(fg)} d="{"".join(ds)}"/>')
     for fg, st, x0, s, centre, end in texts:
-        attrs = "" if centre else f' textLength="{fmt(end - x0)}" lengthAdjust="spacing"'
+        if not centre:
+            out.append(f"<g{fcls(fg)}>{GLYPHS.run(s, x0, bool(st & BOLD))}</g>")
+            continue
+        attrs = ""
         if st & BOLD:
             attrs += ' font-weight="700"'
         if st & ITAL:
             attrs += ' font-style="italic"'
-        if centre:
-            attrs += ' text-anchor="middle"'
+        attrs += ' text-anchor="middle"'
         out.append(f'<text{fcls(fg)}{attrs} x="{fmt(x0)}" y="{BASE_Y}">{html.escape(s, quote=False)}</text>')
     return out
 
@@ -576,6 +622,7 @@ def render_svg(pane, t_from, t_to, title, pause=2.5, fps=10, at=None, label="", 
     k_still = n - 1 if still is None else min(n - 1, max(0, int(round(still / dt))))
     total = n * dt + pause
     pal = Palette()
+    GLYPHS.reset()
     defs, body, css_frames = [], [], []
     ids = {}
 
@@ -691,6 +738,7 @@ def render_svg(pane, t_from, t_to, title, pause=2.5, fps=10, at=None, label="", 
                 cls = f"a v z f{pal.cls(end)}" if end else "a v"
                 body.append(f'<use class="{cls}" style="animation-name:{animate_colours(colours)}" href="#{gid}" x="{fmt(x * CW)}" y="{fmt(y * CH)}"/>')
 
+    defs += GLYPHS.defs()
     style = [pal.css()]
     if at is None:
         style.append(f".a{{opacity:0;animation:{fmt(total)}s step-end infinite}}.z{{opacity:1}}")
@@ -794,6 +842,10 @@ def expand(v):
 
 
 def main(argv):
+    global GLYPHS
+    if "--font" not in argv:
+        raise SystemExit("--font DIR is required")
+    GLYPHS = Glyphs(argv[argv.index("--font") + 1])
     spec = expand(json.load(open(argv[1])))
     frames_dir = argv[argv.index("--frames-dir") + 1] if "--frames-dir" in argv else None
     if "--load-timeline" in argv:
