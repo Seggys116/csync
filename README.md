@@ -139,31 +139,13 @@ nothing else is written anywhere. Editors that save through a temporary file and
 
 ## Speed
 
-Measured end to end with a real host and a real FUSE guest on one machine (Docker, Linux arm64, loopback), on a
-checkout of 17,403 files. "Native" is the same command run directly on the host's directory. Medians of three runs,
-taken while unrelated work was loading the machine, so treat them as conservative. Every join starts with an empty
-cache, so "first run" is what a new session sees and "repeat" is a repeat inside the same session.
+<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/csync/main/.github/assets/speed.svg" alt="Medians of three runs on a hosted runner: find, git status and rg through the mount compared with native, first run and repeat, then latency for edits, writes, saves and joining, and throughput for bulk changes and a 512 MiB file" width="880"></p>
 
-| What | Native | csync guest |
-|---|---|---|
-| Join to a usable mount | | 85 ms |
-| `find -type f`, first run / repeat | 20 ms | 115 ms / 14 ms |
-| `git status`, first run / repeat | 23 ms | 44 ms / 18 ms |
-| `rg` over the whole tree, first run / repeat | 47 ms | 469 ms / 123 ms |
-| Host edit until the guest sees the inotify event | | 2.2 ms median, 4.0 ms p90 |
-| Write and close a file on the guest | | 0.66 ms median |
-| Save through a temporary file and rename | | 1.1 ms median |
-| 3,000 files changed on the host, guest converged | | 88 ms |
-| 2,000 small files written on the guest, all on the host | | 373 ms |
-| Read a 512 MiB file, first run | | 385 ms (1.3 GiB/s) |
-| Idle CPU and wakeups, host and guest | | 0 and 0 per second |
+Measured end to end by the `bench` workflow (`scripts/bench-e2e.sh`): a real host and a real FUSE guest in one container on a GitHub-hosted runner, over loopback, on a checkout of 15,959 files (the source of csync's own dependencies). Medians of three runs, with the fastest and slowest shown as whiskers. "Native" is the same command run directly on the host's directory. Every join starts with an empty cache, so "first run" is what a new session sees and "repeat" is a repeat inside the same session.
 
-<p align="center"><img src="https://raw.githubusercontent.com/Seggys116/csync/main/.github/assets/speed.svg" alt="Bar chart of find, git status and rg times for native, first run and repeat, and the latency figures for edits, writes and joining" width="880"></p>
+The runner is a small shared machine and the host, the guest and the background hasher all run on its few cores, so the first-run numbers swing from run to run (the first `find` took between 321 and 1,033 ms). Real networks add their round-trip time to the first reads of uncached files. Writing a large file to the host is the slowest path here, at about 65 MiB/s against about 700 MiB/s for reading one.
 
-A 30,000-file write storm inside an ignored `target/` directory costs the host 0 ms of CPU on Linux. On macOS the
-host uses a single FSEvents stream on the project root with the usual build directories excluded; with a project
-open, `fseventsd` uses about the same CPU as it would without csync. Real networks add their round-trip time to the
-first reads of uncached files. The harness is `scripts/bench-e2e.sh`, and `csync bench` runs the micro-benchmarks.
+A 30,000-file write storm inside an ignored `target/` directory costs the host 0 ms of CPU on Linux. On macOS the host uses a single FSEvents stream on the project root with the usual build directories excluded; with a project open, `fseventsd` uses about the same CPU as it would without csync. `csync bench` runs the micro-benchmarks.
 
 ## Security
 
