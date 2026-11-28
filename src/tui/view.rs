@@ -1391,6 +1391,7 @@ fn entry_row(e: &Entry) -> FeedRow {
         What::Added => ("added", theme::OK),
         What::Modified if e.merged => ("merged", theme::VIOLET),
         What::Modified => ("modified", theme::INFO),
+        What::Changed => ("changed", theme::INFO),
         What::Removed => ("removed", theme::ERR),
         What::Renamed => ("renamed", theme::TEAL),
         What::DirAdded => ("dir added", theme::OK),

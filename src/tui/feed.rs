@@ -16,6 +16,8 @@ pub const COALESCE_MS: u64 = 2_000;
 pub enum What {
     Added,
     Modified,
+    // a file the host saw change without knowing whether it is new
+    Changed,
     Removed,
     Renamed,
     DirAdded,
@@ -102,9 +104,9 @@ impl Feed {
     }
 
     fn push_one(&mut self, mut e: Entry) {
-        if e.what == What::Modified
+        if matches!(e.what, What::Modified | What::Changed)
             && let Some(last) = self.ring.back_mut()
-            && last.what == What::Modified
+            && last.what == e.what
             && last.path == e.path
             && last.by == e.by
             && last.ts_ms.abs_diff(e.ts_ms) <= COALESCE_MS
@@ -228,7 +230,7 @@ impl FeedSlot {
 // whether a diff could be offered for this row, without computing it
 pub fn offer(e: &Entry, git: bool) -> bool {
     match e.what {
-        What::Added | What::Modified | What::Removed => match e.by {
+        What::Added | What::Modified | What::Changed | What::Removed => match e.by {
             By::Remote | By::Local => e.old.is_some() || e.new.is_some(),
             By::Host | By::Guest { .. } => git,
         },
@@ -334,6 +336,15 @@ mod tests {
         }
         assert!(!f.is_empty());
         assert_eq!(f.window(None, 1).first().map(|e| e.id), Some(30));
+    }
+
+    #[test]
+    fn a_changed_row_coalesces_with_changed_but_not_with_modified() {
+        let mut f = Feed::default();
+        f.push_batch([ent("x", What::Changed, 0), ent("x", What::Changed, 10)]);
+        assert_eq!(f.len(), 1);
+        f.push_batch([ent("x", What::Modified, 20)]);
+        assert_eq!(f.len(), 2);
     }
 
     #[test]
@@ -520,7 +531,7 @@ mod tests {
     #[test]
     fn offer_truth_table() {
         let hash = Some([9; 32]);
-        let kinds = [What::Added, What::Modified, What::Removed];
+        let kinds = [What::Added, What::Modified, What::Changed, What::Removed];
         for what in kinds {
             for by in [By::Remote, By::Local] {
                 let mut e = ent("a", what, 0);

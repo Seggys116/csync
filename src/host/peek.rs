@@ -48,7 +48,7 @@ impl DiffSource for HostPeek {
 // why a row of this kind has no content to compare, shared with the guest adapter
 pub(crate) fn no_diff_reason(what: What) -> Option<&'static str> {
     match what {
-        What::Added | What::Modified | What::Removed => None,
+        What::Added | What::Modified | What::Changed | What::Removed => None,
         What::Renamed => Some("renamed; contents not changed by this event"),
         What::DirAdded | What::DirRemoved => Some("a directory has no text to compare"),
         What::Link => Some("a symlink has no text to compare"),

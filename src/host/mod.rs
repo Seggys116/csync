@@ -399,12 +399,12 @@ fn unnamed_guest() -> Name {
     Name::new("guest").expect("static name")
 }
 
-// a change carries no earlier state, so a file upsert cannot be told from an addition and reads as modified
+// a change carries no earlier state, so a file upsert cannot be told from an addition and reads as changed
 fn feed_row(c: &Change, by: &By, ts_ms: u64, seq: Seq) -> Entry {
     let base = Entry {
         id: 0,
         ts_ms,
-        what: What::Modified,
+        what: What::Changed,
         by: by.clone(),
         path: RelPath::root(),
         from: None,
@@ -417,7 +417,7 @@ fn feed_row(c: &Change, by: &By, ts_ms: u64, seq: Seq) -> Entry {
     match c {
         Change::Upsert { path, meta, ver } => Entry {
             what: match meta.kind {
-                Kind::File => What::Modified,
+                Kind::File => What::Changed,
                 Kind::Dir => What::DirAdded,
                 Kind::Symlink => What::Link,
             },
@@ -2907,7 +2907,7 @@ mod tests {
         // the directory upsert is only its mtime moving, so it has no row
         assert_eq!(
             kinds,
-            vec![What::Modified, What::Link, What::Removed, What::Renamed]
+            vec![What::Changed, What::Link, What::Removed, What::Renamed]
         );
         assert_eq!(rows[0].path.as_str(), "f");
         assert_eq!(
