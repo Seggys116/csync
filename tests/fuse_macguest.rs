@@ -364,7 +364,11 @@ mod mac {
 
         let args = ["status", "--porcelain"];
         let o = git_run(mnt, &args);
-        let clean = o.status.success() && o.stdout.is_empty();
+        // macos puts its own .fseventsd directory on every volume it watches
+        let clean = o.status.success()
+            && String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .all(|l| l == "?? .fseventsd/");
         if !clean {
             bad.push(git_describe(&args, &o));
         }
