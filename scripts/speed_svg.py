@@ -6,6 +6,8 @@ usage: speed_svg.py OUT.svg
 the numbers below are the medians (and fastest and slowest) of the three runs in the bench workflow run 46144603795
 on commit c8da170; update them from the step summary of a newer run and regenerate.
 """
+import sys
+
 FONT = "ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono','DejaVu Sans Mono',monospace"
 W, H = 960, 548
 groups = [
