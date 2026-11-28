@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* The terminal UI now shows what it had no data for: each guest's bytes in and out and its queued fetch requests on
+  the host, how many files are still waiting for a hash, and why a guest's link dropped while it reconnects.
 * Small requests (version resolution, hash lookups, batches of small files, small files and ranges) get their own two
   host threads, so a large transfer no longer makes a guest wait to open a file. Hashing a large pending file for a
   guest uses all cores.

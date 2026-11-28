@@ -323,6 +323,24 @@ mod live {
         now.saturating_duration_since(heard) >= SILENT_AFTER
     }
 
+    // one short line for the ui saying what ended the link
+    fn close_text(why: &CloseReason) -> String {
+        match why {
+            CloseReason::Eof => "host closed the connection".to_owned(),
+            CloseReason::Io(io::ErrorKind::TimedOut) => "connection timed out".to_owned(),
+            CloseReason::Io(io::ErrorKind::ConnectionReset) => {
+                "connection reset by the host".to_owned()
+            }
+            CloseReason::Io(io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe) => {
+                "connection lost".to_owned()
+            }
+            CloseReason::Io(k) => format!("network error: {k}"),
+            CloseReason::Protocol(m) => format!("protocol error: {m}"),
+            CloseReason::Revoked => "the host revoked this guest".to_owned(),
+            CloseReason::Local => "connection closed locally".to_owned(),
+        }
+    }
+
     fn wait_or_stop(stop: &AtomicBool, until: Instant) {
         while !stop.load(Relaxed) && Instant::now() < until {
             thread::sleep(STOP_POLL.min(until.saturating_duration_since(Instant::now())));
@@ -470,7 +488,8 @@ mod live {
             Err(Fail::Quit) => Ok(()),
             Err(Fail::Retry | Fail::Unverified) => {
                 drop(sess);
-                g.lost(CloseReason::Eof).and_then(|()| g.event_loop())
+                g.offline("could not complete the handshake with the host".to_owned())
+                    .and_then(|()| g.event_loop())
             }
         };
         (res, g.shutdown())
@@ -925,6 +944,10 @@ mod live {
             if matches!(why, CloseReason::Revoked) {
                 return Err(denied("the host revoked this guest"));
             }
+            self.offline(close_text(&why))
+        }
+
+        fn offline(&mut self, reason: String) -> io::Result<()> {
             self.remote.set(None);
             *lock(&self.link_slot) = None;
             self.link = None;
@@ -936,7 +959,10 @@ mod live {
                 .take()
                 .is_some_and(|t| t.elapsed() >= HEALTHY_AFTER);
             (self.redial_wait, self.redial) = redial_policy(self.redial, healthy);
-            self.set_peer(ConnState::Disconnected { since_ms: now_ms() });
+            self.set_peer(ConnState::Disconnected {
+                since_ms: now_ms(),
+                reason: Some(reason),
+            });
             self.spawn_dialer();
             Ok(())
         }
@@ -1815,6 +1841,36 @@ mod live {
             Reject::PairingDisabled,
             Reject::Refused,
         ];
+
+        #[test]
+        fn every_close_reason_reads_as_one_short_line() {
+            let all = [
+                CloseReason::Eof,
+                CloseReason::Io(io::ErrorKind::TimedOut),
+                CloseReason::Io(io::ErrorKind::ConnectionReset),
+                CloseReason::Io(io::ErrorKind::BrokenPipe),
+                CloseReason::Io(io::ErrorKind::PermissionDenied),
+                CloseReason::Protocol("snapshot parts out of order"),
+                CloseReason::Revoked,
+                CloseReason::Local,
+            ];
+            for why in &all {
+                let t = close_text(why);
+                assert!(!t.is_empty() && t.len() <= 60, "{t}");
+                assert!(!t.chars().any(char::is_control), "{t}");
+            }
+            assert_eq!(close_text(&CloseReason::Eof), "host closed the connection");
+            assert_eq!(
+                close_text(&CloseReason::Io(io::ErrorKind::TimedOut)),
+                "connection timed out"
+            );
+            assert_eq!(
+                close_text(&CloseReason::Protocol("snapshot parts out of order")),
+                "protocol error: snapshot parts out of order"
+            );
+            let other = close_text(&CloseReason::Io(io::ErrorKind::PermissionDenied));
+            assert!(other.starts_with("network error: "), "{other}");
+        }
 
         #[test]
         fn forged_rejects_never_end_the_reconnect_loop() {

@@ -138,7 +138,7 @@ pub fn state_text(st: &ConnState, now_ms: u64) -> String {
         }
         ConnState::Syncing { .. } => "syncing".into(),
         ConnState::Live => "live".into(),
-        ConnState::Disconnected { since_ms } => format!(
+        ConnState::Disconnected { since_ms, .. } => format!(
             "offline {}",
             fmt_secs(now_ms.saturating_sub(*since_ms) / 1000)
         ),
@@ -645,7 +645,7 @@ fn guest_badge(s: &UiSnapshot, vs: &ViewState) -> Badge {
             Phase::Live => ("●", "live".into(), theme::OK),
             Phase::Offline => {
                 let since = match s.peers.first().map(|p| &p.state) {
-                    Some(ConnState::Disconnected { since_ms }) => *since_ms,
+                    Some(ConnState::Disconnected { since_ms, .. }) => *since_ms,
                     _ => now,
                 };
                 (
@@ -816,7 +816,7 @@ fn chip(st: &ConnState, vs: &ViewState) -> Badge {
         ),
         ConnState::Syncing { .. } => (vs.spin(), "syncing".into(), theme::INFO),
         ConnState::Live => ("●", "live".into(), theme::OK),
-        ConnState::Disconnected { since_ms } => (
+        ConnState::Disconnected { since_ms, .. } => (
             "○",
             format!(
                 "offline {}",
@@ -854,18 +854,19 @@ enum Col {
     Pending,
 }
 
-fn guest_cols(w: u16) -> Vec<(Col, u16)> {
+// the byte columns need a producer of per-peer counters; without one they would only ever read zero
+fn guest_cols(w: u16, bytes: bool) -> Vec<(Col, u16)> {
     let mut cols = Vec::with_capacity(8);
     if w >= 100 {
         cols.push((Col::Fpr, 9));
     }
     cols.extend([(Col::State, 13), (Col::Rtt, 8)]);
-    if w >= 56 {
+    if bytes && w >= 56 {
         cols.extend([(Col::In, 10), (Col::Out, 10)]);
     }
     let pending = w >= 64;
     let used = |c: &[(Col, u16)]| c.iter().map(|(_, w)| w + 1).sum::<u16>();
-    if w >= 74 {
+    if bytes && w >= 74 {
         let spark = w
             .saturating_sub(used(&cols) + 8 * u16::from(pending) + 19)
             .clamp(8, 30);
@@ -907,7 +908,8 @@ fn guests(f: &mut Frame, area: Rect, s: &UiSnapshot, vs: &ViewState) {
         }
         return;
     }
-    let cols = guest_cols(inner.width);
+    let bytes = s.io.iter().any(|p| p.tx > 0 || p.rx > 0);
+    let cols = guest_cols(inner.width, bytes);
     let mut x = inner.x;
     for (c, w) in &cols {
         let label = match c {
@@ -1137,6 +1139,13 @@ fn counters(buf: &mut Buffer, area: Rect, s: &UiSnapshot, vs: &ViewState) {
             if refused > 0 { t.err } else { t.text },
         ),
     ];
+    if s.stats.hash_pending > 0 {
+        items.push((
+            "hashing",
+            fmt_count(u64::from(s.stats.hash_pending)),
+            t.text,
+        ));
+    }
     if s.stats.skew_ms.unsigned_abs() >= 1000 {
         items.push(("clock skew", format!("{} ms", s.stats.skew_ms), t.err));
     }
@@ -1150,8 +1159,9 @@ fn counters(buf: &mut Buffer, area: Rect, s: &UiSnapshot, vs: &ViewState) {
             "files" => 0,
             "refused" => 1,
             "clock skew" => 2,
-            "commits" => 3,
-            _ => 4,
+            "hashing" => 3,
+            "commits" => 4,
+            _ => 5,
         });
     }
     for (k, v, style) in &items {
@@ -1756,6 +1766,15 @@ fn fit_rows(rows: Vec<Row>, cap: usize) -> (Vec<Row>, usize) {
     (shown, rows.len() - keep)
 }
 
+fn offline_reason(s: &UiSnapshot) -> Option<&str> {
+    match s.peers.first().map(|p| &p.state) {
+        Some(ConnState::Disconnected {
+            reason: Some(r), ..
+        }) => Some(r.as_str()),
+        _ => None,
+    }
+}
+
 fn live_rows(s: &UiSnapshot) -> Vec<Row> {
     let mut rows = Vec::with_capacity(10);
     if phase(s) == Phase::Offline {
@@ -1791,6 +1810,14 @@ fn live_row(buf: &mut Buffer, area: Rect, row: Row, s: &UiSnapshot, vs: &ViewSta
             let x = put(buf, x0, y, "●", r, t.fg(rgb));
             let x = put(buf, x, y, " host unreachable, reconnecting ", r, t.fg(rgb));
             let x = put(buf, x, y, vs.spin(), r, t.err);
+            let x = match offline_reason(s) {
+                Some(why) if r.saturating_sub(x) > 6 => {
+                    let room = usize::from(r.saturating_sub(x));
+                    let why = mid_trunc(&clean(why, NAME_COLS), room - 4);
+                    put(buf, x, y, &format!("  ({why})"), r, t.err)
+                }
+                _ => x,
+            };
             put(buf, x, y, "  cached files stay readable", r, t.dim);
         }
         Row::Link => {
@@ -2196,7 +2223,10 @@ mod tests {
             ConnState::Pairing { sas: *b"Z9Y8X7W6" },
             ConnState::Syncing { done: 3, total: 7 },
             ConnState::Live,
-            ConnState::Disconnected { since_ms: 1_000 },
+            ConnState::Disconnected {
+                since_ms: 1_000,
+                reason: None,
+            },
         ] {
             guest.peers = vec![peer(9, st)];
             out.push(guest.clone());
@@ -2639,6 +2669,97 @@ mod tests {
             wide.contains("accept only if the guest shows the same code"),
             "{wide}"
         );
+    }
+
+    fn offline_guest(reason: Option<&str>) -> UiSnapshot {
+        let mut g = live_guest();
+        g.peers = vec![peer(
+            9,
+            ConnState::Disconnected {
+                since_ms: 1_000,
+                reason: reason.map(str::to_owned),
+            },
+        )];
+        g
+    }
+
+    #[test]
+    fn the_reconnect_banner_names_why_the_link_dropped() {
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let t = text(&render(
+            &offline_guest(Some("connection timed out")),
+            &mut vs,
+            100,
+            30,
+        ));
+        assert!(
+            t.contains("reconnecting") && t.contains("(connection timed out)"),
+            "{t}"
+        );
+        let bare = text(&render(&offline_guest(None), &mut vs, 100, 30));
+        assert!(
+            bare.contains("reconnecting") && !bare.contains("timed out"),
+            "{bare}"
+        );
+    }
+
+    #[test]
+    fn a_long_or_hostile_reason_is_cut_to_the_row_and_cleaned() {
+        let why = format!("protocol error: {}\x1b[2J\u{202e}", "x".repeat(200));
+        let s = offline_guest(Some(&why));
+        for (w, h) in [(30, 12), (60, 16), (80, 24), (200, 60)] {
+            let mut vs = ViewState::new(Depth::True, Instant::now());
+            let buf = render(&s, &mut vs, w, h);
+            for c in &buf.content {
+                assert!(!c.symbol().chars().any(is_hidden_char), "{w}x{h}");
+            }
+        }
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let t = text(&render(&s, &mut vs, 80, 24));
+        let row = t.lines().find(|l| l.contains("host unreachable")).unwrap();
+        assert!(row.contains("protocol error") && row.contains('…'), "{row}");
+    }
+
+    #[test]
+    fn hashing_shows_on_the_host_counters_only_while_files_are_pending() {
+        let mut s = UiSnapshot::new(Role::Host);
+        s.listen = Some("127.0.0.1:47480".parse().unwrap());
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        assert!(!text(&render(&s, &mut vs, 120, 24)).contains("hashing"));
+        s.stats.hash_pending = 1234;
+        s.stats.refused = 5;
+        s.stats.skew_ms = 4000;
+        let wide = text(&render(&s, &mut vs, 120, 24));
+        let (refused, hashing, skew) = (
+            wide.find("refused").unwrap(),
+            wide.find("hashing 1,234").unwrap(),
+            wide.find("clock skew").unwrap(),
+        );
+        assert!(refused < hashing && hashing < skew, "{wide}");
+        let narrow = text(&render(&s, &mut vs, 44, 24));
+        assert!(
+            narrow.contains("clock skew") && !narrow.contains("hashing"),
+            "{narrow}"
+        );
+    }
+
+    #[test]
+    fn byte_columns_appear_only_once_a_peer_has_counters() {
+        let mut s = snaps()[1].clone();
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let with = text(&render(&s, &mut vs, 100, 30));
+        assert!(with.contains("traffic") && with.contains("queue"), "{with}");
+        s.io[0].tx = 0;
+        s.io[0].rx = 0;
+        let mut vs = ViewState::new(Depth::True, Instant::now());
+        let without = text(&render(&s, &mut vs, 100, 30));
+        assert!(!without.contains("traffic"), "{without}");
+        assert!(
+            without.contains("queue") && without.contains("rtt"),
+            "{without}"
+        );
+        let cols: Vec<Col> = guest_cols(100, false).iter().map(|(c, _)| *c).collect();
+        assert!(cols == [Col::Name, Col::Fpr, Col::State, Col::Rtt, Col::Pending]);
     }
 
     #[test]

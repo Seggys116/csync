@@ -266,6 +266,7 @@ fn stream_fd(
             })
             .map_err(|_| WireErr::Io)?;
         core.stats.tx.fetch_add(n as u64, Ordering::Relaxed);
+        g.tx.fetch_add(n as u64, Ordering::Relaxed);
     }
     Ok(true)
 }
@@ -423,6 +424,7 @@ fn fetch(
         }
         if size <= INLINE_MAX as u64 {
             core.stats.tx.fetch_add(size, Ordering::Relaxed);
+            g.tx.fetch_add(size, Ordering::Relaxed);
             let body = if buf.is_empty() {
                 Body::Empty
             } else {
@@ -520,6 +522,7 @@ fn many(core: &Core, g: &Guest, id: ReqId, items: &[(RelPath, Want)]) -> Result<
         out.push((path.clone(), r));
     }
     core.stats.tx.fetch_add(sent, Ordering::Relaxed);
+    g.tx.fetch_add(sent, Ordering::Relaxed);
     reply_bulk(g, id, Ok(Reply::Blobs { items: out }));
     Ok(())
 }
@@ -575,6 +578,9 @@ fn resolve(
     inline: bool,
 ) -> Result<(), WireErr> {
     let (meta, body) = resolve_blob(core, path, &at, inline)?;
+    if let Body::Inline(b) = &body {
+        g.tx.fetch_add(b.0.len() as u64, Ordering::Relaxed);
+    }
     send_blob(g, id, meta, body)
 }
 

@@ -14,10 +14,18 @@ pub enum ConnState {
     Waiting,
     Discovering,
     Handshaking,
-    Pairing { sas: [u8; 8] },
-    Syncing { done: u64, total: u64 },
+    Pairing {
+        sas: [u8; 8],
+    },
+    Syncing {
+        done: u64,
+        total: u64,
+    },
     Live,
-    Disconnected { since_ms: u64 },
+    Disconnected {
+        since_ms: u64,
+        reason: Option<String>,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerView {
@@ -53,6 +61,8 @@ pub struct Stats {
     pub tx: u64,
     pub rx: u64,
     pub inject_backlog: u32,
+    // host: indexed files whose content hash is not known yet
+    pub hash_pending: u32,
     pub skew_ms: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -669,7 +679,12 @@ fn state_fields(st: &ConnState, f: &mut Vec<(&'static str, String)>) {
             f.push(("done", done.to_string()));
             f.push(("total", total.to_string()));
         }
-        ConnState::Disconnected { since_ms } => f.push(("since_ms", since_ms.to_string())),
+        ConnState::Disconnected { since_ms, reason } => {
+            f.push(("since_ms", since_ms.to_string()));
+            if let Some(r) = reason {
+                f.push(("reason", r.clone()));
+            }
+        }
         _ => {}
     }
 }
@@ -1298,10 +1313,38 @@ mod tests {
                 path: RelPath::new("y").unwrap(),
             },
         );
-        s.peers[0].state = ConnState::Disconnected { since_ms: 3 };
+        s.peers[0].state = ConnState::Disconnected {
+            since_ms: 3,
+            reason: None,
+        };
         em.emit(&s, &mut out);
         assert_eq!(out.lines().filter(|l| l.starts_with("notice ")).count(), 1);
         assert!(out.contains("state=disconnected since_ms=3"));
+        assert!(!out.contains("reason="), "{out}");
+    }
+
+    #[test]
+    fn a_disconnect_reason_is_reported_only_when_there_is_one() {
+        let mut s = sample();
+        s.peers[0].state = ConnState::Disconnected {
+            since_ms: 3,
+            reason: Some("host closed the connection".into()),
+        };
+        let text = report(&s);
+        assert!(
+            text.contains("state=disconnected since_ms=3 reason=host%20closed%20the%20connection"),
+            "{text}"
+        );
+        let j = report_json(&text);
+        assert!(
+            j.contains("\"since_ms\":3,\"reason\":\"host closed the connection\""),
+            "{j}"
+        );
+        s.peers[0].state = ConnState::Disconnected {
+            since_ms: 3,
+            reason: None,
+        };
+        assert!(!report(&s).contains("reason="));
     }
 
     // drives the screen the way the interactive loop does: render only when a deadline comes due

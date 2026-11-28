@@ -501,6 +501,8 @@ pub(crate) struct Guest {
     feed: Mutex<Feed>,
     // in-flight fetch ids, true once cancelled
     fetches: Mutex<FxHashMap<ReqId, bool>>,
+    pub(crate) tx: AtomicU64,
+    pub(crate) rx: AtomicU64,
 }
 
 impl Guest {
@@ -518,6 +520,8 @@ impl Guest {
                 replies: Vec::new(),
             }),
             fetches: Mutex::new(FxHashMap::default()),
+            tx: AtomicU64::new(0),
+            rx: AtomicU64::new(0),
         }
     }
 
@@ -553,6 +557,11 @@ impl Guest {
 
     pub(crate) fn end_fetch(&self, id: ReqId) {
         lock(&self.fetches).remove(&id);
+    }
+
+    // fetch requests accepted from this guest and not yet answered, whether queued or running
+    fn queued(&self) -> u32 {
+        u32::try_from(lock(&self.fetches).len()).unwrap_or(u32::MAX)
     }
 
     fn cancel_fetch(&self, id: ReqId) {
@@ -942,8 +951,27 @@ impl Core {
         Ok(())
     }
 
-    fn stats_to_ui(&self) {
-        let files = self.tree().len() as u64;
+    // true while a figure it publishes is still moving without anything else kicking the ui, so the caller ticks again
+    fn stats_to_ui(&self) -> bool {
+        let (files, hash_pending) = {
+            let t = self.tree();
+            (
+                t.len() as u64,
+                u32::try_from(t.pending()).unwrap_or(u32::MAX),
+            )
+        };
+        let guests: Vec<Arc<Guest>> = lock(&self.hub.guests).clone();
+        let queues: Vec<(u64, u32, u64, u64)> = guests
+            .iter()
+            .map(|g| {
+                (
+                    g.id,
+                    g.queued(),
+                    g.tx.load(Ordering::Relaxed),
+                    g.rx.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
         let st = &self.stats;
         let (fetches, commits, refused, merged, tx, rx) = (
             st.fetches.load(Ordering::Relaxed),
@@ -961,7 +989,17 @@ impl Core {
             s.stats.merged = merged;
             s.stats.tx = tx;
             s.stats.rx = rx;
+            s.stats.hash_pending = hash_pending;
+            for &(id, n, gtx, grx) in &queues {
+                if s.peers.iter().any(|p| p.id == id) {
+                    let io = s.peer_io(id);
+                    io.pending = n;
+                    io.tx = gtx;
+                    io.rx = grx;
+                }
+            }
         });
+        hash_pending > 0 || queues.iter().any(|&(_, n, _, _)| n > 0)
     }
 }
 
@@ -1174,7 +1212,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
     core.kick = Some(kick_tx);
     core.echoes = echoes;
     let core = Arc::new(core);
-    core.stats_to_ui();
+    let busy = core.stats_to_ui();
 
     let (stop_tx, stop_rx) = bounded::<()>(1);
     let applier = apply::Applier::new(core.clone(), watcher, ev_rx, stop_rx, index_path);
@@ -1242,7 +1280,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
         sessions: Vec::new(),
     };
     let mut ctl_rx: Receiver<HostCtl> = cfg.ctl.take().unwrap_or_else(never);
-    let mut ui_due: Option<Instant> = None;
+    let mut ui_due: Option<Instant> = busy.then(|| Instant::now() + UI_EVERY);
     loop {
         let pair_rx = host
             .pending
@@ -1276,8 +1314,7 @@ pub fn run(mut cfg: HostCfg, ui: Arc<UiBus>, cmds: Receiver<UiCmd>) -> io::Resul
                 }
             },
             recv(ui_tick) -> _ => {
-                ui_due = None;
-                core.stats_to_ui();
+                ui_due = core.stats_to_ui().then(|| Instant::now() + UI_EVERY);
             },
         }
     }
@@ -1608,7 +1645,10 @@ impl SessionCtx {
         let id = self.g.id;
         lock(&self.core.hub.guests).retain(|x| x.id != id);
         self.g.link.close(CloseReason::Local);
-        self.core.ui(|s| s.peers.retain(|p| p.id != id));
+        self.core.ui(|s| {
+            s.peers.retain(|p| p.id != id);
+            s.io.retain(|p| p.id != id);
+        });
     }
 
     fn set_state(&self, st: ConnState) {
@@ -1963,6 +2003,7 @@ impl SessionCtx {
             Ok(true) => {
                 if let Some(u) = self.uploads.remove(&id) {
                     self.core.stats.rx.fetch_add(u.want, Ordering::Relaxed);
+                    self.g.rx.fetch_add(u.want, Ordering::Relaxed);
                     self.finish_upload(id, u);
                 }
             }
@@ -2643,5 +2684,87 @@ mod tests {
             }
         }
         assert!(removed, "the reply overtook the backlog");
+    }
+
+    // wires a ui bus into the test core and lists the session's guest as a peer on it
+    fn with_ui(s: &mut SessionCtx) -> (Arc<UiBus>, Receiver<()>) {
+        let (bus, wake) = UiBus::new(Role::Host);
+        Arc::get_mut(&mut s.core).unwrap().ui = Some(bus.clone());
+        let view = PeerView {
+            id: s.g.id,
+            name: s.g.name.clone(),
+            fpr: s.g.key.fpr(),
+            state: ConnState::Live,
+            rtt_us: 0,
+        };
+        bus.update(|u| u.peers.push(view));
+        (bus, wake)
+    }
+
+    #[test]
+    fn the_ui_gets_the_pending_hash_count_and_each_guests_fetch_queue() {
+        let (_t, mut s, _jobs, _peer) = session_with(|root| {
+            std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+        });
+        let (bus, _wake) = with_ui(&mut s);
+        lock(&s.core.hub.guests).push(s.g.clone());
+        assert_eq!(s.core.tree().pending(), 1);
+        s.g.begin_fetch(7).unwrap();
+        s.g.begin_fetch(8).unwrap();
+        assert!(s.core.stats_to_ui(), "moving figures ask for another tick");
+        let snap = bus.read();
+        assert_eq!(snap.stats.hash_pending, 1);
+        assert_eq!(snap.io.iter().find(|p| p.id == s.g.id).unwrap().pending, 2);
+        s.g.tx.fetch_add(4096, Ordering::Relaxed);
+        s.g.rx.fetch_add(512, Ordering::Relaxed);
+        s.core.stats_to_ui();
+        let io = bus
+            .read()
+            .io
+            .iter()
+            .find(|p| p.id == s.g.id)
+            .copied()
+            .unwrap();
+        assert_eq!((io.tx, io.rx), (4096, 512));
+        s.g.end_fetch(7);
+        s.g.end_fetch(8);
+        learn_pending(&s.core);
+        assert!(!s.core.stats_to_ui(), "nothing is moving any more");
+        let snap = bus.read();
+        assert_eq!(snap.stats.hash_pending, 0);
+        assert_eq!(snap.io.iter().find(|p| p.id == s.g.id).unwrap().pending, 0);
+    }
+
+    #[test]
+    fn a_guest_that_left_leaves_no_queue_entry_behind() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        let id = s.g.id;
+        lock(&s.core.hub.guests).push(s.g.clone());
+        s.g.begin_fetch(1).unwrap();
+        s.core.stats_to_ui();
+        assert_eq!(bus.read().io.len(), 1);
+        // a hello for another protocol ends the session at once, which is all this needs of run
+        s.run(Some(Hello {
+            proto: PROTO.wrapping_add(1),
+            build: Name::new("t").unwrap(),
+            have: None,
+        }));
+        let snap = bus.read();
+        assert!(snap.peers.iter().all(|p| p.id != id));
+        assert!(snap.io.iter().all(|p| p.id != id));
+    }
+
+    #[test]
+    fn a_pong_publishes_the_guests_round_trip_time() {
+        let (_t, mut s, _jobs, _peer) = session_with(|_| {});
+        let (bus, _wake) = with_ui(&mut s);
+        let sent = now_ns() - 5_000_000;
+        assert!(s.on_msg(Msg::Pong {
+            t_ns: sent,
+            host_ns: 0
+        }));
+        let rtt = bus.read().peers[0].rtt_us;
+        assert!((5_000..60_000_000).contains(&rtt), "{rtt}");
     }
 }
