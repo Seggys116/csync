@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+* Git on a guest no longer reports a corrupt index, commit-graph or missing objects while the host commits and repacks.
+  A `.git` file the host replaces now appears as a new file to everything that opens it afterwards, so a process that
+  still has the old version open keeps reading consistent bytes, a directory removed and made again no longer brings
+  back its old entries, and `.git` directory listings and renames show up at once.
 * A guest that creates a directory and then a file larger than 48 KiB inside it no longer sometimes fails `fsync` with
   ENOENT: the host opened the file's parent when the request arrived instead of when its turn came, so it could look
   for a directory an earlier request in the same ordered stream had not made yet.

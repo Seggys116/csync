@@ -483,7 +483,7 @@ fn await_ver_change(tree: &RwLock<GTree>, id: NodeId, ver: Seq, deadline: Instan
         {
             let t = tree.read().unwrap_or_else(|e| e.into_inner());
             match t.get(id) {
-                Some(n) if n.ver == ver && n.meta.hash.is_none() => {}
+                Some(n) if n.ver == ver && n.meta.hash.is_none() && n.attached() => {}
                 _ => return true,
             }
         }
@@ -1729,7 +1729,6 @@ pub struct GuestFs {
     lists: Mutex<FxHashMap<NodeId, Listing>>,
     pass: bool,
     no_backing: [AtomicBool; 2],
-    no_opendir: bool,
     noflush: bool,
     hold: Mutex<Option<Hold>>,
     // git index blob to the guest view of it, or to itself when no view applies
@@ -1785,7 +1784,6 @@ impl GuestFs {
             lists: Mutex::new(FxHashMap::default()),
             pass: false,
             no_backing: [AtomicBool::new(false), AtomicBool::new(false)],
-            no_opendir: false,
             noflush: false,
             hold: Mutex::new(None),
             views: Mutex::new(FxHashMap::default()),
@@ -1916,19 +1914,11 @@ impl GuestFs {
             Some(_) => return Err(Errno::ENOTDIR),
             None => return Err(Errno::ENOENT),
         }
-        t.list(ino, &mut list);
         // as lookups do there: git rescans objects/pack for the pack a repack just replaced
-        if let Some(kids) = t
-            .get(ino)
-            .filter(|n| n.domain == GDomain::GitRo)
-            .and_then(|n| n.children.as_ref())
-        {
-            list.retain(|(id, _)| t.get(*id).is_some_and(|n| n.vis != Vis::PendingDelete));
-            for (name, &id) in kids {
-                if t.pending_create(ino, name.as_str()) == Some(id) {
-                    list.push((id, None));
-                }
-            }
+        if t.get(ino).is_some_and(|n| n.domain == GDomain::GitRo) {
+            t.list_now(ino, &mut list);
+        } else {
+            t.list(ino, &mut list);
         }
         Ok(Arc::new(list))
     }
@@ -2612,6 +2602,88 @@ impl GuestFs {
         self.core.t().resolve(&RelPath::new(&parts.join("/")).ok()?)
     }
 
+    // the kernel retries an ESTALE open once, so the small .git file a lookup returns is already held here
+    fn git_prime(&self, parent: NodeId, name: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let (id, old, path) = {
+                let t = self.core.t();
+                let Some(id) = t
+                    .lookup_as(parent, name, false)
+                    .map(|(id, _)| id)
+                    .or_else(|| t.pending_create(parent, name))
+                else {
+                    return;
+                };
+                let Some(n) = t.get(id) else { return };
+                let small = n.domain == GDomain::GitRo
+                    && n.meta.kind == Kind::File
+                    && n.special == Special::None
+                    && n.vis != Vis::PendingDelete
+                    && (1..=EAGER_GIT_MAX).contains(&n.meta.size);
+                let held = n.meta.version().is_some_and(|v| {
+                    self.core
+                        .cache
+                        .get(&v.hash)
+                        .is_some_and(|b| b.is_complete())
+                });
+                if !small || held {
+                    return;
+                }
+                let Some(path) = t.rel_path(id) else { return };
+                (id, n.meta.version(), path)
+            };
+            if Instant::now() >= deadline || self.core.cache.remote().current().is_none() {
+                return;
+            }
+            let got = match old {
+                Some(v) => Ok(v),
+                None => self.core.version_of(id, deadline).map_err(Errno::code),
+            }
+            .and_then(|v| {
+                self.core
+                    .cache
+                    .fetch_whole(&v.hash, &path, v.size, deadline)
+                    .map(|_| ())
+            });
+            match got {
+                Ok(()) => {}
+                Err(libc::ENOENT | libc::ESTALE) => {
+                    if !self.await_replaced(id, old, &path, deadline) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    // false if the node still names this version at this path by the deadline
+    fn await_replaced(
+        &self,
+        id: NodeId,
+        old: Option<Version>,
+        at: &RelPath,
+        deadline: Instant,
+    ) -> bool {
+        loop {
+            {
+                let t = self.core.t();
+                match t.get(id) {
+                    Some(n)
+                        if n.vis != Vis::PendingDelete
+                            && n.meta.version() == old
+                            && t.rel_path(id).as_ref() == Some(at) => {}
+                    _ => return true,
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(STALE_STEP);
+        }
+    }
+
     // a small .git file is fetched whole at open, since git reads it right after: one the host deleted
     // meanwhile, such as a loose ref pack-refs pruned, then fails the open as natively, not the read
     fn git_small(
@@ -2639,6 +2711,8 @@ impl GuestFs {
             for _ in 0..STALE_TRIES {
                 let held = match self.core.t().get(id) {
                     Some(n) if n.attached() && n.vis != Vis::PendingDelete => n.meta.version(),
+                    // replaced by a newer inode: ESTALE makes the kernel walk the path to it
+                    Some(n) if !n.attached() => return Err(Errno::ESTALE),
                     _ => return Err(Errno::ENOENT),
                 };
                 let cur = match held {
@@ -4022,10 +4096,7 @@ impl Filesystem for GuestFs {
         // without writeback cache a read-only handle never holds dirty pages
         self.noflush = !wb;
         #[cfg(target_os = "linux")]
-        {
-            super::inject::SIZES_FROM_ATTRS.store(!wb, Relaxed);
-            self.no_opendir = caps.contains(InitFlags::FUSE_NO_OPENDIR_SUPPORT);
-        }
+        super::inject::SIZES_FROM_ATTRS.store(!wb, Relaxed);
         // sizes follow attribute replies only once the startup self-test has shown they do
         #[cfg(target_os = "macos")]
         super::inject::SIZES_FROM_ATTRS.store(false, Relaxed);
@@ -4057,6 +4128,9 @@ impl Filesystem for GuestFs {
             return reply.error(Errno::ENOENT);
         };
         let inj = self.is_inj(req, Act::Lookup(parent.0, name.as_bytes()));
+        if !inj {
+            self.git_prime(parent.0, name);
+        }
         let mut gone = false;
         for pass in 0..2 {
             {
@@ -4473,7 +4547,7 @@ impl Filesystem for GuestFs {
             // content, as a local file would, and no path is needed when that content is held here
             None if !write
                 && !trunc
-                && domain == GDomain::Synced
+                && matches!(domain, GDomain::Synced | GDomain::GitRo)
                 && staging.is_none()
                 && cached(meta.version()) =>
             {
@@ -4932,23 +5006,27 @@ impl Filesystem for GuestFs {
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
         self.core.ctr.op(Op::Opendir);
-        // the kernel then stops sending opendir and releasedir and caches listings by default
-        if self.no_opendir {
-            return reply.error(Errno::ENOSYS);
-        }
         let list = match self.listing(ino.0) {
             Ok(l) => l,
             Err(e) => return reply.error(e),
         };
+        let git = self
+            .core
+            .t()
+            .get(ino.0)
+            .is_some_and(|n| n.domain == GDomain::GitRo);
         let fh = self.add_handle(Handle {
             node: ino.0,
             io: Io::None,
             src: Src::Dir(Snap::new(list)),
         });
-        reply.opened(
-            FileHandle(fh),
-            FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_CACHE_DIR,
-        );
+        // a kernel-cached .git listing lags the lookups, hiding a new pack after its loose objects are gone
+        let flags = if git {
+            FopenFlags::empty()
+        } else {
+            FopenFlags::FOPEN_KEEP_CACHE | FopenFlags::FOPEN_CACHE_DIR
+        };
+        reply.opened(FileHandle(fh), flags);
     }
 
     fn readdir(

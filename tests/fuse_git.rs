@@ -34,6 +34,22 @@ fn git_stays_healthy_while_the_host_commits() {
     eprintln!("skip: the FUSE git test runs on Linux only");
 }
 
+#[test]
+fn git_file_replaced_under_a_reader_opens_whole() {
+    #[cfg(target_os = "linux")]
+    git::replaced_under_a_reader();
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("skip: the FUSE git test runs on Linux only");
+}
+
+#[test]
+fn git_files_match_the_host_after_each_commit_and_gc() {
+    #[cfg(target_os = "linux")]
+    git::replay_matches_host();
+    #[cfg(not(target_os = "linux"))]
+    eprintln!("skip: the FUSE git test runs on Linux only");
+}
+
 #[cfg(target_os = "linux")]
 mod common;
 
@@ -1160,6 +1176,264 @@ mod git {
             let o = run_git(&m, &["status", "--porcelain"]);
             o.status.success() && o.stdout.is_empty()
         });
+        rig.guest.quit(Duration::from_secs(30));
+    }
+
+    // what a MAP_PRIVATE mapping of the whole file shows, the way git maps its index, packs and commit-graph
+    #[allow(unsafe_code)]
+    fn mapped(f: &fs::File) -> Vec<u8> {
+        let len = f.metadata().unwrap().len() as usize;
+        if len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: a fresh read-only private mapping of len bytes of an open regular file; unmapped below.
+        let m = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                std::os::fd::AsRawFd::as_raw_fd(f),
+                0,
+            )
+        };
+        assert_ne!(
+            m,
+            libc::MAP_FAILED,
+            "mmap: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: m points to len readable mapped bytes until munmap.
+        let v = unsafe { std::slice::from_raw_parts(m.cast::<u8>(), len).to_vec() };
+        // SAFETY: m and len are the mapping made above.
+        assert_eq!(unsafe { libc::munmap(m, len) }, 0);
+        v
+    }
+
+    fn whole(f: &mut fs::File) -> Vec<u8> {
+        use std::io::{Seek, SeekFrom};
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut v = Vec::new();
+        f.read_to_end(&mut v).unwrap();
+        v
+    }
+
+    // git renames a new index, pack or commit-graph over the old one while another git process still has the
+    // old one open; the next open must see the new file whole, by size, read and mmap, and the reader its own
+    pub fn replaced_under_a_reader() {
+        if !ready() {
+            return;
+        }
+        let mut rig = rig("gitswap", churn_fixture);
+        let (m, proj) = (rig.m.clone(), rig.w.proj.clone());
+        let name = ".git/swap.bin";
+        let mut prev = noise(1, 90_000);
+        fs::write(proj.join(name), &prev).unwrap();
+        eventually("the first version on the guest", SYNC, || {
+            fs::read(m.join(name)).is_ok_and(|b| b == prev)
+        });
+        let mut problems = Vec::new();
+        for round in 0..6u64 {
+            let mut held = fs::File::open(m.join(name)).unwrap();
+            assert!(whole(&mut held) == prev, "round {round}: the held reader");
+            let next = noise(round + 2, [150_000, 40_000, 120_000][round as usize % 3]);
+            let tmp = proj.join(".git/swap.bin.lock");
+            fs::write(&tmp, &next).unwrap();
+            fs::rename(&tmp, proj.join(name)).unwrap();
+            eventually("the new version on the guest", SYNC, || {
+                fs::read(m.join(name)).is_ok_and(|b| b == next)
+            });
+            let mut f = fs::File::open(m.join(name)).unwrap();
+            let size = f.metadata().unwrap().len();
+            if size != next.len() as u64 {
+                problems.push(format!(
+                    "round {round}: a new open reports {size} bytes, the file has {}",
+                    next.len()
+                ));
+            }
+            if mapped(&f) != next[..(size as usize).min(next.len())] {
+                problems.push(format!(
+                    "round {round}: a new open's mapping is not the new file"
+                ));
+            }
+            if whole(&mut f) != next {
+                problems.push(format!(
+                    "round {round}: a new open does not read the new file"
+                ));
+            }
+            if whole(&mut held) != prev {
+                problems.push(format!(
+                    "round {round}: the reader opened before the swap lost its version"
+                ));
+            }
+            drop(f);
+            drop(held);
+            let path = m.join(name);
+            eventually("the new size once the reader closed", SYNC, || {
+                fs::metadata(&path).is_ok_and(|md| md.len() == next.len() as u64)
+            });
+            prev = next;
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+        rig.guest.quit(Duration::from_secs(30));
+    }
+
+    // every regular file under a git directory, relative to it
+    fn git_files(git_dir: &Path) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        let mut stack = vec![(git_dir.to_path_buf(), String::new())];
+        while let Some((dir, rel)) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let r = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => stack.push((e.path(), r)),
+                    Ok(t) if t.is_file() => {
+                        found.insert(r);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        found
+    }
+
+    // how the guest's copy of one .git file differs from the host's, by size, read and mmap; None when it does not
+    fn differs(m: &Path, proj: &Path, rel: &str) -> Option<String> {
+        let want = fs::read(proj.join(".git").join(rel)).ok()?;
+        let mut f = match fs::File::open(m.join(".git").join(rel)) {
+            Ok(f) => f,
+            Err(e) => return Some(format!("{rel}: open: {e}")),
+        };
+        let size = f.metadata().map(|md| md.len()).unwrap_or(u64::MAX);
+        if size != want.len() as u64 {
+            return Some(format!("{rel}: size {size}, host {}", want.len()));
+        }
+        // the guest serves the index with its own stat fields, so only its length is compared here
+        if rel == "index" {
+            return None;
+        }
+        if whole(&mut f) != want {
+            return Some(format!("{rel}: read differs"));
+        }
+        if mapped(&f) != want {
+            return Some(format!("{rel}: mmap differs"));
+        }
+        None
+    }
+
+    fn all_differences(m: &Path, proj: &Path) -> Vec<String> {
+        let mut out: Vec<String> = git_files(&proj.join(".git"))
+            .iter()
+            .filter(|r| !r.ends_with(".lock") && !r.contains("/.tmp-"))
+            .filter_map(|r| differs(m, proj, r))
+            .collect();
+        let stage = |d: &Path| {
+            String::from_utf8_lossy(&run_git(d, &["ls-files", "--stage"]).stdout).into_owned()
+        };
+        if stage(m) != stage(proj) {
+            out.push("ls-files --stage differs".to_owned());
+        }
+        out
+    }
+
+    // the churn's host steps one at a time, with a guest reader holding each replaced file across the step: after
+    // every step each .git file on the guest must match the host's, while the readers are open and after they close
+    pub fn replay_matches_host() {
+        if !ready() {
+            return;
+        }
+        let mut rig = rig("gitreplay", churn_fixture);
+        let (m, proj) = (rig.m.clone(), rig.w.proj.clone());
+        let held_names = [
+            "index",
+            "HEAD",
+            "refs/heads/main",
+            "packed-refs",
+            "objects/info/commit-graph",
+            "objects/info/packs",
+        ];
+        let mut problems = Vec::new();
+        for i in 0..25usize {
+            let mut held = Vec::new();
+            for n in held_names {
+                if let Ok(mut f) = fs::File::open(m.join(".git").join(n)) {
+                    let _ = whole(&mut f);
+                    let _ = mapped(&f);
+                    held.push(f);
+                }
+            }
+            fs::write(
+                proj.join(format!("f{}.txt", i % 4)),
+                format!("rev {i}\n{}", "x".repeat(i * 3)),
+            )
+            .unwrap();
+            fs::write(
+                proj.join(format!("f{}.txt", (i + 1) % 4)),
+                format!("other {i}\n{}", "y".repeat(i * 5 + 1)),
+            )
+            .unwrap();
+            fs::write(proj.join("big.txt"), big_text(i + 1)).unwrap();
+            if i % 2 == 0 {
+                fs::write(
+                    proj.join(format!("extra{}.txt", i % 6)),
+                    format!("extra {i}\n"),
+                )
+                .unwrap();
+            }
+            git(&proj, &["add", "-A"]);
+            git(&proj, &["commit", "-qm", &format!("n{i}")]);
+            if i % 8 == 7 {
+                git(&proj, &["gc", "-q"]);
+            }
+            // once a plain read shows the step, sizes and mappings must show it too, at once
+            let files = git_files(&proj.join(".git"));
+            eventually("the step's files on the guest", SYNC, || {
+                files.iter().all(|r| {
+                    r == "index"
+                        || r.ends_with(".lock")
+                        || r.contains("/.tmp-")
+                        || fs::read(proj.join(".git").join(r)).ok()
+                            == fs::read(m.join(".git").join(r)).ok()
+                })
+            });
+            for d in all_differences(&m, &proj) {
+                problems.push(format!("step {i}, readers open: {d}"));
+            }
+            // a long git command keeps reading what it opened, past the time the guest gives it
+            thread::sleep(Duration::from_millis(1500));
+            for f in &mut held {
+                let _ = whole(f);
+                let _ = mapped(f);
+            }
+            for phase in ["a reader read again", "readers closed"] {
+                if phase == "readers closed" {
+                    held.clear();
+                }
+                let end = Instant::now() + SYNC;
+                let mut last = all_differences(&m, &proj);
+                while !last.is_empty() && Instant::now() < end {
+                    thread::sleep(Duration::from_millis(50));
+                    last = all_differences(&m, &proj);
+                }
+                for d in last {
+                    problems.push(format!("step {i}, {phase}: {d}"));
+                }
+            }
+            let fsck = run_git(&m, &["fsck", "--full"]);
+            if !fsck.status.success() {
+                problems.push(format!("step {i}: fsck: {}", describe(&fsck)));
+            }
+            if !problems.is_empty() {
+                break;
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
         rig.guest.quit(Duration::from_secs(30));
     }
 }

@@ -378,7 +378,7 @@ impl GTree {
         if let Some(id) = self.child(parent, name)
             && let Some(n) = self.get(id)
         {
-            if !self.hidden(id, n) {
+            if !self.hidden(id, n) || (!inj && self.moved_git(id, n)) {
                 return Some((id, n));
             }
             match self.shadows.get(&id) {
@@ -399,7 +399,31 @@ impl GTree {
         }
         let key = (parent, Name::new(name).ok()?);
         let id = *self.ghosts.get(&key)?;
-        self.get(id).map(|n| (id, n))
+        self.get(id)
+            .filter(|n| inj || !self.moved_git(id, n))
+            .map(|n| (id, n))
+    }
+
+    // git expects a rename in .git to show at once, so only the injector still finds the old name
+    fn moved_git(&self, id: NodeId, n: &GNode) -> bool {
+        n.domain == GDomain::GitRo && self.moving.contains_key(&id)
+    }
+
+    // a .git listing as its lookups see it: changes as they arrive, not as the injector has replayed them
+    pub fn list_now(&self, dir: NodeId, out: &mut Vec<(NodeId, Option<Name>)>) -> bool {
+        let Some(kids) = self.get(dir).and_then(|d| d.children.as_ref()) else {
+            return false;
+        };
+        out.reserve(kids.len());
+        for (name, &id) in kids {
+            if let Some(n) = self.get(id)
+                && n.vis != Vis::PendingDelete
+            {
+                let alias = n.parent != dir || n.name != *name;
+                out.push((id, alias.then(|| name.clone())));
+            }
+        }
+        true
     }
 
     // kernel-visible children of dir; ghosts carry the name they are still visible under
@@ -1126,12 +1150,47 @@ impl GTree {
         let show = on && was == Vis::Live && self.reachable(id);
         let kind = meta.kind;
         let hash = meta.hash;
+        // git renames each new version over the old: a new inode, so no open shares an old reader's pages or size
+        let renew = on
+            && content
+            && kind == Kind::File
+            && n.domain == GDomain::GitRo
+            && meta.git_ro
+            && (n.nlookup.load(Relaxed) > 0 || n.open.load(Relaxed) > 0)
+            && !self.moving.contains_key(&id);
+        if renew {
+            let nm = Name::new(name).ok()?;
+            self.detach_at(id, parent, name, fx);
+            fx.push(Effect::InvalEntry(parent, nm.clone()));
+            fx.push(Effect::InvalInode(parent));
+            let vis = if was == Vis::PendingCreate {
+                Vis::PendingCreate
+            } else {
+                Vis::Live
+            };
+            let nid = self.insert(parent, nm, meta, GDomain::GitRo, vis);
+            let n = self.get_mut(nid)?;
+            n.edited = true;
+            if show {
+                fx.push(Effect::Synth(Synth::Modify { node: nid }));
+            }
+            if warm {
+                match hash {
+                    Some(h) => fx.push(Effect::Warm(nid, h)),
+                    None => fx.push(Effect::WarmPending(nid)),
+                }
+            }
+            return Some(nid);
+        }
         let n = self.get_mut(id)?;
         n.domain = domain_of(&meta);
         n.meta = meta;
         n.edited |= on && content;
         if was == Vis::PendingDelete {
             n.vis = Vis::Live;
+            if kind == Kind::Dir {
+                self.drop_removed_kids(id, fx);
+            }
         }
         if !on || !(content || perm || times || gitro || was == Vis::PendingDelete) {
             return Some(id);
@@ -1220,6 +1279,34 @@ impl GTree {
                 n.vis = Vis::PendingDelete;
             }
             fx.push(Effect::Synth(Synth::Delete { parent, name, dir }));
+        }
+    }
+
+    // a directory removed and made again keeps only entries the injector is still deleting
+    fn drop_removed_kids(&mut self, dir: NodeId, fx: &mut Vec<Effect>) {
+        let gone: Vec<(NodeId, Name)> = self
+            .get(dir)
+            .and_then(|n| n.children.as_ref())
+            .map(|kids| {
+                kids.iter()
+                    .filter(|&(_, &k)| {
+                        self.get(k).is_some_and(|c| {
+                            c.parent == dir
+                                && c.vis != Vis::PendingDelete
+                                && c.domain != GDomain::Local
+                                && c.unacked.is_none()
+                                && c.staging.is_none()
+                        }) && !self.moving.contains_key(&k)
+                    })
+                    .map(|(name, &k)| (k, name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (k, name) in gone {
+            self.detach_at(k, dir, name.as_str(), fx);
+            if self.mounted {
+                fx.push(Effect::InvalEntry(dir, name));
+            }
         }
     }
 
@@ -1656,6 +1743,129 @@ mod tests {
         up(&mut t, "src/a.rs", file(1));
         t.set_mounted(true);
         t
+    }
+
+    fn git(meta: Meta) -> Meta {
+        Meta {
+            git_ro: true,
+            ..meta
+        }
+    }
+
+    #[test]
+    fn a_git_file_the_kernel_holds_gets_a_new_inode_for_each_version() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/index", git(file(1)));
+        up(&mut t, ".git/HEAD", git(file(1)));
+        t.set_mounted(true);
+        let gd = t.resolve(&rp(".git")).unwrap();
+        let old = t.resolve(&rp(".git/index")).unwrap();
+        t.add_lookup(old);
+        let fx = up(&mut t, ".git/index", git(file(2)));
+        let new = t.resolve(&rp(".git/index")).unwrap();
+        assert_ne!(new, old, "a held inode is replaced, not rewritten");
+        let o = t.get(old).unwrap();
+        assert!(!o.attached(), "the old inode is detached");
+        assert_eq!(o.meta.size, 1, "the old inode keeps its own version");
+        assert_eq!(t.get(new).unwrap().meta.size, 2);
+        assert_eq!(t.get(new).unwrap().vis, Vis::Live);
+        assert!(fx.contains(&Effect::InvalEntry(gd, nm("index"))));
+        assert!(fx.contains(&Effect::Synth(Synth::Modify { node: new })));
+        // an inode the kernel never looked up has no pages or size to keep apart
+        let head = t.resolve(&rp(".git/HEAD")).unwrap();
+        up(&mut t, ".git/HEAD", git(file(3)));
+        assert_eq!(t.resolve(&rp(".git/HEAD")), Some(head));
+        // a synced file keeps its inode
+        let mut s = mounted_tree();
+        let a = s.resolve(&rp("src/a.rs")).unwrap();
+        s.add_lookup(a);
+        up(&mut s, "src/a.rs", file(4));
+        assert_eq!(s.resolve(&rp("src/a.rs")), Some(a));
+    }
+
+    #[test]
+    fn a_directory_removed_and_made_again_drops_what_it_held() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/objects", git(dir()));
+        up(&mut t, ".git/objects/29", git(dir()));
+        up(&mut t, ".git/objects/29/74f9", git(file(1)));
+        up(&mut t, ".git/objects/30", git(dir()));
+        up(&mut t, ".git/objects/30/aa", git(file(1)));
+        t.set_mounted(true);
+        for p in [".git", ".git/objects", ".git/objects/30"] {
+            let id = t.resolve(&rp(p)).unwrap();
+            t.add_lookup(id);
+        }
+        let mut fx = Vec::new();
+        for p in [".git/objects/29", ".git/objects/30"] {
+            t.apply(&Change::Remove { path: rp(p) }, &mut fx);
+        }
+        let seen = t.resolve(&rp(".git/objects/30/aa")).unwrap();
+        assert_eq!(t.get(seen).unwrap().vis, Vis::PendingDelete);
+        up(&mut t, ".git/objects/29", git(dir()));
+        up(&mut t, ".git/objects/30", git(dir()));
+        assert_eq!(
+            t.resolve(&rp(".git/objects/29/74f9")),
+            None,
+            "an entry the host removed with its directory came back"
+        );
+        // the injector still deletes an entry the kernel knows, so watchers see it go
+        assert_eq!(t.resolve(&rp(".git/objects/30/aa")), Some(seen));
+        assert_eq!(t.get(seen).unwrap().vis, Vis::PendingDelete);
+        up(&mut t, ".git/objects/29/b1", git(file(2)));
+        assert!(t.resolve(&rp(".git/objects/29/b1")).is_some());
+    }
+
+    #[test]
+    fn a_git_rename_shows_the_new_name_at_once_to_all_but_the_injector() {
+        let mut t = GTree::new();
+        up(&mut t, ".git", git(dir()));
+        up(&mut t, ".git/objects", git(dir()));
+        up(&mut t, ".git/objects/pack", git(dir()));
+        up(&mut t, ".git/objects/pack/.tmp-1-pack-a.idx", git(file(1)));
+        up(&mut t, "src", dir());
+        up(&mut t, "src/a.rs", file(1));
+        t.set_mounted(true);
+        let pack = t.resolve(&rp(".git/objects/pack")).unwrap();
+        let id = t
+            .resolve(&rp(".git/objects/pack/.tmp-1-pack-a.idx"))
+            .unwrap();
+        let mut fx = Vec::new();
+        t.apply(
+            &Change::Rename {
+                from: rp(".git/objects/pack/.tmp-1-pack-a.idx"),
+                to: rp(".git/objects/pack/pack-a.idx"),
+            },
+            &mut fx,
+        );
+        assert_eq!(t.lookup(pack, "pack-a.idx").map(|(i, _)| i), Some(id));
+        assert!(t.lookup(pack, ".tmp-1-pack-a.idx").is_none());
+        let mut ls = Vec::new();
+        t.list_now(pack, &mut ls);
+        assert_eq!(
+            ls,
+            vec![(id, None)],
+            "a .git listing names the new entry once"
+        );
+        // the injector still renames what the kernel saw
+        assert!(t.lookup_as(pack, "pack-a.idx", true).is_none());
+        assert_eq!(
+            t.lookup_as(pack, ".tmp-1-pack-a.idx", true).map(|(i, _)| i),
+            Some(id)
+        );
+        // outside .git a rename shows once injected, as watchers see it
+        let src = t.resolve(&rp("src")).unwrap();
+        t.apply(
+            &Change::Rename {
+                from: rp("src/a.rs"),
+                to: rp("src/b.rs"),
+            },
+            &mut fx,
+        );
+        assert!(t.lookup(src, "b.rs").is_none());
+        assert!(t.lookup(src, "a.rs").is_some());
     }
 
     #[test]
